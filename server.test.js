@@ -1,0 +1,348 @@
+import assert from "node:assert/strict";
+import http from "node:http";
+import { createHash } from "node:crypto";
+import { test } from "node:test";
+import pino from "pino";
+import { computeHmacSignature, createApp, loadConfig, redactPaths } from "./server.js";
+
+const baseEnv = {
+  KICK_CLIENT_ID: "client-id",
+  KICK_CLIENT_SECRET: "client-secret",
+  ALLOWED_REDIRECT_URIS: "https://localhost/callback,https://127.0.0.1/callback",
+  UPSTREAM_TIMEOUT_MS: "50",
+  TRUST_PROXY: "false",
+  LOG_LEVEL: "silent",
+};
+
+function config(overrides = {}) {
+  return loadConfig({ ...baseEnv, ...overrides });
+}
+
+function appWithFetch(fetchImpl, overrides = {}) {
+  return createApp(config(overrides), { fetch: fetchImpl });
+}
+
+function jsonResponse(status, body) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function validExchangeBody(overrides = {}) {
+  return {
+    code: "authorization-code",
+    codeVerifier: "a".repeat(43),
+    redirectUri: "https://localhost/callback",
+    ...overrides,
+  };
+}
+
+async function withServer(app, block) {
+  const server = http.createServer(app);
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address();
+  try {
+    return await block(`http://127.0.0.1:${port}`);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+}
+
+async function httpRequest(baseUrl, method, path, body) {
+  const response = await fetch(`${baseUrl}${path}`, {
+    method,
+    headers: body === undefined ? undefined : { "Content-Type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const text = await response.text();
+  return {
+    status: response.status,
+    headers: Object.fromEntries(response.headers.entries()),
+    body: text ? JSON.parse(text) : {},
+  };
+}
+
+function signedHeaders({ secret, method, path, bodyObject, timestamp, nonce }) {
+  const body = JSON.stringify(bodyObject);
+  const resolvedTimestamp = timestamp ?? String(Math.floor(Date.now() / 1000));
+  const resolvedNonce = nonce ?? `nonce-${Math.random()}`;
+  const signature = computeHmacSignature(secret, {
+    timestamp: resolvedTimestamp,
+    nonce: resolvedNonce,
+    method,
+    pathname: new URL(path, "http://internal").pathname,
+    bodySha256: createHash("sha256").update(body).digest("hex"),
+  });
+  return {
+    "Content-Type": "application/json",
+    "X-Auth-Timestamp": resolvedTimestamp,
+    "X-Auth-Nonce": resolvedNonce,
+    "X-Auth-Signature": signature,
+  };
+}
+
+async function signedRequest(baseUrl, method, path, bodyObject, overrides = {}) {
+  const response = await fetch(`${baseUrl}${path}`, {
+    method,
+    headers: signedHeaders({ secret: overrides.secret ?? "hmac-secret", method, path, bodyObject, ...overrides }),
+    body: JSON.stringify(bodyObject),
+  });
+  const text = await response.text();
+  return { status: response.status, body: text ? JSON.parse(text) : {} };
+}
+
+test("invalid exchange payload returns 400", async () => {
+  const app = appWithFetch(async () => jsonResponse(200, {}));
+
+  const response = await withServer(app, (baseUrl) =>
+    httpRequest(baseUrl, "POST", "/v1/kick/oauth/exchange", {
+      code: "",
+      codeVerifier: "short",
+      redirectUri: "https://localhost/callback",
+    })
+  );
+
+  assert.equal(response.status, 400);
+  assert.equal(response.body.code, "invalid_request");
+});
+
+test("allowed redirect URI reaches mocked upstream", async () => {
+  let upstreamBody;
+  const app = appWithFetch(async (_url, options) => {
+    upstreamBody = options.body;
+    return jsonResponse(200, {
+      access_token: "access-token",
+      refresh_token: "refresh-token",
+      expires_in: 3600,
+      token_type: "Bearer",
+      scope: "user:read chat:write",
+    });
+  });
+
+  const response = await withServer(app, (baseUrl) =>
+    httpRequest(baseUrl, "POST", "/v1/kick/oauth/exchange", validExchangeBody())
+  );
+
+  assert.equal(response.status, 200);
+  assert.equal(response.body.access_token, "access-token");
+  assert.equal(upstreamBody.get("redirect_uri"), "https://localhost/callback");
+  assert.equal(upstreamBody.get("client_secret"), "client-secret");
+});
+
+test("unknown HTTPS redirect URI returns invalid_redirect_uri", async () => {
+  const app = appWithFetch(async () => jsonResponse(200, {}));
+
+  const response = await withServer(app, (baseUrl) =>
+    httpRequest(baseUrl, "POST", "/v1/kick/oauth/exchange", validExchangeBody({ redirectUri: "https://example.com/callback" }))
+  );
+
+  assert.equal(response.status, 400);
+  assert.deepEqual(response.body, {
+    code: "invalid_redirect_uri",
+    message: "Redirect URI is not allowed",
+  });
+});
+
+test("non-HTTPS redirect URI returns invalid_redirect_uri", async () => {
+  const app = appWithFetch(async () => jsonResponse(200, {}));
+
+  const response = await withServer(app, (baseUrl) =>
+    httpRequest(baseUrl, "POST", "/v1/kick/oauth/exchange", validExchangeBody({ redirectUri: "http://localhost/callback" }))
+  );
+
+  assert.equal(response.status, 400);
+  assert.equal(response.body.code, "invalid_redirect_uri");
+});
+
+test("slow upstream request aborts and maps to 502", async () => {
+  const app = appWithFetch(
+    async (_url, options) =>
+      new Promise((_resolve, reject) => {
+        options.signal.addEventListener("abort", () => {
+          const error = new Error("aborted");
+          error.name = "AbortError";
+          reject(error);
+        });
+      }),
+    { UPSTREAM_TIMEOUT_MS: "10" }
+  );
+
+  const response = await withServer(app, (baseUrl) =>
+    httpRequest(baseUrl, "POST", "/v1/kick/oauth/refresh", { refreshToken: "refresh-token" })
+  );
+
+  assert.equal(response.status, 502);
+  assert.deepEqual(response.body, {
+    code: "upstream_unavailable",
+    message: "Kick OAuth request timed out",
+  });
+});
+
+test("Kick OAuth error maps to safe response without token leakage", async () => {
+  const app = appWithFetch(async () =>
+    jsonResponse(400, {
+      error: "invalid_grant",
+      error_description: "secret access-token refresh-token authorization-code",
+    })
+  );
+
+  const response = await withServer(app, (baseUrl) =>
+    httpRequest(baseUrl, "POST", "/v1/kick/oauth/refresh", { refreshToken: "refresh-token" })
+  );
+
+  assert.equal(response.status, 400);
+  assert.deepEqual(response.body, {
+    code: "invalid_grant",
+    message: "Kick OAuth grant is invalid",
+  });
+  assert.doesNotMatch(JSON.stringify(response.body), /secret|refresh-token|authorization-code/);
+});
+
+test("introspection 401 maps to inactive token response", async () => {
+  const app = appWithFetch(async () => jsonResponse(401, { message: "token secret-token inactive" }));
+
+  const response = await withServer(app, (baseUrl) =>
+    httpRequest(baseUrl, "POST", "/v1/kick/oauth/introspect", { token: "secret-token" })
+  );
+
+  assert.equal(response.status, 200);
+  assert.deepEqual(response.body, {
+    active: false,
+    exp: null,
+    client_id: null,
+    user_id: null,
+    username: null,
+    scope: null,
+  });
+});
+
+test("route-specific rate limit returns 429", async () => {
+  const app = appWithFetch(async () => jsonResponse(200, { active: true }));
+
+  const response = await withServer(app, async (baseUrl) => {
+    let lastResponse;
+    for (let i = 0; i < 61; i += 1) {
+      lastResponse = await httpRequest(baseUrl, "POST", "/v1/kick/oauth/introspect", { token: `token-${i}` });
+    }
+    return lastResponse;
+  });
+
+  assert.equal(response.status, 429);
+  assert.deepEqual(response.body, { code: "rate_limited", message: "Too many requests" });
+});
+
+test("healthz includes security headers", async () => {
+  const app = appWithFetch(async () => jsonResponse(200, {}));
+
+  const response = await withServer(app, (baseUrl) => httpRequest(baseUrl, "GET", "/healthz"));
+
+  assert.equal(response.status, 200);
+  assert.equal(response.body.ok, true);
+  assert.equal(response.headers["x-powered-by"], undefined);
+  assert.equal(response.headers["x-content-type-options"], "nosniff");
+  assert.equal(response.headers["x-frame-options"], "SAMEORIGIN");
+});
+
+test("pino redacts sensitive request fields", () => {
+  const logs = [];
+  const logger = pino(
+    {
+      level: "info",
+      redact: { paths: redactPaths, censor: "[REDACTED]" },
+    },
+    {
+      write: (line) => logs.push(line),
+    }
+  );
+
+  logger.info({
+    req: {
+      headers: { authorization: "Bearer access-token" },
+      body: {
+        code: "authorization-code",
+        codeVerifier: "code-verifier",
+        refreshToken: "refresh-token",
+        token: "secret-token",
+      },
+    },
+  });
+
+  const line = logs.join("");
+  assert.doesNotMatch(line, /access-token|authorization-code|code-verifier|refresh-token|secret-token/);
+  assert.match(line, /\[REDACTED]/);
+});
+
+const hmacEnv = { ...baseEnv, APP_HMAC_SECRET: "hmac-secret" };
+
+test("valid HMAC signature is accepted", async () => {
+  const app = createApp(loadConfig(hmacEnv), { fetch: async () => jsonResponse(200, {}) });
+
+  const response = await withServer(app, (baseUrl) =>
+    signedRequest(baseUrl, "POST", "/v1/kick/oauth/introspect", { token: "secret-token" })
+  );
+
+  assert.equal(response.status, 200);
+});
+
+test("missing signature headers return 401 when HMAC is required", async () => {
+  const app = createApp(loadConfig(hmacEnv), { fetch: async () => jsonResponse(200, {}) });
+
+  const response = await withServer(app, (baseUrl) =>
+    httpRequest(baseUrl, "POST", "/v1/kick/oauth/introspect", { token: "secret-token" })
+  );
+
+  assert.equal(response.status, 401);
+  assert.deepEqual(response.body, { code: "unauthorized", message: "Request signature is invalid" });
+});
+
+test("wrong signature returns 401", async () => {
+  const app = createApp(loadConfig(hmacEnv), { fetch: async () => jsonResponse(200, {}) });
+
+  const response = await withServer(app, (baseUrl) =>
+    signedRequest(baseUrl, "POST", "/v1/kick/oauth/introspect", { token: "secret-token" }, { secret: "wrong-secret" })
+  );
+
+  assert.equal(response.status, 401);
+});
+
+test("stale timestamp returns 401", async () => {
+  const app = createApp(loadConfig(hmacEnv), { fetch: async () => jsonResponse(200, {}) });
+  const staleTimestamp = String(Math.floor(Date.now() / 1000) - 3600);
+
+  const response = await withServer(app, (baseUrl) =>
+    signedRequest(baseUrl, "POST", "/v1/kick/oauth/introspect", { token: "secret-token" }, { timestamp: staleTimestamp })
+  );
+
+  assert.equal(response.status, 401);
+});
+
+test("nonce reuse returns 401", async () => {
+  const app = createApp(loadConfig(hmacEnv), { fetch: async () => jsonResponse(200, {}) });
+
+  await withServer(app, async (baseUrl) => {
+    const nonce = "fixed-nonce";
+    const first = await signedRequest(baseUrl, "POST", "/v1/kick/oauth/introspect", { token: "token-1" }, { nonce });
+    const second = await signedRequest(baseUrl, "POST", "/v1/kick/oauth/introspect", { token: "token-2" }, { nonce });
+    assert.equal(first.status, 200);
+    assert.equal(second.status, 401);
+  });
+});
+
+test("healthz stays open when HMAC is required", async () => {
+  const app = createApp(loadConfig(hmacEnv), { fetch: async () => jsonResponse(200, {}) });
+
+  const response = await withServer(app, (baseUrl) => httpRequest(baseUrl, "GET", "/healthz"));
+
+  assert.equal(response.status, 200);
+});
+
+test("unsigned requests pass when no HMAC secret is configured", async () => {
+  const app = appWithFetch(async () => jsonResponse(200, {}));
+
+  const response = await withServer(app, (baseUrl) =>
+    httpRequest(baseUrl, "POST", "/v1/kick/oauth/introspect", { token: "secret-token" })
+  );
+
+  assert.equal(response.status, 200);
+});
