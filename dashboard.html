@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Usage</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #fafafa;
+        --fg: #1a1a1a;
+        --muted: #6b6b6b;
+        --card: #ffffff;
+        --border: #e5e5e5;
+        --accent: #4f46e5;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #0f0f10;
+          --fg: #ededed;
+          --muted: #9a9a9a;
+          --card: #18181b;
+          --border: #2a2a2e;
+          --accent: #818cf8;
+        }
+      }
+      * { box-sizing: border-box; }
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        margin: 0;
+        padding: 24px;
+        background: var(--bg);
+        color: var(--fg);
+      }
+      h1 { font-size: 18px; font-weight: 600; margin: 0 0 16px; }
+      .toolbar {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        margin-bottom: 16px;
+        flex-wrap: wrap;
+      }
+      input[type="password"] {
+        flex: 1 1 240px;
+        min-width: 200px;
+        padding: 8px 10px;
+        font: inherit;
+        background: var(--card);
+        color: var(--fg);
+        border: 1px solid var(--border);
+        border-radius: 6px;
+      }
+      button {
+        padding: 8px 14px;
+        background: var(--accent);
+        color: #fff;
+        border: 0;
+        border-radius: 6px;
+        font: inherit;
+        cursor: pointer;
+      }
+      label { font-size: 13px; color: var(--muted); display: inline-flex; align-items: center; gap: 6px; }
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+        gap: 12px;
+        margin-bottom: 24px;
+      }
+      .card {
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 14px 16px;
+      }
+      .card .k { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }
+      .card .v { font-size: 24px; font-weight: 600; margin-top: 4px; }
+      .card .h { color: var(--muted); font-size: 12px; margin-top: 4px; }
+      .section { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+      .section h2 { font-size: 14px; font-weight: 600; margin: 0 0 12px; }
+      table { width: 100%; border-collapse: collapse; font-size: 13px; }
+      th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+      th { color: var(--muted); font-weight: 500; }
+      .bar-chart {
+        display: flex;
+        align-items: flex-end;
+        gap: 2px;
+        height: 120px;
+      }
+      .bar { flex: 1 1 0; background: var(--accent); border-radius: 2px 2px 0 0; min-height: 1px; transition: opacity 0.1s; }
+      .bar:hover { opacity: 0.7; }
+      .x-axis { display: flex; justify-content: space-between; color: var(--muted); font-size: 11px; margin-top: 6px; }
+      .error { color: #dc2626; padding: 12px; background: #fef2f2; border: 1px solid #fecaca; border-radius: 6px; }
+      .meta { color: var(--muted); font-size: 12px; margin-top: 4px; }
+    </style>
+  </head>
+  <body>
+    <h1>Usage</h1>
+    <div class="toolbar">
+      <input id="token" type="password" placeholder="Admin token" autocomplete="off" />
+      <label><input type="checkbox" id="remember" /> Remember on this device</label>
+      <button id="refresh" type="button">Refresh</button>
+    </div>
+    <div id="root"></div>
+    <script>
+      const STORAGE_KEY = "metricsAdminToken";
+      const root = document.getElementById("root");
+      const tokenInput = document.getElementById("token");
+      const rememberBox = document.getElementById("remember");
+
+      const saved = localStorage.getItem(STORAGE_KEY);
+      if (saved) {
+        tokenInput.value = saved;
+        rememberBox.checked = true;
+      }
+
+      document.getElementById("refresh").addEventListener("click", load);
+      tokenInput.addEventListener("keydown", (e) => { if (e.key === "Enter") load(); });
+
+      async function load() {
+        const token = tokenInput.value.trim();
+        if (!token) {
+          renderError("Enter an admin token first.");
+          return;
+        }
+        if (rememberBox.checked) {
+          localStorage.setItem(STORAGE_KEY, token);
+        } else {
+          localStorage.removeItem(STORAGE_KEY);
+        }
+        try {
+          const res = await fetch("/v1/metrics/stats", {
+            headers: { Authorization: "Bearer " + token },
+          });
+          if (res.status === 401) throw new Error("Invalid admin token");
+          if (res.status === 404) throw new Error("Stats endpoint is not enabled on the server");
+          if (!res.ok) throw new Error("HTTP " + res.status);
+          const data = await res.json();
+          render(data);
+        } catch (err) {
+          renderError(err.message || String(err));
+        }
+      }
+
+      function renderError(message) {
+        root.innerHTML = '<div class="error">' + escapeHtml(message) + "</div>";
+      }
+
+      function render(d) {
+        const maxDau = Math.max(1, ...d.dauSeries.map((p) => p.dau));
+        const first = d.dauSeries[0]?.date || "";
+        const last = d.dauSeries[d.dauSeries.length - 1]?.date || "";
+        const html = [
+          '<div class="grid">',
+          card("Monthly active", fmt(d.mau), ""),
+          card("Active today", fmt(d.dauToday), d.mau > 0 ? Math.round(d.dauToday / d.mau * 100) + "% of MAU" : ""),
+          card("Total installs", fmt(d.totalInstalls), ""),
+          card("Accounts (MAU)", fmt(d.accountsMau), "from logins"),
+          "</div>",
+          '<div class="section">',
+          '<h2>Daily active (last ' + d.dauSeries.length + " days)</h2>",
+          '<div class="bar-chart">' + d.dauSeries.map((p) =>
+            '<div class="bar" title="' + escapeHtml(p.date) + ": " + p.dau + '" style="height:' + Math.max(2, Math.round(p.dau / maxDau * 100)) + '%"></div>'
+          ).join("") + "</div>",
+          '<div class="x-axis"><span>' + escapeHtml(first) + "</span><span>" + escapeHtml(last) + "</span></div>",
+          "</div>",
+          '<div class="section">',
+          '<h2>Versions in ' + escapeHtml(d.currentMonth) + "</h2>",
+          versionsTable(d.versions),
+          "</div>",
+          '<div class="meta">Generated ' + escapeHtml(d.generatedAt) + "</div>",
+        ].join("");
+        root.innerHTML = html;
+      }
+
+      function card(k, v, h) {
+        return '<div class="card"><div class="k">' + escapeHtml(k) + '</div><div class="v">' + escapeHtml(v) + '</div>' + (h ? '<div class="h">' + escapeHtml(h) + "</div>" : "") + "</div>";
+      }
+
+      function versionsTable(rows) {
+        if (!rows || rows.length === 0) return "<p>No installs recorded this month yet.</p>";
+        const total = rows.reduce((a, r) => a + r.count, 0);
+        return "<table><thead><tr><th>Version</th><th>Devices</th><th>Share</th></tr></thead><tbody>" +
+          rows.map((r) =>
+            "<tr><td>" + escapeHtml(r.version) + "</td><td>" + r.count + "</td><td>" + Math.round(r.count / total * 100) + "%</td></tr>"
+          ).join("") + "</tbody></table>";
+      }
+
+      function fmt(n) {
+        return typeof n === "number" ? n.toLocaleString() : String(n ?? "");
+      }
+
+      function escapeHtml(s) {
+        return String(s).replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+      }
+
+      if (tokenInput.value) load();
+    </script>
+  </body>
+</html>

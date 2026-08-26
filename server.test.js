@@ -2,8 +2,12 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { createHash } from "node:crypto";
 import { test } from "node:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import pino from "pino";
 import { computeHmacSignature, createApp, loadConfig, redactPaths } from "./server.js";
+import { createMetricsStore } from "./metrics.js";
 
 const baseEnv = {
   KICK_CLIENT_ID: "client-id",
@@ -49,17 +53,21 @@ async function withServer(app, block) {
   }
 }
 
-async function httpRequest(baseUrl, method, path, body) {
+async function httpRequest(baseUrl, method, path, body, options = {}) {
+  const headers = { ...(options.headers || {}) };
+  if (body !== undefined) headers["Content-Type"] = "application/json";
   const response = await fetch(`${baseUrl}${path}`, {
     method,
-    headers: body === undefined ? undefined : { "Content-Type": "application/json" },
+    headers: Object.keys(headers).length > 0 ? headers : undefined,
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   const text = await response.text();
+  let parsed = {};
+  if (text) { try { parsed = JSON.parse(text); } catch { parsed = { raw: text }; } }
   return {
     status: response.status,
     headers: Object.fromEntries(response.headers.entries()),
-    body: text ? JSON.parse(text) : {},
+    body: parsed,
   };
 }
 
@@ -346,3 +354,144 @@ test("unsigned requests pass when no HMAC secret is configured", async () => {
 
   assert.equal(response.status, 200);
 });
+
+
+
+function metricsEnv(overrides = {}) {
+  return {
+    ...baseEnv,
+    METRICS_SALT: "test-salt-32-bytes-padding-padding",
+    METRICS_ACCOUNT_SALT: "test-account-salt-padding-padding",
+    METRICS_ADMIN_TOKEN: "admin-secret",
+    METRICS_DATA_FILE: "memory",
+    ...overrides,
+  };
+}
+
+function appWithMetrics(fetchImpl, overrides = {}) {
+  const cfg = loadConfig(metricsEnv(overrides));
+  const store = createMetricsStore({
+    salt: cfg.metrics.salt,
+    accountSalt: cfg.metrics.accountSalt,
+    dataPath: null,
+  });
+  return { app: createApp(cfg, { fetch: fetchImpl, metrics: store }), store };
+}
+
+function makePingBody(version = "1.0.0") {
+  // 64 hex chars, any value: the server re-hashes with the salt.
+  return { pid: "a".repeat(64), v: version };
+}
+
+test("ping records a new install and reflects in stats", async () => {
+  const { app, store } = appWithMetrics(async () => jsonResponse(200, {}));
+
+  const response = await withServer(app, (baseUrl) =>
+    httpRequest(baseUrl, "POST", "/v1/metrics/ping", makePingBody())
+  );
+
+  assert.equal(response.status, 204);
+  const stats = store.computeStats();
+  assert.equal(stats.mau, 1);
+  assert.equal(stats.dauToday, 1);
+  assert.equal(stats.totalInstalls, 1);
+  assert.equal(stats.versions.length, 1);
+  assert.equal(stats.versions[0].version, "1.0.0");
+  store.close();
+});
+
+test("ping dedupes same hash within a day and does not inflate installs", async () => {
+  const { app, store } = appWithMetrics(async () => jsonResponse(200, {}));
+
+  await withServer(app, async (baseUrl) => {
+    await httpRequest(baseUrl, "POST", "/v1/metrics/ping", makePingBody());
+    await httpRequest(baseUrl, "POST", "/v1/metrics/ping", makePingBody("1.0.1"));
+  });
+
+  const stats = store.computeStats();
+  assert.equal(stats.mau, 1);
+  assert.equal(stats.totalInstalls, 1);
+  assert.equal(stats.versions[0].version, "1.0.1");
+  store.close();
+});
+
+test("ping rejects malformed payloads", async () => {
+  const { app, store } = appWithMetrics(async () => jsonResponse(200, {}));
+
+  const response = await withServer(app, (baseUrl) =>
+    httpRequest(baseUrl, "POST", "/v1/metrics/ping", { pid: "not-hex", v: "1" })
+  );
+
+  assert.equal(response.status, 400);
+  assert.equal(response.body.code, "invalid_request");
+  store.close();
+});
+
+test("ping endpoint hidden when METRICS_SALT is unset", async () => {
+  const app = appWithFetch(async () => jsonResponse(200, {}));
+  const response = await withServer(app, (baseUrl) =>
+    httpRequest(baseUrl, "POST", "/v1/metrics/ping", makePingBody())
+  );
+  assert.equal(response.status, 404);
+});
+
+test("stats endpoint requires admin token", async () => {
+  const { app, store } = appWithMetrics(async () => jsonResponse(200, {}));
+
+  const noToken = await withServer(app, (baseUrl) => httpRequest(baseUrl, "GET", "/v1/metrics/stats"));
+  assert.equal(noToken.status, 401);
+
+  const wrongToken = await withServer(app, (baseUrl) =>
+    httpRequest(baseUrl, "GET", "/v1/metrics/stats", undefined, { headers: { Authorization: "Bearer wrong" } })
+  );
+  assert.equal(wrongToken.status, 401);
+
+  const ok = await withServer(app, (baseUrl) =>
+    httpRequest(baseUrl, "GET", "/v1/metrics/stats", undefined, { headers: { Authorization: "Bearer admin-secret" } })
+  );
+  assert.equal(ok.status, 200);
+  assert.equal(typeof ok.body.mau, "number");
+  store.close();
+});
+
+test("stats endpoint hidden when METRICS_ADMIN_TOKEN is unset", async () => {
+  const { app, store } = appWithMetrics(async () => jsonResponse(200, {}), { METRICS_ADMIN_TOKEN: "" });
+  const response = await withServer(app, (baseUrl) => httpRequest(baseUrl, "GET", "/v1/metrics/stats"));
+  assert.equal(response.status, 404);
+  store.close();
+});
+
+test("account counter records hashed sub once per month", () => {
+  const store = createMetricsStore({ salt: "a".repeat(32), accountSalt: "b".repeat(32), dataPath: null });
+  const subHash = store.hashSub("user-42");
+  const first = store.recordAccount({ subHash });
+  const second = store.recordAccount({ subHash });
+  assert.equal(first.isNewSession, true);
+  assert.equal(second.isNewSession, false);
+  const stats = store.computeStats();
+  assert.equal(stats.accountsMau, 1);
+  store.close();
+});
+
+test("metrics store persists and reloads across instances", () => {
+  const dir = mkdtempSync(join(tmpdir(), "metrics-"));
+  const file = join(dir, "m.json");
+  try {
+    const a = createMetricsStore({ salt: "s", accountSalt: "s", dataPath: file });
+    a.recordPing({ pidHash: "d".repeat(64), version: "1.0.0", clientEpoch: aMonthString() });
+    a.flushSync();
+    a.close();
+    const b = createMetricsStore({ salt: "s", accountSalt: "s", dataPath: file });
+    const stats = b.computeStats();
+    assert.equal(stats.mau, 1);
+    assert.equal(stats.totalInstalls, 1);
+    b.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+function aMonthString() {
+  const d = new Date();
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
+}

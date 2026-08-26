@@ -5,8 +5,14 @@ import rateLimit from "express-rate-limit";
 import pino from "pino";
 import pinoHttp from "pino-http";
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
+import {
+  createMetricsStore,
+  loadMetricsConfig,
+  requireAdminToken,
+} from "./metrics.js";
 
 const KICK_TOKEN_URL = "https://id.kick.com/oauth/token";
 const KICK_REVOKE_URL = "https://id.kick.com/oauth/revoke";
@@ -44,6 +50,7 @@ export function loadConfig(env = process.env) {
   const allowedRedirectUris = parseAllowedRedirectUris(env.ALLOWED_REDIRECT_URIS);
   const appHmacSecret = env.APP_HMAC_SECRET || "";
   const hmacToleranceSeconds = Number(env.HMAC_TIMESTAMP_TOLERANCE_SECONDS || 300);
+  const metrics = loadMetricsConfig(env);
 
   if (!Number.isInteger(port) || port <= 0) {
     throw new Error("PORT must be a positive integer");
@@ -71,6 +78,7 @@ export function loadConfig(env = process.env) {
     allowedRedirectUris,
     appHmacSecret,
     hmacToleranceSeconds,
+    metrics,
   };
 }
 
@@ -95,11 +103,29 @@ export function createApp(config, deps = {}) {
   const registerPost = (path, limiter, handler) =>
     app.post(path, ...(requireHmac ? [requireHmac] : []), limiter, handler);
 
+  const metrics = deps.metrics || (config.metrics.enabled
+    ? createMetricsStore({
+        salt: config.metrics.salt,
+        accountSalt: config.metrics.accountSalt,
+        dataPath: config.metrics.dataPath,
+        retentionMonths: config.metrics.retentionMonths,
+      })
+    : null);
+
   app.use("/v1/kick/oauth", createLimiter(120));
-  registerPost("/v1/kick/oauth/exchange", createLimiter(20), exchangeHandler(config, upstreamFetch));
-  registerPost("/v1/kick/oauth/refresh", createLimiter(30), refreshHandler(config, upstreamFetch));
+  registerPost("/v1/kick/oauth/exchange", createLimiter(20), exchangeHandler(config, upstreamFetch, metrics));
+  registerPost("/v1/kick/oauth/refresh", createLimiter(30), refreshHandler(config, upstreamFetch, metrics));
   registerPost("/v1/kick/oauth/revoke", createLimiter(30), revokeHandler(config, upstreamFetch));
   registerPost("/v1/kick/oauth/introspect", createLimiter(60), introspectHandler(config, upstreamFetch));
+
+  if (metrics) {
+    app.use("/v1/metrics", createLimiter(120));
+    registerPost("/v1/metrics/ping", createLimiter(10), pingHandler(metrics));
+    app.get("/v1/metrics/stats", requireAdminToken(config.metrics), statsHandler(metrics));
+    if (config.metrics.dashPath) {
+      app.get("/v1/metrics/dashboard", dashboardHandler(config.metrics));
+    }
+  }
 
   app.get("/healthz", (_req, res) => {
     res.status(200).json({ ok: true });
@@ -130,6 +156,11 @@ const revokeSchema = z.object({
 
 const introspectSchema = z.object({
   token: z.string().min(1),
+});
+
+const pingSchema = z.object({
+  pid: z.string().regex(/^[0-9a-f]{64}$/),
+  v: z.string().min(1).max(32).regex(/^[A-Za-z0-9._\-+ ]*$/),
 });
 
 function createLimiter(max) {
@@ -395,7 +426,7 @@ function sendOAuthError(req, res, error, fallbackMessage, logMessage) {
   return res.status(status).json({ code, message });
 }
 
-function exchangeHandler(config, upstreamFetch) {
+function exchangeHandler(config, upstreamFetch, metrics) {
   return async (req, res) => {
     const parsed = exchangeSchema.safeParse(req.body);
     if (!parsed.success) return validationError(res, parsed);
@@ -413,14 +444,23 @@ function exchangeHandler(config, upstreamFetch) {
         client_secret: config.kickClientSecret,
       });
 
-      return res.status(200).json(tokenResponse(data));
+      const responseBody = tokenResponse(data);
+      if (metrics && responseBody.access_token) {
+        recordAccountFromAccessToken({
+          accessToken: responseBody.access_token,
+          metrics,
+          upstreamFetch,
+          config,
+        }).catch(() => {});
+      }
+      return res.status(200).json(responseBody);
     } catch (error) {
       return sendOAuthError(req, res, error, "OAuth exchange failed", "exchange failed");
     }
   };
 }
 
-function refreshHandler(config, upstreamFetch) {
+function refreshHandler(config, upstreamFetch, metrics) {
   return async (req, res) => {
     const parsed = refreshSchema.safeParse(req.body);
     if (!parsed.success) return validationError(res, parsed);
@@ -433,7 +473,16 @@ function refreshHandler(config, upstreamFetch) {
         client_secret: config.kickClientSecret,
       });
 
-      return res.status(200).json(tokenResponse(data));
+      const responseBody = tokenResponse(data);
+      if (metrics && responseBody.access_token) {
+        recordAccountFromAccessToken({
+          accessToken: responseBody.access_token,
+          metrics,
+          upstreamFetch,
+          config,
+        }).catch(() => {});
+      }
+      return res.status(200).json(responseBody);
     } catch (error) {
       return sendOAuthError(req, res, error, "OAuth refresh failed", "refresh failed");
     }
@@ -522,6 +571,60 @@ export function startServer(env = process.env, deps = {}) {
   return app.listen(config.port, () => {
     config.logger.info({ port: config.port, trustProxy: config.trustProxy }, "Kick OAuth backend running");
   });
+}
+
+function pingHandler(metrics) {
+  return async (req, res) => {
+    const parsed = pingSchema.safeParse(req.body);
+    if (!parsed.success) return validationError(res, parsed);
+    try {
+      const pidHash = metrics.hashPid(parsed.data.pid);
+      const now = new Date();
+      const month = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}`;
+      metrics.recordPing({ pidHash, version: parsed.data.v, clientEpoch: month }, now);
+      return res.status(204).end();
+    } catch (error) {
+      req.log.warn({ err: { message: error.message } }, "ping rejected");
+      return res.status(400).json({ code: "invalid_request", message: error.message });
+    }
+  };
+}
+
+function statsHandler(metrics) {
+  return async (_req, res) => {
+    const payload = metrics.computeStats(new Date());
+    return res.status(200).json(payload);
+  };
+}
+
+function dashboardHandler(metricsConfig) {
+  return async (_req, res) => {
+    if (!metricsConfig.dashPath || !existsSync(metricsConfig.dashPath)) {
+      return res.status(404).json({ code: "not_found", message: "Not found" });
+    }
+    try {
+      const html = readFileSync(metricsConfig.dashPath, "utf8");
+      res.setHeader("Content-Type", "text/html; charset=utf-8");
+      res.setHeader("Cache-Control", "no-store");
+      return res.status(200).send(html);
+    } catch (error) {
+      return res.status(500).json({ code: "internal_error", message: "Dashboard unavailable" });
+    }
+  };
+}
+
+async function recordAccountFromAccessToken({ accessToken, metrics, upstreamFetch, config }) {
+  if (!accessToken || !metrics) return;
+  try {
+    const response = await postKickAuthed(config, upstreamFetch, KICK_INTROSPECT_URL, accessToken);
+    if (!response.ok) return;
+    const subRaw = response.body && typeof response.body === "object" ? response.body.user_id : null;
+    if (subRaw === null || subRaw === undefined) return;
+    const subHash = metrics.hashSub(String(subRaw));
+    metrics.recordAccount({ subHash });
+  } catch {
+    // Fire-and-forget; failures are silent.
+  }
 }
 
 const isMain = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
