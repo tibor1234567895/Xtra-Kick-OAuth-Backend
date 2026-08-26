@@ -618,7 +618,9 @@ async function recordAccountFromAccessToken({ accessToken, metrics, upstreamFetc
   try {
     const response = await postKickAuthed(config, upstreamFetch, KICK_INTROSPECT_URL, accessToken);
     if (!response.ok) return;
-    const subRaw = response.body && typeof response.body === "object" ? response.body.user_id : null;
+    const body = response.body && typeof response.body === "object" ? response.body : {};
+    const data = typeof body.data === "object" && body.data !== null ? body.data : body;
+    const subRaw = data.user_id ?? data.sub ?? null;
     if (subRaw === null || subRaw === undefined) return;
     const subHash = metrics.hashSub(String(subRaw));
     metrics.recordAccount({ subHash });
