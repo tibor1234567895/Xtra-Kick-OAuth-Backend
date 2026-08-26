@@ -16,7 +16,9 @@ import {
 
 const KICK_TOKEN_URL = "https://id.kick.com/oauth/token";
 const KICK_REVOKE_URL = "https://id.kick.com/oauth/revoke";
-const KICK_INTROSPECT_URL = "https://api.kick.com/public/v1/token/introspect";
+// Moved off /public/v1/token/introspect (deprecated 2026-01-15) to the OAuth host;
+// same contract: POST with Authorization: Bearer <token>, empty body.
+const KICK_INTROSPECT_URL = "https://id.kick.com/oauth/token/introspect";
 const TIMEOUT_MESSAGE = "Kick OAuth request timed out";
 const REDACTED = "[REDACTED]";
 
