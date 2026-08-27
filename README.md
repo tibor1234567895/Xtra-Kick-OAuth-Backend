@@ -21,14 +21,22 @@ Minimal OAuth proxy for Kick token operations.
 ## Configuration
 - `KICK_CLIENT_ID` and `KICK_CLIENT_SECRET` are required.
 - `ALLOWED_REDIRECT_URIS` is required and must be a comma-separated list of exact HTTPS redirect URIs.
+- `APP_HMAC_SECRET` must be set for internet-facing deployments. The only
+  unauthenticated mode is the explicit development setting
+  `ALLOW_UNAUTHENTICATED_OAUTH=true`.
 - `UPSTREAM_TIMEOUT_MS` defaults to `10000`.
 - `TRUST_PROXY` defaults to `loopback`.
 - `LOG_LEVEL` defaults to `info`.
+- `METRICS_MAX_DEVICES_PER_MONTH` defaults to `100000` and bounds anonymous
+  metrics storage for the active month.
 
 ## Notes
 - Keep `KICK_CLIENT_SECRET` only on backend.
 - Configure Kick dev dashboard redirect URI to `https://localhost/callback`.
 - Keep real client IDs, client secrets, access tokens, refresh tokens, and authorization codes out of docs and logs.
+- Do not treat an HMAC secret shipped in the Android APK as confidential. The
+  long-term fix is to replace shared APK signing with a public-client auth
+  design; keep the server-side HMAC as defense-in-depth during that migration.
 
 ## Ubuntu service
 

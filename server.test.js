@@ -16,6 +16,7 @@ const baseEnv = {
   UPSTREAM_TIMEOUT_MS: "50",
   TRUST_PROXY: "false",
   LOG_LEVEL: "silent",
+  ALLOW_UNAUTHENTICATED_OAUTH: "true",
 };
 
 function config(overrides = {}) {
@@ -113,6 +114,13 @@ test("invalid exchange payload returns 400", async () => {
 
   assert.equal(response.status, 400);
   assert.equal(response.body.code, "invalid_request");
+});
+
+test("loadConfig rejects missing HMAC unless explicitly allowed", () => {
+  assert.throws(
+    () => loadConfig({ ...baseEnv, ALLOW_UNAUTHENTICATED_OAUTH: "false" }),
+    /APP_HMAC_SECRET is required/
+  );
 });
 
 test("allowed redirect URI reaches mocked upstream", async () => {
@@ -433,6 +441,22 @@ test("ping rejects malformed payloads", async () => {
   store.close();
 });
 
+test("metrics device cap returns 429 without adding another device", () => {
+  const store = createMetricsStore({
+    salt: "s",
+    accountSalt: "s",
+    dataPath: null,
+    maxDevicesPerMonth: 1,
+  });
+  store.recordPing({ pidHash: "a".repeat(64), version: "1", clientEpoch: aMonthString() });
+  assert.throws(
+    () => store.recordPing({ pidHash: "b".repeat(64), version: "1", clientEpoch: aMonthString() }),
+    (error) => error.status === 429 && error.code === "metrics_capacity_reached"
+  );
+  assert.equal(store.computeStats().mau, 1);
+  store.close();
+});
+
 test("ping endpoint hidden when METRICS_SALT is unset", async () => {
   const app = appWithFetch(async () => jsonResponse(200, {}));
   const response = await withServer(app, (baseUrl) =>
@@ -464,6 +488,24 @@ test("stats endpoint hidden when METRICS_ADMIN_TOKEN is unset", async () => {
   const { app, store } = appWithMetrics(async () => jsonResponse(200, {}), { METRICS_ADMIN_TOKEN: "" });
   const response = await withServer(app, (baseUrl) => httpRequest(baseUrl, "GET", "/v1/metrics/stats"));
   assert.equal(response.status, 404);
+  store.close();
+});
+
+test("dashboard endpoint requires admin token", async () => {
+  const { app, store } = appWithMetrics(async () => jsonResponse(200, {}), {
+    METRICS_DASHBOARD_FILE: join(process.cwd(), "dashboard.html"),
+  });
+
+  await withServer(app, async (baseUrl) => {
+    const noToken = await httpRequest(baseUrl, "GET", "/v1/metrics/dashboard");
+    assert.equal(noToken.status, 401);
+
+    const ok = await httpRequest(baseUrl, "GET", "/v1/metrics/dashboard", undefined, {
+      headers: { Authorization: "Bearer admin-secret" },
+    });
+    assert.equal(ok.status, 200);
+    assert.match(ok.headers["content-type"], /text\/html/);
+  });
   store.close();
 });
 

@@ -26,6 +26,7 @@ export function loadMetricsConfig(env = process.env) {
     ? resolve(env.METRICS_DATA_FILE)
     : resolve("./data/metrics.json");
   const retentionMonths = Math.max(1, Number(env.METRICS_RETENTION_MONTHS || 2));
+  const maxDevicesPerMonth = Math.max(1, Number(env.METRICS_MAX_DEVICES_PER_MONTH || 100_000));
   const dashPath = env.METRICS_DASHBOARD_FILE
     ? resolve(env.METRICS_DASHBOARD_FILE)
     : null;
@@ -36,6 +37,7 @@ export function loadMetricsConfig(env = process.env) {
     adminToken,
     dataPath,
     retentionMonths,
+    maxDevicesPerMonth,
     dashPath,
   };
 }
@@ -79,8 +81,9 @@ function ensureDir(filePath) {
 
 export function createMetricsStore(options = {}) {
   const { salt, accountSalt, dataPath } = options;
-  let { retentionMonths } = options;
+  let { retentionMonths, maxDevicesPerMonth } = options;
   if (!Number.isInteger(retentionMonths) || retentionMonths < 1) retentionMonths = 2;
+  if (!Number.isInteger(maxDevicesPerMonth) || maxDevicesPerMonth < 1) maxDevicesPerMonth = 100_000;
   if (!salt) {
     throw new Error("createMetricsStore: salt is required");
   }
@@ -126,6 +129,8 @@ export function createMetricsStore(options = {}) {
         flushSync();
       } catch {
         // Swallow: counters are best-effort.
+      } finally {
+        pendingFlush = null;
       }
     }, 2_000);
     if (typeof pendingFlush.unref === "function") pendingFlush.unref();
@@ -168,6 +173,12 @@ export function createMetricsStore(options = {}) {
       if (safeVersion) existing.v = safeVersion;
       scheduleFlush();
       return { isNewInstall: false, month: serverEpoch };
+    }
+    if (Object.keys(month).length >= maxDevicesPerMonth) {
+      const error = new Error("metrics device capacity reached");
+      error.status = 429;
+      error.code = "metrics_capacity_reached";
+      throw error;
     }
     month[pidHash] = { v: safeVersion, d: dayBit };
     state.totalInstalls += 1;

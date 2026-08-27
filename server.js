@@ -51,7 +51,8 @@ export function loadConfig(env = process.env) {
   const port = Number(env.PORT || 8080);
   const upstreamTimeoutMs = Number(env.UPSTREAM_TIMEOUT_MS || 10_000);
   const allowedRedirectUris = parseAllowedRedirectUris(env.ALLOWED_REDIRECT_URIS);
-  const appHmacSecret = env.APP_HMAC_SECRET || "";
+  const appHmacSecret = (env.APP_HMAC_SECRET || "").trim();
+  const allowUnauthenticatedOAuth = env.ALLOW_UNAUTHENTICATED_OAUTH === "true";
   const hmacToleranceSeconds = Number(env.HMAC_TIMESTAMP_TOLERANCE_SECONDS || 300);
   const metrics = loadMetricsConfig(env);
 
@@ -70,6 +71,9 @@ export function loadConfig(env = process.env) {
   if (allowedRedirectUris.size === 0) {
     throw new Error("ALLOWED_REDIRECT_URIS must contain at least one HTTPS URI");
   }
+  if (!appHmacSecret && !allowUnauthenticatedOAuth) {
+    throw new Error("APP_HMAC_SECRET is required unless ALLOW_UNAUTHENTICATED_OAUTH=true");
+  }
 
   return {
     port,
@@ -80,6 +84,7 @@ export function loadConfig(env = process.env) {
     upstreamTimeoutMs,
     allowedRedirectUris,
     appHmacSecret,
+    allowUnauthenticatedOAuth,
     hmacToleranceSeconds,
     metrics,
   };
@@ -112,6 +117,7 @@ export function createApp(config, deps = {}) {
         accountSalt: config.metrics.accountSalt,
         dataPath: config.metrics.dataPath,
         retentionMonths: config.metrics.retentionMonths,
+        maxDevicesPerMonth: config.metrics.maxDevicesPerMonth,
       })
     : null);
 
@@ -126,7 +132,7 @@ export function createApp(config, deps = {}) {
     registerPost("/v1/metrics/ping", createLimiter(10), pingHandler(metrics));
     app.get("/v1/metrics/stats", requireAdminToken(config.metrics), statsHandler(metrics));
     if (config.metrics.dashPath) {
-      app.get("/v1/metrics/dashboard", dashboardHandler(config.metrics));
+      app.get("/v1/metrics/dashboard", requireAdminToken(config.metrics), dashboardHandler(config.metrics));
     }
   }
 
@@ -587,8 +593,8 @@ function pingHandler(metrics) {
       metrics.recordPing({ pidHash, version: parsed.data.v, clientEpoch: month }, now);
       return res.status(204).end();
     } catch (error) {
-      req.log.warn({ err: { message: error.message } }, "ping rejected");
-      return res.status(400).json({ code: "invalid_request", message: error.message });
+      req.log.warn({ err: { message: error.message, code: error.code } }, "ping rejected");
+      return res.status(error.status || 400).json({ code: error.code || "invalid_request", message: error.message });
     }
   };
 }
