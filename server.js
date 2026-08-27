@@ -132,7 +132,8 @@ export function createApp(config, deps = {}) {
     registerPost("/v1/metrics/ping", createLimiter(10), pingHandler(metrics));
     app.get("/v1/metrics/stats", requireAdminToken(config.metrics), statsHandler(metrics));
     if (config.metrics.dashPath) {
-      app.get("/v1/metrics/dashboard", requireAdminToken(config.metrics), dashboardHandler(config.metrics));
+      // The page is only a login shell; its data request remains token-protected.
+      app.get("/v1/metrics/dashboard", dashboardHandler(config.metrics));
     }
   }
 

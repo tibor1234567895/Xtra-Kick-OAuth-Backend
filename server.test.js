@@ -491,20 +491,18 @@ test("stats endpoint hidden when METRICS_ADMIN_TOKEN is unset", async () => {
   store.close();
 });
 
-test("dashboard endpoint requires admin token", async () => {
+test("dashboard shell loads without admin token while stats stays protected", async () => {
   const { app, store } = appWithMetrics(async () => jsonResponse(200, {}), {
     METRICS_DASHBOARD_FILE: join(process.cwd(), "dashboard.html"),
   });
 
   await withServer(app, async (baseUrl) => {
     const noToken = await httpRequest(baseUrl, "GET", "/v1/metrics/dashboard");
-    assert.equal(noToken.status, 401);
+    assert.equal(noToken.status, 200);
+    assert.match(noToken.headers["content-type"], /text\/html/);
 
-    const ok = await httpRequest(baseUrl, "GET", "/v1/metrics/dashboard", undefined, {
-      headers: { Authorization: "Bearer admin-secret" },
-    });
-    assert.equal(ok.status, 200);
-    assert.match(ok.headers["content-type"], /text\/html/);
+    const stats = await httpRequest(baseUrl, "GET", "/v1/metrics/stats");
+    assert.equal(stats.status, 401);
   });
   store.close();
 });

@@ -10,7 +10,7 @@ Minimal OAuth proxy for Kick token operations.
 - `POST /v1/kick/oauth/introspect`
 - `POST /v1/metrics/ping` (enabled when `METRICS_SALT` is set)
 - `GET /v1/metrics/stats` (requires `METRICS_ADMIN_TOKEN`)
-- `GET /v1/metrics/dashboard` (requires `METRICS_DASHBOARD_FILE` to point at a static HTML page)
+- `GET /v1/metrics/dashboard` (static login shell; requires `METRICS_DASHBOARD_FILE`)
 
 ## Setup
 1. Copy `.env.example` to `.env` and fill values.
@@ -29,6 +29,8 @@ Minimal OAuth proxy for Kick token operations.
 - `LOG_LEVEL` defaults to `info`.
 - `METRICS_MAX_DEVICES_PER_MONTH` defaults to `100000` and bounds anonymous
   metrics storage for the active month.
+- The dashboard HTML is intentionally public as a login shell; its `/v1/metrics/stats`
+  data request requires `METRICS_ADMIN_TOKEN`.
 
 ## Notes
 - Keep `KICK_CLIENT_SECRET` only on backend.
