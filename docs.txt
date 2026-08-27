@@ -1,5 +1,0 @@
-ubuntu@ubuntu:/etc/systemd/system$ sudo systemctl daemon-reload
-ubuntu@ubuntu:/etc/systemd/system$ sudo systemctl start KickOauthBackend.service
-ubuntu@ubuntu:/etc/systemd/system$ sudo systemctl restart KickOauthBackend.service
-ubuntu@ubuntu:/etc/systemd/system$ journalctl -u KickOauthBackend.service -f
-

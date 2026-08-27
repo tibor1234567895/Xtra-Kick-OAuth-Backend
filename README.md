@@ -29,3 +29,20 @@ Minimal OAuth proxy for Kick token operations.
 - Keep `KICK_CLIENT_SECRET` only on backend.
 - Configure Kick dev dashboard redirect URI to `https://localhost/callback`.
 - Keep real client IDs, client secrets, access tokens, refresh tokens, and authorization codes out of docs and logs.
+
+## Ubuntu service
+
+After pulling and installing production dependencies, restart the existing systemd service:
+
+```bash
+npm ci --omit=dev
+npm test
+sudo systemctl restart KickOauthBackend.service
+sudo systemctl status KickOauthBackend.service
+```
+
+Follow its logs with:
+
+```bash
+journalctl -u KickOauthBackend.service -f
+```
