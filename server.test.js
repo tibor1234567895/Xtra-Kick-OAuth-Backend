@@ -266,7 +266,10 @@ test("pino redacts sensitive request fields", () => {
 
   logger.info({
     req: {
-      headers: { authorization: "Bearer access-token" },
+      headers: {
+        authorization: "Bearer access-token",
+        "x-admin-token": "fallback-admin-token",
+      },
       body: {
         code: "authorization-code",
         codeVerifier: "code-verifier",
@@ -277,7 +280,10 @@ test("pino redacts sensitive request fields", () => {
   });
 
   const line = logs.join("");
-  assert.doesNotMatch(line, /access-token|authorization-code|code-verifier|refresh-token|secret-token/);
+  assert.doesNotMatch(
+    line,
+    /access-token|fallback-admin-token|authorization-code|code-verifier|refresh-token|secret-token/
+  );
   assert.match(line, /\[REDACTED]/);
 });
 

@@ -24,6 +24,7 @@ const REDACTED = "[REDACTED]";
 
 export const redactPaths = [
   "req.headers.authorization",
+  "req.headers.x-admin-token",
   "req.body.code",
   "req.body.codeVerifier",
   "req.body.refreshToken",
