@@ -107,7 +107,7 @@
       const tokenInput = document.getElementById("token");
       const rememberBox = document.getElementById("remember");
 
-      const saved = localStorage.getItem(STORAGE_KEY);
+      const saved = sessionStorage.getItem(STORAGE_KEY);
       if (saved) {
         tokenInput.value = saved;
         rememberBox.checked = true;
@@ -123,9 +123,9 @@
           return;
         }
         if (rememberBox.checked) {
-          localStorage.setItem(STORAGE_KEY, token);
+          sessionStorage.setItem(STORAGE_KEY, token);
         } else {
-          localStorage.removeItem(STORAGE_KEY);
+          sessionStorage.removeItem(STORAGE_KEY);
         }
         try {
           const res = await fetch("/v1/metrics/stats", {

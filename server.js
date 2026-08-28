@@ -24,7 +24,9 @@ const REDACTED = "[REDACTED]";
 
 export const redactPaths = [
   "req.headers.authorization",
-  "req.headers.x-admin-token",
+  "req.headers['x-admin-token']",
+  "req.body.code_verifier",
+  "req.body.refresh_token",
   "req.body.code",
   "req.body.codeVerifier",
   "req.body.refreshToken",
@@ -151,7 +153,7 @@ export function createApp(config, deps = {}) {
 
 const exchangeSchema = z.object({
   code: z.string().min(1),
-  codeVerifier: z.string().min(43).max(128),
+  codeVerifier: z.string().min(43).max(128).regex(/^[A-Za-z0-9._~-]+$/),
   redirectUri: z.string().url(),
 });
 
@@ -616,6 +618,7 @@ function dashboardHandler(metricsConfig) {
       const html = readFileSync(metricsConfig.dashPath, "utf8");
       res.setHeader("Content-Type", "text/html; charset=utf-8");
       res.setHeader("Cache-Control", "no-store");
+      res.setHeader("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'");
       return res.status(200).send(html);
     } catch (error) {
       return res.status(500).json({ code: "internal_error", message: "Dashboard unavailable" });

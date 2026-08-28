@@ -14,7 +14,7 @@
 
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 
 export const SCHEMA_VERSION = 1;
 
@@ -193,6 +193,12 @@ export function createMetricsStore(options = {}) {
     prune();
     const month = ensureMonth(monthKey(now), "accounts");
     if (month[subHash]) return { isNewSession: false };
+    if (Object.keys(month).length >= maxDevicesPerMonth) {
+      const error = new Error("metrics account capacity reached");
+      error.status = 429;
+      error.code = "metrics_capacity_reached";
+      throw error;
+    }
     month[subHash] = true;
     scheduleFlush();
     return { isNewSession: true };
@@ -206,32 +212,31 @@ export function createMetricsStore(options = {}) {
     return hashWithSalt(salt, rawPid);
   }
 
-  function popcount(int) {
-    let n = int >>> 0;
-    let count = 0;
-    while (n) {
-      n &= n - 1;
-      count += 1;
-    }
-    return count;
-  }
-
   function buildDauSeries(stateRef, now) {
     const today = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+    const dayCountsByMonth = {};
+
+    // Single-pass bitmask aggregation per active month bucket: O(N) instead of O(60 * N)
+    for (const [month, bucket] of Object.entries(stateRef.devices)) {
+      if (!bucket) continue;
+      const counts = new Uint32Array(32);
+      for (const entry of Object.values(bucket)) {
+        if (!entry || !entry.d) continue;
+        const mask = entry.d;
+        for (let day = 1; day <= 31; day++) {
+          if ((mask & (1 << (day - 1))) !== 0) counts[day]++;
+        }
+      }
+      dayCountsByMonth[month] = counts;
+    }
+
     const series = [];
     for (let offset = 59; offset >= 0; offset -= 1) {
       const d = new Date(today);
       d.setUTCDate(today.getUTCDate() - offset);
       const m = monthKey(d);
       const day = dayIndexUtc(d);
-      const bit = 1 << (day - 1);
-      const bucket = stateRef.devices[m];
-      let count = 0;
-      if (bucket) {
-        for (const entry of Object.values(bucket)) {
-          if (entry && (entry.d & bit) !== 0) count += 1;
-        }
-      }
+      const count = dayCountsByMonth[m] ? dayCountsByMonth[m][day] : 0;
       series.push({
         date: d.toISOString().slice(0, 10),
         dau: count,
@@ -321,6 +326,3 @@ export function generateSalt(byteCount = 32) {
 
 export { safeEqual, hashWithSalt };
 
-export const __testing = {
-  join,
-};
