@@ -4,3 +4,5 @@
 node_modules/
 data/
 *.log
+*service-account*.json
+firebase-*.json

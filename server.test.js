@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import pino from "pino";
 import { computeHmacSignature, createApp, loadConfig, redactPaths } from "./server.js";
 import { createMetricsStore } from "./metrics.js";
+import { createFcmStore, sendLivePushNotification } from "./fcm.js";
 
 const baseEnv = {
   KICK_CLIENT_ID: "client-id",
@@ -541,3 +542,111 @@ function aMonthString() {
   const d = new Date();
   return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
 }
+
+test("fcm store subscribes and creates reverse index", () => {
+  const store = createFcmStore({ dataFile: null });
+  const tokenA = "a".repeat(32);
+  const tokenB = "b".repeat(32);
+
+  store.subscribe({ token: tokenA, kickUserId: "1001", channelIds: ["500", "600"] });
+  store.subscribe({ token: tokenB, kickUserId: "1002", channelIds: ["600", "700"] });
+
+  assert.deepEqual(store.getTokensForChannel("500"), [tokenA]);
+  assert.deepEqual(store.getTokensForChannel("600").sort(), [tokenA, tokenB].sort());
+  assert.deepEqual(store.getTokensForChannel("700"), [tokenB]);
+  assert.deepEqual(store.getTokensForChannel("999"), []);
+
+  const stats = store.stats();
+  assert.equal(stats.totalTokens, 2);
+  assert.equal(stats.activeChannels, 3);
+
+  store.unsubscribe({ token: tokenA });
+  assert.deepEqual(store.getTokensForChannel("500"), []);
+  assert.deepEqual(store.getTokensForChannel("600"), [tokenB]);
+  assert.equal(store.stats().totalTokens, 1);
+  assert.equal(store.stats().activeChannels, 2);
+});
+
+test("fcm store persists across instances", () => {
+  const dir = mkdtempSync(join(tmpdir(), "fcm-"));
+  const file = join(dir, "fcm.json");
+  const token = "x".repeat(32);
+
+  try {
+    const a = createFcmStore({ dataFile: file });
+    a.subscribe({ token, kickUserId: "123", channelIds: ["456"] });
+    a.flushSync();
+
+    const b = createFcmStore({ dataFile: file });
+    assert.deepEqual(b.getTokensForChannel("456"), [token]);
+    assert.equal(b.stats().totalTokens, 1);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("POST /v1/fcm/subscribe validates payload and records subscription", async () => {
+  const fcmStore = createFcmStore({ dataFile: null });
+  const app = createApp(config(), { fcmStore, messaging: null, pusherRelay: null });
+
+  await withServer(app, async (baseUrl) => {
+    const token = "fcm_test_token_123456789012345";
+    const res = await httpRequest(baseUrl, "POST", "/v1/fcm/subscribe", {
+      token,
+      kick_user_id: "999",
+      channel_ids: ["100", "200"],
+    });
+
+    assert.equal(res.status, 200);
+    assert.equal(res.body.ok, true);
+    assert.equal(res.body.subscribed_channels, 2);
+    assert.deepEqual(fcmStore.getTokensForChannel("100"), [token]);
+
+    const unregRes = await httpRequest(baseUrl, "POST", "/v1/fcm/unsubscribe", {
+      token,
+    });
+    assert.equal(unregRes.status, 200);
+    assert.equal(unregRes.body.ok, true);
+    assert.equal(unregRes.body.unsubscribed, true);
+    assert.deepEqual(fcmStore.getTokensForChannel("100"), []);
+  });
+});
+
+test("sendLivePushNotification handles multicast response and prunes invalid tokens", async () => {
+  const fcmStore = createFcmStore({ dataFile: null });
+  const validToken = "valid_token_123456789012345";
+  const invalidToken = "invalid_token_1234567890123";
+
+  fcmStore.subscribe({ token: validToken, channelIds: ["888"] });
+  fcmStore.subscribe({ token: invalidToken, channelIds: ["888"] });
+
+  const mockMessaging = {
+    sendEachForMulticast: async (payload) => {
+      return {
+        successCount: 1,
+        failureCount: 1,
+        responses: [
+          { success: true },
+          { success: false, error: { code: "messaging/registration-token-not-registered" } },
+        ],
+      };
+    },
+  };
+
+  const result = await sendLivePushNotification({
+    messaging: mockMessaging,
+    tokens: [validToken, invalidToken],
+    userId: "888",
+    channelSlug: "teststreamer",
+    title: "teststreamer is live!",
+    description: "Playing Minecraft",
+    profilePicture: "https://example.com/avatar.jpg",
+    logger: null,
+    fcmStore,
+  });
+
+  assert.equal(result.successCount, 1);
+  assert.equal(result.failureCount, 1);
+  assert.deepEqual(result.invalidTokens, [invalidToken]);
+  assert.deepEqual(fcmStore.getTokensForChannel("888"), [validToken]);
+});

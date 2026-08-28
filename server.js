@@ -13,11 +13,15 @@ import {
   loadMetricsConfig,
   requireAdminToken,
 } from "./metrics.js";
+import {
+  createFcmStore,
+  createPusherRelay,
+  initFirebaseMessaging,
+  loadFcmConfig,
+} from "./fcm.js";
 
 const KICK_TOKEN_URL = "https://id.kick.com/oauth/token";
 const KICK_REVOKE_URL = "https://id.kick.com/oauth/revoke";
-// Moved off /public/v1/token/introspect (deprecated 2026-01-15) to the OAuth host;
-// same contract: POST with Authorization: Bearer <token>, empty body.
 const KICK_INTROSPECT_URL = "https://id.kick.com/oauth/token/introspect";
 const TIMEOUT_MESSAGE = "Kick OAuth request timed out";
 const REDACTED = "[REDACTED]";
@@ -57,6 +61,7 @@ export function loadConfig(env = process.env) {
   const allowUnauthenticatedOAuth = env.ALLOW_UNAUTHENTICATED_OAUTH === "true";
   const hmacToleranceSeconds = Number(env.HMAC_TIMESTAMP_TOLERANCE_SECONDS || 300);
   const metrics = loadMetricsConfig(env);
+  const fcm = loadFcmConfig(env);
 
   if (!Number.isInteger(port) || port <= 0) {
     throw new Error("PORT must be a positive integer");
@@ -89,6 +94,7 @@ export function loadConfig(env = process.env) {
     allowUnauthenticatedOAuth,
     hmacToleranceSeconds,
     metrics,
+    fcm,
   };
 }
 
@@ -113,7 +119,7 @@ export function createApp(config, deps = {}) {
   const registerPost = (path, limiter, handler) =>
     app.post(path, ...(requireHmac ? [requireHmac] : []), limiter, handler);
 
-  const metrics = deps.metrics || (config.metrics.enabled
+  const metrics = deps.metrics || (config.metrics?.enabled
     ? createMetricsStore({
         salt: config.metrics.salt,
         accountSalt: config.metrics.accountSalt,
@@ -122,6 +128,22 @@ export function createApp(config, deps = {}) {
         maxDevicesPerMonth: config.metrics.maxDevicesPerMonth,
       })
     : null);
+
+  const fcmStore = deps.fcmStore || createFcmStore({
+    dataFile: config.fcm?.dataFile,
+    logger: config.logger,
+  });
+  const messaging = deps.messaging !== undefined
+    ? deps.messaging
+    : initFirebaseMessaging({
+        serviceAccountPath: config.fcm?.serviceAccountPath,
+        logger: config.logger,
+      });
+  const pusherRelay = deps.pusherRelay !== undefined
+    ? deps.pusherRelay
+    : (config.fcm?.pusherRelayEnabled && messaging
+        ? createPusherRelay({ fcmStore, messaging, logger: config.logger })
+        : null);
 
   app.use("/v1/kick/oauth", createLimiter(120));
   registerPost("/v1/kick/oauth/exchange", createLimiter(20), exchangeHandler(config, upstreamFetch, metrics));
@@ -137,6 +159,13 @@ export function createApp(config, deps = {}) {
       // The page is only a login shell; its data request remains token-protected.
       app.get("/v1/metrics/dashboard", dashboardHandler(config.metrics));
     }
+  }
+
+  app.use("/v1/fcm", createLimiter(120));
+  registerPost("/v1/fcm/subscribe", createLimiter(30), fcmSubscribeHandler(fcmStore, pusherRelay));
+  registerPost("/v1/fcm/unsubscribe", createLimiter(30), fcmUnsubscribeHandler(fcmStore));
+  if (config.metrics?.adminToken) {
+    app.get("/v1/fcm/stats", requireAdminToken(config.metrics), fcmStatsHandler(fcmStore));
   }
 
   app.get("/healthz", (_req, res) => {
@@ -166,6 +195,16 @@ const revokeSchema = z.object({
   tokenTypeHint: z.enum(["access_token", "refresh_token"]).optional(),
 });
 
+const fcmSubscribeSchema = z.object({
+  token: z.string().trim().min(20).max(500),
+  kick_user_id: z.string().trim().optional(),
+  channel_ids: z.array(z.string().trim()).max(500),
+});
+
+const fcmUnsubscribeSchema = z.object({
+  token: z.string().trim().min(20).max(500),
+});
+
 const introspectSchema = z.object({
   token: z.string().min(1),
 });
@@ -185,8 +224,6 @@ function createLimiter(max) {
   });
 }
 
-// Canonical string signed by clients. Both the app and the tests must produce
-// exactly this format, so keep it in one place.
 export function hmacCanonicalString({ timestamp, nonce, method, pathname, bodySha256 }) {
   return `${timestamp}\n${nonce}\n${method}\n${pathname}\n${bodySha256}`;
 }
@@ -553,6 +590,41 @@ function introspectHandler(config, upstreamFetch) {
     } catch (error) {
       return sendOAuthError(req, res, error, "OAuth introspect failed", "introspect failed");
     }
+  };
+}
+
+function fcmSubscribeHandler(fcmStore, pusherRelay) {
+  return async (req, res) => {
+    const parsed = fcmSubscribeSchema.safeParse(req.body);
+    if (!parsed.success) return validationError(res, parsed);
+
+    const result = fcmStore.subscribe({
+      token: parsed.data.token,
+      kickUserId: parsed.data.kick_user_id,
+      channelIds: parsed.data.channel_ids,
+    });
+    pusherRelay?.syncSubscriptions();
+
+    return res.status(200).json({
+      ok: true,
+      subscribed_channels: result.subscribedChannels,
+    });
+  };
+}
+
+function fcmUnsubscribeHandler(fcmStore) {
+  return async (req, res) => {
+    const parsed = fcmUnsubscribeSchema.safeParse(req.body);
+    if (!parsed.success) return validationError(res, parsed);
+
+    const removed = fcmStore.unsubscribe({ token: parsed.data.token });
+    return res.status(200).json({ ok: true, unsubscribed: removed });
+  };
+}
+
+function fcmStatsHandler(fcmStore) {
+  return async (_req, res) => {
+    return res.status(200).json({ ok: true, stats: fcmStore.stats() });
   };
 }
 
