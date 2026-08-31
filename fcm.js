@@ -57,6 +57,7 @@ export function createFcmStore({ dataFile, logger } = {}) {
       saveTimer = null;
       persist();
     }, 1000);
+    if (typeof saveTimer.unref === "function") saveTimer.unref();
   }
 
   function persist() {
@@ -323,6 +324,7 @@ export function createPusherRelay({ fcmStore, messaging, logger }) {
       reconnectTimeout = null;
       connect();
     }, 5000);
+    if (typeof reconnectTimeout.unref === "function") reconnectTimeout.unref();
   }
 
   function syncSubscriptions() {

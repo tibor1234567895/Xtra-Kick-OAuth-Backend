@@ -18,6 +18,8 @@ const baseEnv = {
   TRUST_PROXY: "false",
   LOG_LEVEL: "silent",
   ALLOW_UNAUTHENTICATED_OAUTH: "true",
+  FCM_PUSHER_RELAY_ENABLED: "false",
+  FCM_SERVICE_ACCOUNT_KEY_PATH: "none",
 };
 
 function config(overrides = {}) {
