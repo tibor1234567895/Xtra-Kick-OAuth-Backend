@@ -595,10 +595,10 @@ async function waitFor(condition, timeoutMs = 1000) {
   return condition();
 }
 
-test("successful exchange records account via client-credential introspect", async () => {
+test("successful exchange records account via token introspection", async () => {
   const fetchCalls = [];
   const { app, store } = appWithMetrics(async (url, options) => {
-    fetchCalls.push({ url, body: String(options.body) });
+    fetchCalls.push({ url, headers: options?.headers, body: String(options?.body || "") });
     if (String(url).includes("/oauth/token") && !String(url).includes("introspect")) {
       return jsonResponse(200, { access_token: "at", refresh_token: "rt", expires_in: 3600 });
     }
@@ -612,13 +612,65 @@ test("successful exchange records account via client-credential introspect", asy
 
   const introspectCall = fetchCalls.find((c) => String(c.url).includes("introspect"));
   assert.ok(introspectCall, "expected an introspect call");
-  assert.match(introspectCall.body, /token=at/);
-  assert.match(introspectCall.body, /client_id=client-id/);
-  assert.match(introspectCall.body, /client_secret=client-secret/);
+  assert.equal(introspectCall.headers?.Authorization, "Bearer at");
   const stats = store.computeStats();
   assert.equal(stats.accountsMau, 1);
   const accountBucket = latestAccountBucket(store);
   assert.equal(accountBucket.recorded, 1);
+  store.close();
+});
+
+test("successful exchange falls back to users endpoint when introspect omits user_id", async () => {
+  const fetchCalls = [];
+  const { app, store } = appWithMetrics(async (url, options) => {
+    fetchCalls.push({ url, headers: options?.headers });
+    if (String(url).includes("/oauth/token") && !String(url).includes("introspect")) {
+      return jsonResponse(200, { access_token: "at", refresh_token: "rt", expires_in: 3600 });
+    }
+    if (String(url).includes("introspect")) {
+      return jsonResponse(200, { data: { active: true, client_id: "client-id", token_type: "user" } });
+    }
+    if (String(url).includes("/public/v1/users")) {
+      return jsonResponse(200, { data: [{ user_id: "99", name: "fallbackUser" }] });
+    }
+    return jsonResponse(404, {});
+  });
+
+  await withServer(app, async (baseUrl) => {
+    await httpRequest(baseUrl, "POST", "/v1/kick/oauth/exchange", validExchangeBody());
+    await waitFor(() => store.computeStats().accountsMau === 1);
+  });
+
+  const userCall = fetchCalls.find((c) => String(c.url).includes("/public/v1/users"));
+  assert.ok(userCall, "expected a /public/v1/users fallback call");
+  assert.equal(userCall.headers?.Authorization, "Bearer at");
+  const stats = store.computeStats();
+  assert.equal(stats.accountsMau, 1);
+  const accountBucket = latestAccountBucket(store);
+  assert.equal(accountBucket.recorded, 1);
+  store.close();
+});
+
+test("scanner probe endpoints are rejected and categorized as OTHER in metrics", async () => {
+  const { app, store } = appWithMetrics(async () => jsonResponse(200, {}));
+
+  await withServer(app, async (baseUrl) => {
+    const envRes = await httpRequest(baseUrl, "GET", "/v1/.env");
+    assert.equal(envRes.status, 404);
+    assert.deepEqual(envRes.body, { code: "not_found", message: "Not found" });
+
+    const gqlRes = await httpRequest(baseUrl, "POST", "/v1/graphql", { query: "{}" });
+    assert.equal(gqlRes.status, 404);
+
+    const unknownRes = await httpRequest(baseUrl, "GET", "/v1/random-scan-path");
+    assert.equal(unknownRes.status, 404);
+  });
+
+  const counters = store.computeStats().counters.today;
+  assert.ok(counters.endpoints["OTHER / 404"], "expected OTHER / 404 bucket");
+  assert.equal(counters.endpoints["OTHER / 404"].r4, 3);
+  assert.equal(counters.endpoints["GET /v1/.env"], undefined);
+  assert.equal(counters.endpoints["POST /v1/graphql"], undefined);
   store.close();
 });
 

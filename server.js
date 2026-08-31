@@ -98,22 +98,30 @@ export function loadConfig(env = process.env) {
   };
 }
 
+export const KNOWN_ENDPOINTS = new Set([
+  "POST /v1/kick/oauth/exchange",
+  "POST /v1/kick/oauth/refresh",
+  "POST /v1/kick/oauth/revoke",
+  "POST /v1/kick/oauth/introspect",
+  "POST /v1/metrics/ping",
+  "GET /v1/metrics/stats",
+  "GET /v1/metrics/dashboard",
+  "POST /v1/fcm/subscribe",
+  "POST /v1/fcm/unsubscribe",
+  "GET /v1/fcm/stats",
+  "GET /healthz",
+]);
+
+const BLOCKED_PROBE_REGEX = /(\.env|\.git|\.php|\.bak|\.asp|\.jsp|graphql|wp-admin|phpmyadmin|\.\.)/i;
+
 export function createApp(config, deps = {}) {
   const app = express();
   const upstreamFetch = deps.fetch || globalThis.fetch;
 
   app.disable("x-powered-by");
   app.set("trust proxy", config.trustProxy);
+  app.use(createLimiter(180));
   app.use(helmet({ contentSecurityPolicy: false }));
-  app.use(
-    express.json({
-      limit: "32kb",
-      verify: (req, _res, buf) => {
-        req.rawBody = buf;
-      },
-    })
-  );
-  app.use(pinoHttp({ logger: config.logger }));
 
   const metrics = deps.metrics || (config.metrics?.enabled
     ? createMetricsStore({
@@ -128,8 +136,8 @@ export function createApp(config, deps = {}) {
 
   if (metrics) {
     app.use((req, res, next) => {
-      if (!req.path.startsWith("/v1/")) return next();
-      const endpoint = `${req.method} ${req.originalUrl.split("?")[0]}`;
+      const rawEndpoint = `${req.method} ${req.originalUrl.split("?")[0]}`;
+      const endpoint = KNOWN_ENDPOINTS.has(rawEndpoint) ? rawEndpoint : "OTHER / 404";
       res.on("finish", () => {
         try {
           metrics.countersEndpoint(endpoint, res.statusCode);
@@ -140,6 +148,22 @@ export function createApp(config, deps = {}) {
       return next();
     });
   }
+
+  app.use((req, res, next) => {
+    if (BLOCKED_PROBE_REGEX.test(req.originalUrl)) {
+      return res.status(404).json({ code: "not_found", message: "Not found" });
+    }
+    return next();
+  });
+  app.use(
+    express.json({
+      limit: "32kb",
+      verify: (req, _res, buf) => {
+        req.rawBody = buf;
+      },
+    })
+  );
+  app.use(pinoHttp({ logger: config.logger }));
 
   const requireHmac = config.appHmacSecret ? createHmacMiddleware(config, metrics) : null;
   const registerPost = (path, limiter, handler) =>
@@ -186,6 +210,10 @@ export function createApp(config, deps = {}) {
 
   app.get("/healthz", (_req, res) => {
     res.status(200).json({ ok: true });
+  });
+
+  app.use((_req, res) => {
+    return res.status(404).json({ code: "not_found", message: "Not found" });
   });
 
   app.use((err, req, res, _next) => {
@@ -761,38 +789,45 @@ function dashboardHandler(metricsConfig) {
 async function recordAccountFromAccessToken({ accessToken, metrics, upstreamFetch, config }) {
   if (!accessToken || !metrics) return;
   try {
-    // RFC 7662 introspection: the token goes in the form body and the client
-    // authenticates itself with its credentials. The previous implementation
-    // sent the user's access token as a Bearer header, which Kick rejects,
-    // leaving Accounts (MAU) stuck at zero.
-    const response = await fetchWithTimeout(
-      upstreamFetch,
-      KICK_INTROSPECT_URL,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/x-www-form-urlencoded",
-          Accept: "application/json",
-        },
-        body: toForm({
-          token: accessToken,
-          client_id: config.kickClientId,
-          client_secret: config.kickClientSecret,
-        }),
-      },
-      config.upstreamTimeoutMs
-    );
-    if (!response.ok) {
-      metrics.countersAccount(`introspect_http_${response.status}`);
+    const upstream = await postKickAuthed(config, upstreamFetch, KICK_INTROSPECT_URL, accessToken);
+    if (!upstream.ok) {
+      metrics.countersAccount(`introspect_http_${upstream.status}`);
       return;
     }
-    const body = await readJson(response);
-    const data = typeof body.data === "object" && body.data !== null ? body.data : body;
-    if (data.active === false) {
+    const data = typeof upstream.body?.data === "object" && upstream.body?.data !== null
+      ? upstream.body.data
+      : upstream.body;
+
+    if (data?.active === false) {
       metrics.countersAccount("inactive");
       return;
     }
-    const subRaw = data.user_id ?? data.sub ?? null;
+
+    let subRaw = data?.user_id ?? data?.sub ?? null;
+    if (subRaw === null || subRaw === undefined) {
+      try {
+        const userRes = await fetchWithTimeout(
+          upstreamFetch,
+          "https://api.kick.com/public/v1/users",
+          {
+            method: "GET",
+            headers: {
+              Accept: "application/json",
+              Authorization: `Bearer ${accessToken}`,
+            },
+          },
+          config.upstreamTimeoutMs
+        );
+        if (userRes.ok) {
+          const userBody = await readJson(userRes);
+          const userData = Array.isArray(userBody?.data) ? userBody.data[0] : userBody?.data;
+          subRaw = userData?.user_id ?? userData?.id ?? null;
+        }
+      } catch {
+        // Fallback user fetch is best-effort.
+      }
+    }
+
     if (subRaw === null || subRaw === undefined) {
       metrics.countersAccount("no_sub");
       return;
