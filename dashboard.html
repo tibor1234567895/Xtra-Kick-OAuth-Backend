@@ -13,6 +13,9 @@
         --card: #ffffff;
         --border: #e5e5e5;
         --accent: #4f46e5;
+        --accent-soft: rgba(79, 70, 229, 0.35);
+        --good: #16a34a;
+        --bad: #dc2626;
       }
       @media (prefers-color-scheme: dark) {
         :root {
@@ -22,6 +25,9 @@
           --card: #18181b;
           --border: #2a2a2e;
           --accent: #818cf8;
+          --accent-soft: rgba(129, 140, 248, 0.35);
+          --good: #4ade80;
+          --bad: #f87171;
         }
       }
       * { box-sizing: border-box; }
@@ -40,9 +46,7 @@
         margin-bottom: 16px;
         flex-wrap: wrap;
       }
-      input[type="password"] {
-        flex: 1 1 240px;
-        min-width: 200px;
+      input[type="password"], select {
         padding: 8px 10px;
         font: inherit;
         background: var(--card);
@@ -50,6 +54,7 @@
         border: 1px solid var(--border);
         border-radius: 6px;
       }
+      input[type="password"] { flex: 1 1 240px; min-width: 200px; }
       button {
         padding: 8px 14px;
         background: var(--accent);
@@ -59,6 +64,12 @@
         font: inherit;
         cursor: pointer;
       }
+      button.secondary {
+        background: transparent;
+        color: var(--fg);
+        border: 1px solid var(--border);
+      }
+      button.secondary.active { border-color: var(--accent); color: var(--accent); }
       label { font-size: 13px; color: var(--muted); display: inline-flex; align-items: center; gap: 6px; }
       .grid {
         display: grid;
@@ -75,22 +86,39 @@
       .card .k { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }
       .card .v { font-size: 24px; font-weight: 600; margin-top: 4px; }
       .card .h { color: var(--muted); font-size: 12px; margin-top: 4px; }
+      .card .h.up { color: var(--good); }
+      .card .h.down { color: var(--bad); }
       .section { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
       .section h2 { font-size: 14px; font-weight: 600; margin: 0 0 12px; }
       table { width: 100%; border-collapse: collapse; font-size: 13px; }
       th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); }
       th { color: var(--muted); font-weight: 500; }
+      td.num, th.num { text-align: right; }
       .bar-chart {
         display: flex;
         align-items: flex-end;
         gap: 2px;
-        height: 120px;
+        height: 140px;
       }
-      .bar { flex: 1 1 0; background: var(--accent); border-radius: 2px 2px 0 0; min-height: 1px; transition: opacity 0.1s; }
-      .bar:hover { opacity: 0.7; }
+      .bar { flex: 1 1 0; background: var(--accent); border-radius: 2px 2px 0 0; min-height: 1px; transition: opacity 0.1s; position: relative; display: flex; align-items: flex-end; }
+      .bar.new { background: var(--accent-soft); }
+      .bar:hover { opacity: 0.75; }
+      .legend { display: flex; gap: 14px; color: var(--muted); font-size: 12px; margin-top: 8px; }
+      .legend span::before {
+        content: "";
+        display: inline-block;
+        width: 10px; height: 10px;
+        border-radius: 2px;
+        margin-right: 5px;
+        vertical-align: -1px;
+        background: var(--accent);
+      }
+      .legend span.new::before { background: var(--accent-soft); }
       .x-axis { display: flex; justify-content: space-between; color: var(--muted); font-size: 11px; margin-top: 6px; }
       .error { color: #dc2626; padding: 12px; background: #fef2f2; border: 1px solid #fecaca; border-radius: 6px; }
+      @media (prefers-color-scheme: dark) { .error { color: var(--bad); background: rgba(220,38,38,.08); border-color: rgba(220,38,38,.3); } }
       .meta { color: var(--muted); font-size: 12px; margin-top: 4px; }
+      .cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
     </style>
   </head>
   <body>
@@ -98,23 +126,52 @@
     <div class="toolbar">
       <input id="token" type="password" placeholder="Admin token" autocomplete="off" />
       <label><input type="checkbox" id="remember" /> Remember on this device</label>
+      <select id="range">
+        <option value="30">Last 30 days</option>
+        <option value="60" selected>Last 60 days</option>
+        <option value="90">Last 90 days</option>
+      </select>
       <button id="refresh" type="button">Refresh</button>
+      <label><input type="checkbox" id="auto" /> Auto</label>
     </div>
     <div id="root"></div>
     <script>
       const STORAGE_KEY = "metricsAdminToken";
+      const RANGE_KEY = "metricsRange";
       const root = document.getElementById("root");
       const tokenInput = document.getElementById("token");
       const rememberBox = document.getElementById("remember");
+      const rangeSelect = document.getElementById("range");
+      const autoBox = document.getElementById("auto");
+      let autoTimer = null;
 
       const saved = sessionStorage.getItem(STORAGE_KEY);
       if (saved) {
         tokenInput.value = saved;
         rememberBox.checked = true;
       }
+      rangeSelect.value = sessionStorage.getItem(RANGE_KEY) || "60";
+      rangeSelect.addEventListener("change", () => {
+        sessionStorage.setItem(RANGE_KEY, rangeSelect.value);
+        load();
+      });
 
       document.getElementById("refresh").addEventListener("click", load);
       tokenInput.addEventListener("keydown", (e) => { if (e.key === "Enter") load(); });
+      autoBox.addEventListener("change", () => {
+        sessionStorage.setItem("metricsAuto", autoBox.checked ? "1" : "");
+        if (autoBox.checked) {
+          autoTimer = setInterval(load, 60_000);
+          load();
+        } else if (autoTimer) {
+          clearInterval(autoTimer);
+          autoTimer = null;
+        }
+      });
+      if (sessionStorage.getItem("metricsAuto")) {
+        autoBox.checked = true;
+        autoTimer = setInterval(load, 60_000);
+      }
 
       async function load() {
         const token = tokenInput.value.trim();
@@ -128,7 +185,7 @@
           sessionStorage.removeItem(STORAGE_KEY);
         }
         try {
-          const res = await fetch("/v1/metrics/stats", {
+          const res = await fetch("/v1/metrics/stats?days=" + encodeURIComponent(rangeSelect.value), {
             headers: { Authorization: "Bearer " + token },
           });
           if (res.status === 401) throw new Error("Invalid admin token");
@@ -145,44 +202,122 @@
         root.innerHTML = '<div class="error">' + escapeHtml(message) + "</div>";
       }
 
+      function deltaHint(current, previous) {
+        if (previous <= 0) return "";
+        const pct = Math.round((current - previous) / previous * 100);
+        if (pct === 0) return "";
+        const cls = pct > 0 ? "up" : "down";
+        return ' <span class="' + cls + '">' + (pct > 0 ? "+" : "") + pct + "% vs yesterday</span>";
+      }
+
       function render(d) {
-        const maxDau = Math.max(1, ...d.dauSeries.map((p) => p.dau));
-        const first = d.dauSeries[0]?.date || "";
-        const last = d.dauSeries[d.dauSeries.length - 1]?.date || "";
+        const series = d.dauSeries || [];
+        const dauPrev = series.length >= 2 ? series[series.length - 2].dau : 0;
+
+        const maxDau = Math.max(1, ...series.map((p) => p.dau));
+        const first = series[0]?.date || "";
+        const last = series[series.length - 1]?.date || "";
         const html = [
           '<div class="grid">',
           card("Monthly active", fmt(d.mau), ""),
-          card("Active today", fmt(d.dauToday), d.mau > 0 ? Math.round(d.dauToday / d.mau * 100) + "% of MAU" : ""),
-          card("Total installs", fmt(d.totalInstalls), ""),
+          card("Weekly active", fmt(d.wau), ""),
+          card("Active today", fmt(d.dauToday), d.mau > 0 ? Math.round(d.dauToday / d.mau * 100) + "% of MAU" + deltaHint(d.dauToday, dauPrev) : ""),
+          card("New today", fmt(d.newToday), "installs today"),
+          card("Total installs", fmt(d.totalInstalls), "deduplicated"),
           card("Accounts (MAU)", fmt(d.accountsMau), "from logins"),
           "</div>",
           '<div class="section">',
-          '<h2>Daily active (last ' + d.dauSeries.length + " days)</h2>",
-          '<div class="bar-chart">' + d.dauSeries.map((p) =>
-            '<div class="bar" title="' + escapeHtml(p.date) + ": " + p.dau + '" style="height:' + Math.max(2, Math.round(p.dau / maxDau * 100)) + '%"></div>'
+          '<h2>Daily active — returning vs new (last ' + series.length + " days)</h2>",
+          '<div class="bar-chart">' + series.map((p) =>
+            stackBar(p, maxDau)
           ).join("") + "</div>",
           '<div class="x-axis"><span>' + escapeHtml(first) + "</span><span>" + escapeHtml(last) + "</span></div>",
+          '<div class="legend"><span>Returning</span><span class="new">New installs</span></div>',
+          "</div>",
+          '<div class="cols">',
+          '<div class="section">',
+          "<h2>Versions</h2>",
+          labeledTable(d.versions.map((r) => [r.version, r.count]), "version"),
           "</div>",
           '<div class="section">',
-          '<h2>Versions in ' + escapeHtml(d.currentMonth) + "</h2>",
-          versionsTable(d.versions),
+          "<h2>Android versions</h2>",
+          labeledTable((d.os || []).map((r) => [r.label === "unknown" ? "unknown" : "API " + r.label, r.count]), "API level"),
+          "</div>",
+          '<div class="section">',
+          "<h2>Countries</h2>",
+          labeledTable((d.countries || []).map((r) => [r.label, r.count]), "country"),
+          "</div>",
+          "</div>",
+          '<div class="section">',
+          "<h2>Backend health (7 days)</h2>",
+          healthTable(d.counters && d.counters.week),
           "</div>",
           '<div class="meta">Generated ' + escapeHtml(d.generatedAt) + "</div>",
         ].join("");
         root.innerHTML = html;
       }
 
-      function card(k, v, h) {
-        return '<div class="card"><div class="k">' + escapeHtml(k) + '</div><div class="v">' + escapeHtml(v) + '</div>' + (h ? '<div class="h">' + escapeHtml(h) + "</div>" : "") + "</div>";
+      function stackBar(p, maxDau) {
+        const total = Math.max(2, Math.round(p.dau / maxDau * 100));
+        const newPct = p.dau > 0 ? Math.round(p.new / p.dau * 100) : 0;
+        return '<div class="bar" title="' + escapeHtml(p.date) + ": " + p.dau + " active (" + p.returning + " returning, " + p.new + ' new)" style="height:' + total + '%">' +
+          (newPct > 0 ? '<div class="bar new" style="height:' + newPct + '%"></div>' : "") +
+          "</div>";
       }
 
-      function versionsTable(rows) {
-        if (!rows || rows.length === 0) return "<p>No installs recorded this month yet.</p>";
-        const total = rows.reduce((a, r) => a + r.count, 0);
-        return "<table><thead><tr><th>Version</th><th>Devices</th><th>Share</th></tr></thead><tbody>" +
+      function card(k, v, h) {
+        return '<div class="card"><div class="k">' + escapeHtml(k) + '</div><div class="v">' + escapeHtml(v) + '</div>' + (h ? '<div class="h">' + h + "</div>" : "") + "</div>";
+      }
+
+      function labeledTable(rows, emptyLabel) {
+        if (!rows || rows.length === 0) return "<p style=\"color:var(--muted)\">No " + escapeHtml(emptyLabel) + " data yet.</p>";
+        const total = rows.reduce((a, r) => a + r[1], 0);
+        return "<table><thead><tr><th>" + escapeHtml(emptyLabel.charAt(0).toUpperCase() + emptyLabel.slice(1)) + "</th><th class=\"num\">Devices</th><th class=\"num\">Share</th></tr></thead><tbody>" +
           rows.map((r) =>
-            "<tr><td>" + escapeHtml(r.version) + "</td><td>" + r.count + "</td><td>" + Math.round(r.count / total * 100) + "%</td></tr>"
+            "<tr><td>" + escapeHtml(r[0]) + "</td><td class=\"num\">" + r[1] + "</td><td class=\"num\">" + Math.round(r[1] / total * 100) + "%</td></tr>"
           ).join("") + "</tbody></table>";
+      }
+
+      function healthTable(week) {
+        const endpoints = (week && week.endpoints) || {};
+        const names = Object.keys(endpoints).sort();
+        if (names.length === 0) return '<p style="color:var(--muted)">No request data yet.</p>';
+        const rows = names.map((name) => {
+          const e = endpoints[name] || {};
+          const ok = e.ok || 0;
+          const r4 = e.r4 || 0;
+          const r5 = e.r5 || 0;
+          const limited = e.limited || 0;
+          const hmac = e.hmac || 0;
+          const total = ok + r4 + r5 + limited + hmac;
+          const errRate = total > 0 ? Math.round((r4 + r5) / total * 100) : 0;
+          const parts = [];
+          if (r4) parts.push("4xx: " + r4);
+          if (r5) parts.push("5xx: " + r5);
+          if (limited) parts.push("limited: " + limited);
+          if (hmac) parts.push("hmac: " + hmac);
+          return "<tr><td>" + escapeHtml(name) + "</td><td class=\"num\">" + total + "</td><td class=\"num\">" + ok + "</td><td class=\"num\">" + errRate + "%</td><td>" + escapeHtml(parts.join(", ") || "—") + "</td></tr>";
+        });
+        const oauth = (week && week.oauth) || {};
+        const oauthRows = Object.entries(oauth).map(([code, n]) => "<tr><td>" + escapeHtml(code) + "</td><td class=\"num\">" + n + "</td></tr>").join("");
+        const pingC = (week && week.ping) || {};
+        const pingRows = Object.entries(pingC).map(([code, n]) => "<tr><td>" + escapeHtml(code) + "</td><td class=\"num\">" + n + "</td></tr>").join("");
+        const accountC = (week && week.account) || {};
+        const accountRows = Object.entries(accountC).map(([code, n]) => "<tr><td>" + escapeHtml(code) + "</td><td class=\"num\">" + n + "</td></tr>").join("");
+        return (
+          "<table><thead><tr><th>Endpoint</th><th class=\"num\">Requests</th><th class=\"num\">OK</th><th class=\"num\">Err%</th><th>Breakdown</th></tr></thead><tbody>" +
+          rows.join("") + "</tbody></table>" +
+          '<div class="cols" style="margin-top:12px">' +
+          miniSection("OAuth outcomes", oauthRows) +
+          miniSection("Ping outcomes", pingRows) +
+          miniSection("Account capture", accountRows) +
+          "</div>"
+        );
+      }
+
+      function miniSection(title, rows) {
+        if (!rows) return "";
+        return "<div><h2 style=\"font-size:12px;color:var(--muted)\">" + escapeHtml(title) + "</h2><table><tbody>" + rows + "</tbody></table></div>";
       }
 
       function fmt(n) {

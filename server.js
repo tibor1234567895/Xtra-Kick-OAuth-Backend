@@ -115,10 +115,6 @@ export function createApp(config, deps = {}) {
   );
   app.use(pinoHttp({ logger: config.logger }));
 
-  const requireHmac = config.appHmacSecret ? createHmacMiddleware(config) : null;
-  const registerPost = (path, limiter, handler) =>
-    app.post(path, ...(requireHmac ? [requireHmac] : []), limiter, handler);
-
   const metrics = deps.metrics || (config.metrics?.enabled
     ? createMetricsStore({
         salt: config.metrics.salt,
@@ -126,8 +122,28 @@ export function createApp(config, deps = {}) {
         dataPath: config.metrics.dataPath,
         retentionMonths: config.metrics.retentionMonths,
         maxDevicesPerMonth: config.metrics.maxDevicesPerMonth,
+        maxEverSeen: config.metrics.maxEverSeen,
       })
     : null);
+
+  if (metrics) {
+    app.use((req, res, next) => {
+      if (!req.path.startsWith("/v1/")) return next();
+      const endpoint = `${req.method} ${req.originalUrl.split("?")[0]}`;
+      res.on("finish", () => {
+        try {
+          metrics.countersEndpoint(endpoint, res.statusCode);
+        } catch {
+          // Counters are best-effort.
+        }
+      });
+      return next();
+    });
+  }
+
+  const requireHmac = config.appHmacSecret ? createHmacMiddleware(config, metrics) : null;
+  const registerPost = (path, limiter, handler) =>
+    app.post(path, ...(requireHmac ? [requireHmac] : []), limiter, handler);
 
   const fcmStore = deps.fcmStore || createFcmStore({
     dataFile: config.fcm?.dataFile,
@@ -212,6 +228,9 @@ const introspectSchema = z.object({
 const pingSchema = z.object({
   pid: z.string().regex(/^[0-9a-f]{64}$/),
   v: z.string().min(1).max(32).regex(/^[A-Za-z0-9._\-+ ]*$/),
+  os: z.string().regex(/^\d{1,3}$/).optional(),
+  cc: z.string().regex(/^[A-Za-z]{2}$/).optional(),
+  s: z.number().int().min(0).max(100_000).optional(),
 });
 
 function createLimiter(max) {
@@ -236,7 +255,7 @@ function unauthorized(res) {
   return res.status(401).json({ code: "unauthorized", message: "Request signature is invalid" });
 }
 
-function createHmacMiddleware(config) {
+function createHmacMiddleware(config, metrics = null) {
   const toleranceMs = config.hmacToleranceSeconds * 1000;
   const seenNonces = new Map();
   const cleanup = setInterval(() => {
@@ -252,22 +271,31 @@ function createHmacMiddleware(config) {
     const nonce = req.get("x-auth-nonce");
     const signature = req.get("x-auth-signature");
 
-    if (!timestamp || !nonce || !signature || typeof nonce !== "string") {
+    const reject = () => {
+      try {
+        metrics?.countersHmacRejected(`${req.method} ${new URL(req.originalUrl, "http://internal").pathname}`);
+      } catch {
+        // Counters are best-effort.
+      }
       return unauthorized(res);
+    };
+
+    if (!timestamp || !nonce || !signature || typeof nonce !== "string") {
+      return reject();
     }
     if (!/^\d+$/.test(timestamp)) {
-      return unauthorized(res);
+      return reject();
     }
     const now = Date.now();
     if (Math.abs(now - Number(timestamp) * 1000) > toleranceMs) {
-      return unauthorized(res);
+      return reject();
     }
 
     let pathname;
     try {
       pathname = new URL(req.originalUrl, "http://internal").pathname;
     } catch {
-      return unauthorized(res);
+      return reject();
     }
 
     const bodySha256 = createHash("sha256")
@@ -285,13 +313,13 @@ function createHmacMiddleware(config) {
     );
     const provided = Buffer.from(signature.toLowerCase(), "hex");
     if (expected.length !== provided.length || !timingSafeEqual(expected, provided)) {
-      return unauthorized(res);
+      return reject();
     }
 
     const nonceExpiresAt = now + 2 * toleranceMs;
     const previousExpiry = seenNonces.get(nonce);
     if (previousExpiry && previousExpiry > now) {
-      return unauthorized(res);
+      return reject();
     }
     seenNonces.set(nonce, nonceExpiresAt);
 
@@ -494,16 +522,20 @@ function exchangeHandler(config, upstreamFetch, metrics) {
       });
 
       const responseBody = tokenResponse(data);
-      if (metrics && responseBody.access_token) {
-        recordAccountFromAccessToken({
-          accessToken: responseBody.access_token,
-          metrics,
-          upstreamFetch,
-          config,
-        }).catch(() => {});
+      if (metrics) {
+        metrics.countersOauth("exchange_ok");
+        if (responseBody.access_token) {
+          recordAccountFromAccessToken({
+            accessToken: responseBody.access_token,
+            metrics,
+            upstreamFetch,
+            config,
+          }).catch(() => {});
+        }
       }
       return res.status(200).json(responseBody);
     } catch (error) {
+      metrics?.countersOauth(error.code || "exchange_error");
       return sendOAuthError(req, res, error, "OAuth exchange failed", "exchange failed");
     }
   };
@@ -523,16 +555,20 @@ function refreshHandler(config, upstreamFetch, metrics) {
       });
 
       const responseBody = tokenResponse(data);
-      if (metrics && responseBody.access_token) {
-        recordAccountFromAccessToken({
-          accessToken: responseBody.access_token,
-          metrics,
-          upstreamFetch,
-          config,
-        }).catch(() => {});
+      if (metrics) {
+        metrics.countersOauth("refresh_ok");
+        if (responseBody.access_token) {
+          recordAccountFromAccessToken({
+            accessToken: responseBody.access_token,
+            metrics,
+            upstreamFetch,
+            config,
+          }).catch(() => {});
+        }
       }
       return res.status(200).json(responseBody);
     } catch (error) {
+      metrics?.countersOauth(error.code || "refresh_error");
       return sendOAuthError(req, res, error, "OAuth refresh failed", "refresh failed");
     }
   };
@@ -660,14 +696,36 @@ export function startServer(env = process.env, deps = {}) {
 function pingHandler(metrics) {
   return async (req, res) => {
     const parsed = pingSchema.safeParse(req.body);
-    if (!parsed.success) return validationError(res, parsed);
+    if (!parsed.success) {
+      try {
+        metrics.countersPing("invalid");
+      } catch {
+        // Counters are best-effort.
+      }
+      return validationError(res, parsed);
+    }
     try {
       const pidHash = metrics.hashPid(parsed.data.pid);
       const now = new Date();
       const month = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}`;
-      metrics.recordPing({ pidHash, version: parsed.data.v, clientEpoch: month }, now);
+      metrics.recordPing(
+        {
+          pidHash,
+          version: parsed.data.v,
+          clientEpoch: month,
+          os: parsed.data.os,
+          cc: parsed.data.cc,
+          sessions: parsed.data.s,
+        },
+        now
+      );
       return res.status(204).end();
     } catch (error) {
+      try {
+        metrics.countersPing(error.code === "metrics_capacity_reached" ? "capacity" : "epoch");
+      } catch {
+        // Counters are best-effort.
+      }
       req.log.warn({ err: { message: error.message, code: error.code } }, "ping rejected");
       return res.status(error.status || 400).json({ code: error.code || "invalid_request", message: error.message });
     }
@@ -675,8 +733,10 @@ function pingHandler(metrics) {
 }
 
 function statsHandler(metrics) {
-  return async (_req, res) => {
-    const payload = metrics.computeStats(new Date());
+  return async (req, res) => {
+    const daysParam = req.query.days;
+    const days = typeof daysParam === "string" && /^\d{1,3}$/.test(daysParam) ? Number(daysParam) : 60;
+    const payload = metrics.computeStats(new Date(), days);
     return res.status(200).json(payload);
   };
 }
@@ -701,16 +761,47 @@ function dashboardHandler(metricsConfig) {
 async function recordAccountFromAccessToken({ accessToken, metrics, upstreamFetch, config }) {
   if (!accessToken || !metrics) return;
   try {
-    const response = await postKickAuthed(config, upstreamFetch, KICK_INTROSPECT_URL, accessToken);
-    if (!response.ok) return;
-    const body = response.body && typeof response.body === "object" ? response.body : {};
+    // RFC 7662 introspection: the token goes in the form body and the client
+    // authenticates itself with its credentials. The previous implementation
+    // sent the user's access token as a Bearer header, which Kick rejects,
+    // leaving Accounts (MAU) stuck at zero.
+    const response = await fetchWithTimeout(
+      upstreamFetch,
+      KICK_INTROSPECT_URL,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          Accept: "application/json",
+        },
+        body: toForm({
+          token: accessToken,
+          client_id: config.kickClientId,
+          client_secret: config.kickClientSecret,
+        }),
+      },
+      config.upstreamTimeoutMs
+    );
+    if (!response.ok) {
+      metrics.countersAccount(`introspect_http_${response.status}`);
+      return;
+    }
+    const body = await readJson(response);
     const data = typeof body.data === "object" && body.data !== null ? body.data : body;
+    if (data.active === false) {
+      metrics.countersAccount("inactive");
+      return;
+    }
     const subRaw = data.user_id ?? data.sub ?? null;
-    if (subRaw === null || subRaw === undefined) return;
+    if (subRaw === null || subRaw === undefined) {
+      metrics.countersAccount("no_sub");
+      return;
+    }
     const subHash = metrics.hashSub(String(subRaw));
     metrics.recordAccount({ subHash });
+    metrics.countersAccount("recorded");
   } catch {
-    // Fire-and-forget; failures are silent.
+    metrics.countersAccount("error");
   }
 }
 

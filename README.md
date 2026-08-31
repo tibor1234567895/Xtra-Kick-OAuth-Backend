@@ -29,8 +29,15 @@ Minimal OAuth proxy for Kick token operations.
 - `LOG_LEVEL` defaults to `info`.
 - `METRICS_MAX_DEVICES_PER_MONTH` defaults to `100000` and bounds anonymous
   metrics storage for the active month.
+- `METRICS_RETENTION_MONTHS` defaults to `3` (stats can chart up to 90 days).
+- `METRICS_MAX_EVERSEEN` defaults to `250000` and caps the install-dedup set.
+- The stats payload includes DAU/WAU/MAU, deduplicated installs, new-vs-returning
+  daily series, version/OS/country breakdowns, and 7-day backend health counters
+  (per-endpoint request outcomes, OAuth grant outcomes, ping rejections, and
+  account-capture results).
 - The dashboard HTML is intentionally public as a login shell; its `/v1/metrics/stats`
-  data request requires `METRICS_ADMIN_TOKEN`.
+  data request requires `METRICS_ADMIN_TOKEN`. It supports 30/60/90-day ranges,
+  auto-refresh, and reads `?days=` from `/v1/metrics/stats`.
 
 ## Notes
 - Keep `KICK_CLIENT_SECRET` only on backend.

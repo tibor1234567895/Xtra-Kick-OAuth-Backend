@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { createHash } from "node:crypto";
 import { test } from "node:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import pino from "pino";
@@ -519,6 +519,192 @@ test("account counter records hashed sub once per month", () => {
   assert.equal(stats.accountsMau, 1);
   store.close();
 });
+
+test("install is deduped across months for a returning device", () => {
+  const store = createMetricsStore({ salt: "s", accountSalt: "s", dataPath: null });
+  const pidHash = "c".repeat(64);
+  const now = new Date();
+  const prevMonth = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 15));
+
+  store.recordPing({ pidHash, version: "2.0.0", clientEpoch: monthStringOf(prevMonth) }, prevMonth);
+  store.recordPing({ pidHash, version: "2.1.0", clientEpoch: monthStringOf(now) }, now);
+
+  const stats = store.computeStats();
+  assert.equal(stats.totalInstalls, 1);
+  assert.equal(stats.mau, 1);
+  store.close();
+});
+
+test("ping v2 fields surface in stats and series", async () => {
+  const { app, store } = appWithMetrics(async () => jsonResponse(200, {}));
+
+  await withServer(app, (baseUrl) =>
+    httpRequest(baseUrl, "POST", "/v1/metrics/ping", { ...makePingBody(), os: "34", cc: "de", s: 3 })
+  );
+
+  const stats = store.computeStats();
+  assert.equal(stats.os[0].label, "34");
+  assert.equal(stats.countries[0].label, "DE");
+  assert.equal(stats.sessionsToday, 3);
+  assert.equal(stats.wau, 1);
+  const today = stats.dauSeries[stats.dauSeries.length - 1];
+  assert.equal(today.dau, 1);
+  assert.equal(today.new, 1);
+  assert.equal(today.returning, 0);
+  store.close();
+});
+
+test("same-day returning pings keep new/returning split intact", async () => {
+  const { app, store } = appWithMetrics(async () => jsonResponse(200, {}));
+
+  await withServer(app, async (baseUrl) => {
+    await httpRequest(baseUrl, "POST", "/v1/metrics/ping", makePingBody());
+    await httpRequest(baseUrl, "POST", "/v1/metrics/ping", makePingBody());
+  });
+
+  const today = store.computeStats().dauSeries.at(-1);
+  assert.equal(today.dau, 1);
+  assert.equal(today.new, 1);
+  assert.equal(today.returning, 0);
+  store.close();
+});
+
+test("endpoint and oauth outcome counters are recorded", async () => {
+  const { app, store } = appWithMetrics(async () =>
+    jsonResponse(400, { error: "invalid_grant" })
+  );
+
+  await withServer(app, async (baseUrl) => {
+    await httpRequest(baseUrl, "POST", "/v1/metrics/ping", makePingBody());
+    await httpRequest(baseUrl, "POST", "/v1/kick/oauth/refresh", { refreshToken: "refresh-token" });
+  });
+
+  const counters = store.computeStats().counters.today;
+  assert.equal(counters.endpoints["POST /v1/metrics/ping"].ok, 1);
+  assert.equal(counters.endpoints["POST /v1/kick/oauth/refresh"].r4, 1);
+  assert.equal(counters.oauth.invalid_grant, 1);
+  store.close();
+});
+
+async function waitFor(condition, timeoutMs = 1000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (condition()) return true;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  return condition();
+}
+
+test("successful exchange records account via client-credential introspect", async () => {
+  const fetchCalls = [];
+  const { app, store } = appWithMetrics(async (url, options) => {
+    fetchCalls.push({ url, body: String(options.body) });
+    if (String(url).includes("/oauth/token") && !String(url).includes("introspect")) {
+      return jsonResponse(200, { access_token: "at", refresh_token: "rt", expires_in: 3600 });
+    }
+    return jsonResponse(200, { data: { active: true, user_id: "42", username: "tester" } });
+  });
+
+  await withServer(app, async (baseUrl) => {
+    await httpRequest(baseUrl, "POST", "/v1/kick/oauth/exchange", validExchangeBody());
+    await waitFor(() => store.computeStats().accountsMau === 1);
+  });
+
+  const introspectCall = fetchCalls.find((c) => String(c.url).includes("introspect"));
+  assert.ok(introspectCall, "expected an introspect call");
+  assert.match(introspectCall.body, /token=at/);
+  assert.match(introspectCall.body, /client_id=client-id/);
+  assert.match(introspectCall.body, /client_secret=client-secret/);
+  const stats = store.computeStats();
+  assert.equal(stats.accountsMau, 1);
+  const accountBucket = latestAccountBucket(store);
+  assert.equal(accountBucket.recorded, 1);
+  store.close();
+});
+
+test("introspect failure increments account counter instead of failing silently", async () => {
+  const { app, store } = appWithMetrics(async (url) => {
+    if (String(url).includes("/oauth/token") && !String(url).includes("introspect")) {
+      return jsonResponse(200, { access_token: "at", refresh_token: "rt", expires_in: 3600 });
+    }
+    return jsonResponse(401, { message: "unauthorized" });
+  });
+
+  await withServer(app, async (baseUrl) => {
+    await httpRequest(baseUrl, "POST", "/v1/kick/oauth/exchange", validExchangeBody());
+    await waitFor(() => Object.keys(store.state.counters).length > 0 && Object.keys(latestAccountBucket(store)).length > 0);
+  });
+
+  const accountBucket = latestAccountBucket(store);
+  assert.equal(accountBucket.introspect_http_401, 1);
+  assert.equal(store.computeStats().accountsMau, 0);
+  store.close();
+});
+
+test("ping rejection counters track invalid payloads", async () => {
+  const { app, store } = appWithMetrics(async () => jsonResponse(200, {}));
+
+  await withServer(app, async (baseUrl) => {
+    await httpRequest(baseUrl, "POST", "/v1/metrics/ping", { pid: "nothex", v: "1" });
+  });
+
+  const pingCounters = store.state.counters[Object.keys(store.state.counters)[0]].ping;
+  assert.equal(pingCounters.invalid, 1);
+  store.close();
+});
+
+test("stats honors days query parameter", async () => {
+  const { app, store } = appWithMetrics(async () => jsonResponse(200, {}));
+
+  const response = await withServer(app, (baseUrl) =>
+    httpRequest(baseUrl, "GET", "/v1/metrics/stats?days=30", undefined, {
+      headers: { Authorization: "Bearer admin-secret" },
+    })
+  );
+
+  assert.equal(response.status, 200);
+  assert.equal(response.body.dauSeries.length, 30);
+  store.close();
+});
+
+test("schema 1 store file is migrated without losing data", () => {
+  const dir = mkdtempSync(join(tmpdir(), "metrics-v1-"));
+  const file = join(dir, "m.json");
+  const month = monthStringOf(new Date());
+  try {
+    writeFileSync(
+      file,
+      JSON.stringify({
+        version: 1,
+        totalInstalls: 7,
+        devices: { [month]: { ["e".repeat(64)]: { v: "1.0.0", d: 1 } } },
+        accounts: { [month]: { "sub1": true } },
+      })
+    );
+    const store = createMetricsStore({ salt: "s", accountSalt: "s", dataPath: file });
+    const stats = store.computeStats();
+    assert.equal(stats.totalInstalls, 7);
+    assert.equal(stats.mau, 1);
+    assert.equal(stats.accountsMau, 1);
+
+    // First v2 ping counts once as install (baseline), then dedup applies.
+    store.recordPing({ pidHash: "f".repeat(64), version: "2.0.0", clientEpoch: month });
+    store.recordPing({ pidHash: "f".repeat(64), version: "2.0.0", clientEpoch: month });
+    assert.equal(store.computeStats().totalInstalls, 8);
+    store.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+function monthStringOf(date) {
+  return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, "0")}`;
+}
+
+function latestAccountBucket(store) {
+  const days = Object.keys(store.state.counters).sort();
+  return store.state.counters[days[days.length - 1]].account;
+}
 
 test("metrics store persists and reloads across instances", () => {
   const dir = mkdtempSync(join(tmpdir(), "metrics-"));
