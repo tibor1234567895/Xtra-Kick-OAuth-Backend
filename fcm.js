@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileS
 import { dirname } from "node:path";
 import WebSocket from "ws";
 import admin from "firebase-admin";
+import { getMessaging } from "firebase-admin/messaging";
 
 const PUSHER_URL = "wss://ws-us2.pusher.com/app/32cbd69e4b950bf97679?protocol=7&client=js&version=8.5.0&flash=false";
 
@@ -181,13 +182,15 @@ export function initFirebaseMessaging({ serviceAccountPath, logger } = {}) {
   try {
     const raw = readFileSync(serviceAccountPath, "utf8");
     const serviceAccount = JSON.parse(raw);
-    const app = admin.apps.length > 0
-      ? admin.app()
+    // firebase-admin v14 moved the app/credential helpers to top-level named
+    // exports (admin.apps / admin.credential no longer exist).
+    const app = admin.getApps().length > 0
+      ? admin.getApp()
       : admin.initializeApp({
-          credential: admin.credential.cert(serviceAccount),
+          credential: admin.cert(serviceAccount),
         });
     logger?.info("fcm_firebase_admin_initialized");
-    return app.messaging();
+    return getMessaging(app);
   } catch (err) {
     logger?.error({ err: err.message }, "fcm_firebase_admin_init_failed");
     return null;
