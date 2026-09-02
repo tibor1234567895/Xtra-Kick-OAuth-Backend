@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import pino from "pino";
 import { computeHmacSignature, createApp, loadConfig, redactPaths } from "./server.js";
 import { createMetricsStore } from "./metrics.js";
-import { createFcmStore, sendLivePushNotification } from "./fcm.js";
+import { createFcmStore, createPusherRelay, sendLivePushNotification } from "./fcm.js";
 
 const baseEnv = {
   KICK_CLIENT_ID: "client-id",
@@ -890,3 +890,87 @@ test("sendLivePushNotification handles multicast response and prunes invalid tok
   assert.deepEqual(result.invalidTokens, [invalidToken]);
   assert.deepEqual(fcmStore.getTokensForChannel("888"), [validToken]);
 });
+
+test("handleLiveEvent matches subscribers by channelId, userId, and slug", async () => {
+  const fcmStore = createFcmStore({ dataFile: null });
+  const tokenChannel = "token_channel_668";
+  const tokenUser = "token_user_676";
+  const tokenSlug = "token_slug_xqc";
+  const tokenUnrelated = "token_unrelated_999";
+
+  fcmStore.subscribe({ token: tokenChannel, channelIds: ["668"] });
+  fcmStore.subscribe({ token: tokenUser, channelIds: ["676"] });
+  fcmStore.subscribe({ token: tokenSlug, channelIds: ["xqc"] });
+  fcmStore.subscribe({ token: tokenUnrelated, channelIds: ["999"] });
+
+  let sentPayload = null;
+  const mockMessaging = {
+    sendEachForMulticast: async (payload) => {
+      sentPayload = payload;
+      return {
+        successCount: payload.tokens.length,
+        failureCount: 0,
+        responses: payload.tokens.map(() => ({ success: true })),
+      };
+    },
+  };
+
+  const relay = createPusherRelay({
+    fcmStore,
+    messaging: mockMessaging,
+    logger: null,
+  });
+
+  const kickLiveMessage = {
+    event: "App\\Events\\NotifyFollowersStreamHasStarted",
+    channel: "channel.668",
+    data: JSON.stringify({
+      user_id: 676,
+      title: "xQc is live!",
+      description: "Chatting",
+      path: "/xqc",
+      profile_picture: "https://example.com/avatar.jpg",
+    }),
+  };
+
+  relay.handleLiveEvent(kickLiveMessage);
+  relay.close();
+
+  assert.ok(sentPayload, "Multicast payload should have been sent");
+  assert.equal(sentPayload.data.type, "stream_live");
+  assert.equal(sentPayload.data.channel_id, "668");
+  assert.equal(sentPayload.data.user_id, "676");
+  assert.equal(sentPayload.data.channel_slug, "xqc");
+  assert.deepEqual(new Set(sentPayload.tokens), new Set([tokenChannel, tokenUser, tokenSlug]));
+  assert.ok(!sentPayload.tokens.includes(tokenUnrelated));
+});
+
+test("sendLivePushNotification includes channel_id and properly trims leading slashes from slug", async () => {
+  let capturedPayload = null;
+  const mockMessaging = {
+    sendEachForMulticast: async (payload) => {
+      capturedPayload = payload;
+      return { successCount: 1, failureCount: 0, responses: [{ success: true }] };
+    },
+  };
+
+  await sendLivePushNotification({
+    messaging: mockMessaging,
+    tokens: ["dummy_token_1234567890"],
+    channelId: "668",
+    userId: "676",
+    channelSlug: "/xqc",
+    title: "xQc is live!",
+    description: "Just Chatting",
+    profilePicture: "https://example.com/pfp.jpg",
+    logger: null,
+  });
+
+  assert.ok(capturedPayload);
+  assert.equal(capturedPayload.data.channel_id, "668");
+  assert.equal(capturedPayload.data.user_id, "676");
+  assert.equal(capturedPayload.data.channel_slug, "xqc");
+  assert.equal(capturedPayload.android.priority, "high");
+});
+
+

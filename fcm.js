@@ -201,6 +201,7 @@ export function initFirebaseMessaging({ serviceAccountPath, logger } = {}) {
 export async function sendLivePushNotification({
   messaging,
   tokens,
+  channelId,
   userId,
   channelSlug,
   title,
@@ -211,11 +212,12 @@ export async function sendLivePushNotification({
 }) {
   if (!messaging || !tokens || tokens.length === 0) return { successCount: 0, failureCount: 0 };
 
-  const cleanSlug = String(channelSlug || userId || "").trim().replace(/^\+/, "");
+  const cleanSlug = String(channelSlug || userId || "").trim().replace(/^\/+/, "");
   const payload = {
     tokens,
     data: {
       type: "stream_live",
+      channel_id: String(channelId || ""),
       user_id: String(userId || ""),
       channel_slug: cleanSlug,
       title: String(title || `${cleanSlug} is live!`),
@@ -272,7 +274,42 @@ export function createPusherRelay({ fcmStore, messaging, logger }) {
   let ws = null;
   let isClosed = false;
   let reconnectTimeout = null;
+  let pingInterval = null;
+  let pongTimeout = null;
   let subscribedChannels = new Set();
+
+  function startHeartbeat(activityTimeoutSec = 120) {
+    stopHeartbeat();
+    const intervalMs = Math.max(10000, Math.floor((activityTimeoutSec * 1000) / 2));
+    pingInterval = setInterval(() => {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        try {
+          ws.send(JSON.stringify({ event: "pusher:ping", data: {} }));
+          if (!pongTimeout) {
+            pongTimeout = setTimeout(() => {
+              logger?.warn("pusher_relay_pong_timeout_reconnecting");
+              if (ws) ws.close();
+            }, 30000);
+            if (typeof pongTimeout.unref === "function") pongTimeout.unref();
+          }
+        } catch (e) {
+          // send failure will trigger close
+        }
+      }
+    }, intervalMs);
+    if (typeof pingInterval.unref === "function") pingInterval.unref();
+  }
+
+  function stopHeartbeat() {
+    if (pingInterval) {
+      clearInterval(pingInterval);
+      pingInterval = null;
+    }
+    if (pongTimeout) {
+      clearTimeout(pongTimeout);
+      pongTimeout = null;
+    }
+  }
 
   function connect() {
     if (isClosed) return;
@@ -282,6 +319,7 @@ export function createPusherRelay({ fcmStore, messaging, logger }) {
       ws.on("open", () => {
         logger?.info("pusher_relay_connected");
         subscribedChannels.clear();
+        startHeartbeat(120);
         syncSubscriptions();
       });
 
@@ -290,6 +328,23 @@ export function createPusherRelay({ fcmStore, messaging, logger }) {
           const msg = JSON.parse(raw.toString());
           if (msg.event === "pusher:ping") {
             ws.send(JSON.stringify({ event: "pusher:pong", data: {} }));
+            return;
+          }
+          if (msg.event === "pusher:pong") {
+            if (pongTimeout) {
+              clearTimeout(pongTimeout);
+              pongTimeout = null;
+            }
+            return;
+          }
+          if (msg.event === "pusher:connection_established") {
+            let timeout = 120;
+            try {
+              const estData = typeof msg.data === "string" ? JSON.parse(msg.data) : msg.data;
+              if (estData?.activity_timeout) timeout = Number(estData.activity_timeout);
+            } catch {}
+            startHeartbeat(timeout);
+            syncSubscriptions();
             return;
           }
           if (
@@ -306,6 +361,7 @@ export function createPusherRelay({ fcmStore, messaging, logger }) {
 
       ws.on("close", () => {
         logger?.warn("pusher_relay_disconnected");
+        stopHeartbeat();
         ws = null;
         scheduleReconnect();
       });
@@ -346,19 +402,31 @@ export function createPusherRelay({ fcmStore, messaging, logger }) {
 
   function handleLiveEvent(msg) {
     try {
-      const data = typeof msg.data === "string" ? JSON.parse(msg.data) : msg.data;
-      if (!data) return;
-      const userId = data.user_id ? String(data.user_id) : null;
-      if (!userId) return;
+      const data = typeof msg.data === "string" ? JSON.parse(msg.data) : (msg.data || {});
+      const channelFromPusher = typeof msg.channel === "string" ? msg.channel.replace(/^channel\./, "").trim() : null;
+      const userId = data.user_id ? String(data.user_id).trim() : null;
+      const channelIdFromData = data.channel_id ? String(data.channel_id).trim() : null;
+      const slug = String(data.path || data.slug || data.channel_slug || "")
+        .trim()
+        .replace(/^\/+/, "")
+        .toLowerCase();
 
-      const tokens = fcmStore.getTokensForChannel(userId);
+      const candidateKeys = [channelFromPusher, channelIdFromData, userId, slug].filter(Boolean);
+      const tokenSet = new Set();
+      for (const key of candidateKeys) {
+        for (const tok of fcmStore.getTokensForChannel(key)) {
+          tokenSet.add(tok);
+        }
+      }
+      const tokens = Array.from(tokenSet);
       if (tokens.length === 0) return;
 
       sendLivePushNotification({
         messaging,
         tokens,
+        channelId: channelFromPusher || channelIdFromData,
         userId,
-        channelSlug: data.path,
+        channelSlug: slug || channelFromPusher || userId,
         title: data.title,
         description: data.description,
         profilePicture: data.profile_picture,
@@ -377,6 +445,7 @@ export function createPusherRelay({ fcmStore, messaging, logger }) {
     handleLiveEvent,
     close() {
       isClosed = true;
+      stopHeartbeat();
       if (reconnectTimeout) clearTimeout(reconnectTimeout);
       if (ws) {
         ws.close();
