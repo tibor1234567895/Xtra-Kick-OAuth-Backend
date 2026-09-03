@@ -386,6 +386,7 @@ export function createPusherRelay({ fcmStore, messaging, logger }) {
   function syncSubscriptions() {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     const activeChannels = fcmStore.getActiveChannels();
+    let added = 0;
     for (const ch of activeChannels) {
       const pusherChannel = `channel.${ch}`;
       if (!subscribedChannels.has(pusherChannel)) {
@@ -396,8 +397,13 @@ export function createPusherRelay({ fcmStore, messaging, logger }) {
           })
         );
         subscribedChannels.add(pusherChannel);
+        added++;
       }
     }
+    logger?.info(
+      { active: activeChannels.length, subscribed: subscribedChannels.size, added },
+      "pusher_relay_subscriptions_synced"
+    );
   }
 
   function handleLiveEvent(msg) {
@@ -419,7 +425,19 @@ export function createPusherRelay({ fcmStore, messaging, logger }) {
         }
       }
       const tokens = Array.from(tokenSet);
-      if (tokens.length === 0) return;
+      if (tokens.length === 0) {
+        logger?.warn(
+          {
+            event: msg.event,
+            pusherChannel: channelFromPusher,
+            channelId: channelIdFromData,
+            userId,
+            slug,
+          },
+          "pusher_relay_live_event_no_subscribers"
+        );
+        return;
+      }
 
       sendLivePushNotification({
         messaging,
