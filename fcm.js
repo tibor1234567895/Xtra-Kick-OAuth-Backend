@@ -5,6 +5,56 @@ import admin from "firebase-admin";
 import { getMessaging } from "firebase-admin/messaging";
 
 const PUSHER_URL = "wss://ws-us2.pusher.com/app/32cbd69e4b950bf97679?protocol=7&client=js&version=8.5.0&flash=false";
+const channelResolutionCache = new Map(); // slug/id -> { channelId, userId, slug, expiresAt }
+const RESOLUTION_TTL_MS = 24 * 60 * 60 * 1000;
+
+export async function resolveKickChannel(slugOrId, { fetchFn = globalThis.fetch, logger } = {}) {
+  const key = String(slugOrId || "").trim().toLowerCase();
+  if (!key) return null;
+
+  const cached = channelResolutionCache.get(key);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached;
+  }
+
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5000);
+    const res = await fetchFn(`https://kick.com/api/v2/channels/${encodeURIComponent(key)}`, {
+      headers: {
+        "Accept": "application/json",
+      },
+      signal: controller.signal,
+    }).finally(() => clearTimeout(timer));
+
+    if (!res.ok) return null;
+    const body = await res.json();
+    if (!body || !body.id) return null;
+
+    const result = {
+      channelId: String(body.id),
+      userId: body.user_id ? String(body.user_id) : null,
+      slug: body.slug ? String(body.slug).toLowerCase() : key,
+      expiresAt: Date.now() + RESOLUTION_TTL_MS,
+    };
+
+    channelResolutionCache.set(key, result);
+    channelResolutionCache.set(result.channelId, result);
+    if (result.userId) channelResolutionCache.set(result.userId, result);
+    if (result.slug) channelResolutionCache.set(result.slug, result);
+
+    if (channelResolutionCache.size > 5000) {
+      const oldestKey = channelResolutionCache.keys().next().value;
+      if (oldestKey) channelResolutionCache.delete(oldestKey);
+    }
+
+    logger?.info({ key, channelId: result.channelId, slug: result.slug }, "kick_channel_resolved");
+    return result;
+  } catch (err) {
+    logger?.warn({ key, err: err.message }, "kick_channel_resolve_failed");
+    return null;
+  }
+}
 
 export function loadFcmConfig(env = process.env) {
   const serviceAccountPath = env.FCM_SERVICE_ACCOUNT_KEY_PATH || "./firebase-service-account.json";
@@ -147,6 +197,30 @@ export function createFcmStore({ dataFile, logger } = {}) {
 
     getActiveChannels() {
       return Array.from(channelIndex.keys());
+    },
+
+    addAliasesToToken(token, aliases) {
+      const normalizedToken = String(token).trim();
+      const existing = tokens.get(normalizedToken);
+      if (!existing || !Array.isArray(aliases) || aliases.length === 0) return 0;
+
+      let addedCount = 0;
+      for (const alias of aliases) {
+        const normalized = String(alias).trim();
+        if (!normalized) continue;
+        if (!existing.channelIds.has(normalized)) {
+          existing.channelIds.add(normalized);
+          if (!channelIndex.has(normalized)) channelIndex.set(normalized, new Set());
+          channelIndex.get(normalized).add(normalizedToken);
+          addedCount++;
+        }
+      }
+
+      if (addedCount > 0) {
+        existing.updatedAt = Date.now();
+        scheduleSave();
+      }
+      return addedCount;
     },
 
     pruneInvalidTokens(invalidTokens) {

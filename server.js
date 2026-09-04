@@ -18,6 +18,7 @@ import {
   createPusherRelay,
   initFirebaseMessaging,
   loadFcmConfig,
+  resolveKickChannel,
 } from "./fcm.js";
 
 const KICK_TOKEN_URL = "https://id.kick.com/oauth/token";
@@ -202,7 +203,7 @@ export function createApp(config, deps = {}) {
   }
 
   app.use("/v1/fcm", createLimiter(120));
-  registerPost("/v1/fcm/subscribe", createLimiter(30), fcmSubscribeHandler(fcmStore, pusherRelay));
+  registerPost("/v1/fcm/subscribe", createLimiter(30), fcmSubscribeHandler(fcmStore, pusherRelay, { upstreamFetch, config }));
   registerPost("/v1/fcm/unsubscribe", createLimiter(30), fcmUnsubscribeHandler(fcmStore));
   if (config.metrics?.adminToken) {
     app.get("/v1/fcm/stats", requireAdminToken(config.metrics), fcmStatsHandler(fcmStore));
@@ -242,7 +243,7 @@ const revokeSchema = z.object({
 const fcmSubscribeSchema = z.object({
   token: z.string().trim().min(20).max(500),
   kick_user_id: z.string().trim().optional(),
-  channel_ids: z.array(z.string().trim()).max(500),
+  channel_ids: z.array(z.string().trim().min(1).max(100)).max(500),
 });
 
 const fcmUnsubscribeSchema = z.object({
@@ -657,7 +658,7 @@ function introspectHandler(config, upstreamFetch) {
   };
 }
 
-function fcmSubscribeHandler(fcmStore, pusherRelay) {
+function fcmSubscribeHandler(fcmStore, pusherRelay, { upstreamFetch, config } = {}) {
   return async (req, res) => {
     const parsed = fcmSubscribeSchema.safeParse(req.body);
     if (!parsed.success) return validationError(res, parsed);
@@ -668,6 +669,46 @@ function fcmSubscribeHandler(fcmStore, pusherRelay) {
       channelIds: parsed.data.channel_ids,
     });
     pusherRelay?.syncSubscriptions();
+
+    // In the background, resolve any slugs or keys so numeric channel_ids are guaranteed
+    // to be subscribed on the Pusher WebSocket and registered to the device token.
+    const token = parsed.data.token;
+    const channelIds = parsed.data.channel_ids;
+    const fetchFn = upstreamFetch || globalThis.fetch;
+    const logger = req.log || config?.logger;
+
+    (async () => {
+      try {
+        const nonNumeric = channelIds.filter((id) => !/^\d+$/.test(id));
+        if (nonNumeric.length === 0) return;
+
+        const resolvedIds = [];
+        // Resolve with controlled concurrency
+        const BATCH_SIZE = 5;
+        for (let i = 0; i < nonNumeric.length; i += BATCH_SIZE) {
+          const batch = nonNumeric.slice(i, i + BATCH_SIZE);
+          const results = await Promise.all(
+            batch.map((slug) => resolveKickChannel(slug, { fetchFn, logger }))
+          );
+          for (const r of results) {
+            if (r) {
+              if (r.channelId) resolvedIds.push(r.channelId);
+              if (r.userId) resolvedIds.push(r.userId);
+            }
+          }
+        }
+
+        if (resolvedIds.length > 0) {
+          const added = fcmStore.addAliasesToToken(token, resolvedIds);
+          if (added > 0) {
+            pusherRelay?.syncSubscriptions();
+            logger?.info({ token: token.slice(-8), resolvedCount: resolvedIds.length, added }, "fcm_slugs_resolved_and_synced");
+          }
+        }
+      } catch (err) {
+        logger?.warn({ err: err.message }, "fcm_background_slug_resolution_failed");
+      }
+    })().catch(() => {});
 
     return res.status(200).json({
       ok: true,

@@ -973,4 +973,64 @@ test("sendLivePushNotification includes channel_id and properly trims leading sl
   assert.equal(capturedPayload.android.priority, "high");
 });
 
+test("fcmStore.addAliasesToToken adds new channels to existing token without wiping old ones", () => {
+  const store = createFcmStore({ dataFile: null });
+  const token = "x".repeat(32);
+  store.subscribe({ token, channelIds: ["xqc"] });
+
+  assert.deepEqual(store.getTokensForChannel("xqc"), [token]);
+  assert.deepEqual(store.getTokensForChannel("668"), []);
+
+  const added = store.addAliasesToToken(token, ["668", "676", "xqc"]);
+  assert.equal(added, 2); // 668 and 676 added, xqc was already present
+
+  assert.deepEqual(store.getTokensForChannel("xqc"), [token]);
+  assert.deepEqual(store.getTokensForChannel("668"), [token]);
+  assert.deepEqual(store.getTokensForChannel("676"), [token]);
+});
+
+test("POST /v1/fcm/subscribe resolves non-numeric slugs in the background", async () => {
+  const fcmStore = createFcmStore({ dataFile: null });
+  const token = "z".repeat(32);
+
+  const mockFetch = async (url) => {
+    if (url.includes("/channels/xqc")) {
+      return {
+        ok: true,
+        json: async () => ({ id: 668, user_id: 676, slug: "xqc" }),
+      };
+    }
+    return { ok: false, status: 404 };
+  };
+
+  const app = createApp(
+    config({
+      fcm: { pusherRelayEnabled: false },
+    }),
+    {
+      fcmStore,
+      messaging: null,
+      fetch: mockFetch,
+    }
+  );
+
+  await withServer(app, async (baseUrl) => {
+    const response = await httpRequest(baseUrl, "POST", "/v1/fcm/subscribe", {
+      token,
+      channel_ids: ["xqc"],
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(response.body.ok, true);
+
+    // Wait briefly for the background resolution promise to settle
+    await new Promise((r) => setTimeout(r, 60));
+
+    // Verify that numeric channel 668 and user 676 were added as aliases to the token
+    assert.deepEqual(fcmStore.getTokensForChannel("668"), [token]);
+    assert.deepEqual(fcmStore.getTokensForChannel("676"), [token]);
+    assert.deepEqual(fcmStore.getTokensForChannel("xqc"), [token]);
+  });
+});
+
 
