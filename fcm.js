@@ -687,6 +687,7 @@ export function createLiveStreamPoller({
   let isClosed = false;
   let timer = null;
   let isPolling = false;
+  let isFirstPoll = true;
   // Map of broadcaster_user_id (or slug/channel_id) -> streamStartTime
   const seenStreams = new Map();
 
@@ -809,9 +810,8 @@ export function createLiveStreamPoller({
           liveCount++;
           const lastStartTime = seenStreams.get(channelKey);
           if (lastStartTime !== startTime) {
-            // Transition: stream just started!
+            // Transition: stream just started (or first time seeing it)
             seenStreams.set(channelKey, startTime);
-            newStreamCount++;
 
             // Cache channel resolution details for aliases
             const resolved = {
@@ -823,6 +823,11 @@ export function createLiveStreamPoller({
             if (slug) channelResolutionCache.set(slug, resolved);
             if (uId) channelResolutionCache.set(uId, resolved);
             if (resolved.channelId) channelResolutionCache.set(resolved.channelId, resolved);
+
+            // Skip notifications on the first cycle (warm-up: seed seenStreams only)
+            if (isFirstPoll) continue;
+
+            newStreamCount++;
 
             // Find all tokens registered to any of the streamer's keys
             const candidateKeys = [uId, slug, resolved.channelId].filter(Boolean);
@@ -867,9 +872,10 @@ export function createLiveStreamPoller({
       }
 
       logger?.info(
-        { queried: foundChannels.length, live: liveCount, newlyLive: newStreamCount },
+        { queried: foundChannels.length, live: liveCount, newlyLive: newStreamCount, warmup: isFirstPoll },
         "live_poller_cycle_complete"
       );
+      isFirstPoll = false;
     } catch (err) {
       logger?.warn({ err: err.message }, "live_poller_cycle_failed");
     } finally {

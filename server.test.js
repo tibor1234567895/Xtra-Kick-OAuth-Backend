@@ -1198,17 +1198,12 @@ test("createLiveStreamPoller detects stream start, sends notification, and dedup
   });
 
   try {
-    // 1. First cycle: detects live stream and dispatches notification
+    // 1. First cycle (warm-up): seeds seenStreams but does NOT dispatch notifications
     await poller.checkLiveStreams();
-    assert.ok(sentPayload !== null, "Notification should be dispatched on first stream detection");
-    assert.deepEqual(sentPayload.tokens, [token]);
-    assert.equal(sentPayload.data.channel_slug, "dougthegiant");
-    assert.equal(sentPayload.data.channel_id, "129698");
-    assert.equal(sentPayload.data.user_id, "131146");
-    assert.equal(sentPayload.data.title, "Doug Stream Live");
+    assert.equal(sentPayload, null, "Warm-up cycle should not dispatch any notification");
+    assert.equal(poller.getSeenStreams().has("131146"), true, "Warm-up should seed seenStreams");
 
-    // 2. Second cycle while stream is still running: should deduplicate (no notification)
-    sentPayload = null;
+    // 2. Second cycle while stream is still running: dedup (same start_time, no notification)
     await poller.checkLiveStreams();
     assert.equal(sentPayload, null, "Notification should be deduped for ongoing stream");
 
@@ -1218,11 +1213,15 @@ test("createLiveStreamPoller detects stream start, sends notification, and dedup
     assert.equal(sentPayload, null);
     assert.equal(poller.getSeenStreams().has("131146"), false, "Offline stream pruned from seenStreams");
 
-    // 4. Stream goes live again with new start time
+    // 4. Stream goes live again with new start time — should notify (warm-up is over)
     mockIsLive = true;
     mockStartTime = "2026-09-04 12:00:00";
     await poller.checkLiveStreams();
-    assert.ok(sentPayload !== null, "Notification dispatched for new stream start");
+    assert.ok(sentPayload !== null, "Notification dispatched for new stream start after warm-up");
+    assert.deepEqual(sentPayload.tokens, [token]);
+    assert.equal(sentPayload.data.channel_slug, "dougthegiant");
+    assert.equal(sentPayload.data.channel_id, "129698");
+    assert.equal(sentPayload.data.user_id, "131146");
     assert.equal(sentPayload.data.title, "Doug Stream Live");
   } finally {
     poller.close();
