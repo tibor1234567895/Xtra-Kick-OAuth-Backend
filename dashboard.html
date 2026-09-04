@@ -12,10 +12,12 @@
         --muted: #6b6b6b;
         --card: #ffffff;
         --border: #e5e5e5;
-        --accent: #4f46e5;
-        --accent-soft: rgba(79, 70, 229, 0.35);
+        --accent: #15803d;
+        --accent-soft: rgba(21, 128, 61, 0.18);
         --good: #16a34a;
+        --warn: #b45309;
         --bad: #dc2626;
+        --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
       }
       @media (prefers-color-scheme: dark) {
         :root {
@@ -24,132 +26,145 @@
           --muted: #9a9a9a;
           --card: #18181b;
           --border: #2a2a2e;
-          --accent: #818cf8;
-          --accent-soft: rgba(129, 140, 248, 0.35);
+          --accent: #4ade80;
+          --accent-soft: rgba(74, 222, 128, 0.2);
           --good: #4ade80;
+          --warn: #fbbf24;
           --bad: #f87171;
         }
       }
       * { box-sizing: border-box; }
       body {
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-        margin: 0;
-        padding: 24px;
-        background: var(--bg);
-        color: var(--fg);
+        margin: 0; padding: 24px;
+        background: var(--bg); color: var(--fg);
       }
-      h1 { font-size: 18px; font-weight: 600; margin: 0 0 16px; }
+      .wrap { max-width: 1080px; margin: 0 auto; }
+      .head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+      h1 { font-size: 20px; font-weight: 650; margin: 0; letter-spacing: -0.01em; }
+      .status { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+      .status .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--muted); margin-right: 6px; vertical-align: 1px; }
+      .status.ok .dot { background: var(--good); }
+      .status.err .dot { background: var(--bad); }
       .toolbar {
-        display: flex;
-        gap: 8px;
-        align-items: center;
-        margin-bottom: 16px;
-        flex-wrap: wrap;
+        display: flex; gap: 8px; align-items: center;
+        margin-bottom: 16px; flex-wrap: wrap;
       }
-      input[type="password"], select {
-        padding: 8px 10px;
-        font: inherit;
-        background: var(--card);
-        color: var(--fg);
-        border: 1px solid var(--border);
-        border-radius: 6px;
+      input[type="password"], input[type="text"], select {
+        padding: 8px 10px; font: inherit;
+        background: var(--card); color: var(--fg);
+        border: 1px solid var(--border); border-radius: 6px;
       }
-      input[type="password"] { flex: 1 1 240px; min-width: 200px; }
+      input[type="password"], input[type="text"] { flex: 1 1 220px; min-width: 200px; font-family: var(--mono); font-size: 13px; }
       button {
-        padding: 8px 14px;
-        background: var(--accent);
-        color: #fff;
-        border: 0;
-        border-radius: 6px;
-        font: inherit;
-        cursor: pointer;
+        padding: 8px 14px; background: var(--accent);
+        color: #fff; border: 0; border-radius: 6px;
+        font: inherit; font-weight: 600; cursor: pointer;
       }
-      button.secondary {
-        background: transparent;
-        color: var(--fg);
-        border: 1px solid var(--border);
-      }
-      button.secondary.active { border-color: var(--accent); color: var(--accent); }
-      label { font-size: 13px; color: var(--muted); display: inline-flex; align-items: center; gap: 6px; }
+      @media (prefers-color-scheme: dark) { button { color: #06130a; } }
+      button.ghost { background: transparent; color: var(--fg); border: 1px solid var(--border); font-weight: 500; }
+      button.small { padding: 5px 10px; font-size: 12.5px; font-weight: 500; }
+      label { font-size: 13px; color: var(--muted); display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+      .count { font-family: var(--mono); font-size: 12px; }
       .grid {
         display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-        gap: 12px;
-        margin-bottom: 24px;
+        grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+        gap: 12px; margin-bottom: 20px;
       }
       .card {
-        background: var(--card);
-        border: 1px solid var(--border);
-        border-radius: 8px;
-        padding: 14px 16px;
+        background: var(--card); border: 1px solid var(--border);
+        border-radius: 8px; padding: 13px 14px;
       }
-      .card .k { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }
-      .card .v { font-size: 24px; font-weight: 600; margin-top: 4px; }
+      .card .k { color: var(--muted); font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.05em; }
+      .card .v { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 23px; font-weight: 700; margin-top: 4px; letter-spacing: -0.02em; }
       .card .h { color: var(--muted); font-size: 12px; margin-top: 4px; }
-      .card .h.up { color: var(--good); }
-      .card .h.down { color: var(--bad); }
+      .card .h .up { color: var(--good); font-weight: 700; }
+      .card .h .down { color: var(--bad); font-weight: 700; }
       .section { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
-      .section h2 { font-size: 14px; font-weight: 600; margin: 0 0 12px; }
+      .section h2 { font-size: 14px; font-weight: 650; margin: 0; }
+      .section .sub { color: var(--muted); font-size: 12px; margin: 2px 0 12px; font-family: var(--mono); }
+      .section-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; flex-wrap: wrap; margin-bottom: 4px; }
+      .links { display: flex; gap: 8px; }
       table { width: 100%; border-collapse: collapse; font-size: 13px; }
-      th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); }
-      th { color: var(--muted); font-weight: 500; }
-      td.num, th.num { text-align: right; }
-      .bar-chart {
-        display: flex;
-        align-items: flex-end;
-        gap: 2px;
-        height: 140px;
+      th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--border); }
+      th { color: var(--muted); font-weight: 500; font-size: 12px; }
+      td.num, th.num { text-align: right; font-family: var(--mono); font-variant-numeric: tabular-nums; }
+      .share { height: 4px; border-radius: 99px; background: var(--accent-soft); margin-top: 5px; overflow: hidden; }
+      .share > div { height: 100%; background: var(--accent); }
+      .bar-chart { display: flex; align-items: flex-end; gap: 2px; height: 140px; margin-top: 12px; }
+      .bar {
+        flex: 1 1 0; background: var(--accent); border-radius: 2px 2px 0 0;
+        min-height: 1px; display: flex; align-items: flex-end; min-width: 2px;
       }
-      .bar { flex: 1 1 0; background: var(--accent); border-radius: 2px 2px 0 0; min-height: 1px; transition: opacity 0.1s; position: relative; display: flex; align-items: flex-end; }
-      .bar.new { background: var(--accent-soft); }
-      .bar:hover { opacity: 0.75; }
+      .bar.new-seg-wrap { background: var(--accent); }
+      .bar .new-seg { width: 100%; background: var(--accent-soft); border-top: 1px solid var(--accent); border-radius: 2px 2px 0 0; }
+      .bar:hover { filter: brightness(1.12); }
+      .bar.peak { outline: 2px solid var(--warn); outline-offset: 1px; }
       .legend { display: flex; gap: 14px; color: var(--muted); font-size: 12px; margin-top: 8px; }
-      .legend span::before {
-        content: "";
-        display: inline-block;
-        width: 10px; height: 10px;
-        border-radius: 2px;
-        margin-right: 5px;
-        vertical-align: -1px;
-        background: var(--accent);
+      .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; background: var(--accent); }
+      .legend i.new { background: var(--accent-soft); border: 1px solid var(--accent); }
+      .x-axis { display: flex; justify-content: space-between; color: var(--muted); font-size: 11px; margin-top: 6px; font-family: var(--mono); }
+      .pill {
+        display: inline-block; font-family: var(--mono); font-size: 11px;
+        padding: 1px 8px; border-radius: 999px; border: 1px solid var(--border);
       }
-      .legend span.new::before { background: var(--accent-soft); }
-      .x-axis { display: flex; justify-content: space-between; color: var(--muted); font-size: 11px; margin-top: 6px; }
-      .error { color: #dc2626; padding: 12px; background: #fef2f2; border: 1px solid #fecaca; border-radius: 6px; }
-      @media (prefers-color-scheme: dark) { .error { color: var(--bad); background: rgba(220,38,38,.08); border-color: rgba(220,38,38,.3); } }
-      .meta { color: var(--muted); font-size: 12px; margin-top: 4px; }
+      .pill.ok { color: var(--good); border-color: var(--good); }
+      .pill.warn { color: var(--warn); border-color: var(--warn); }
+      .pill.bad { color: var(--bad); border-color: var(--bad); }
+      .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+      .chip { font-family: var(--mono); font-size: 12px; border: 1px solid var(--border); border-radius: 999px; padding: 3px 9px; }
+      .mini-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-top: 12px; }
+      .mini h3 { font-size: 12px; color: var(--muted); margin: 0 0 4px; font-weight: 600; }
+      .error { color: var(--bad); padding: 12px; background: color-mix(in srgb, var(--bad) 7%, transparent); border: 1px solid color-mix(in srgb, var(--bad) 35%, transparent); border-radius: 6px; font-size: 13px; }
+      .empty { border: 1px dashed var(--border); border-radius: 8px; padding: 22px 18px; background: var(--card); }
+      .empty h2 { margin: 0 0 6px; font-size: 14px; }
+      .empty p { margin: 0 0 6px; color: var(--muted); font-size: 13px; }
+      .empty code { font-family: var(--mono); font-size: 12px; background: var(--bg); border: 1px solid var(--border); padding: 1px 6px; border-radius: 4px; }
+      .meta { color: var(--muted); font-size: 12px; margin-top: 4px; font-family: var(--mono); }
       .cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
+      .sk { border: 1px solid var(--border); border-radius: 8px; min-height: 90px; margin-bottom: 12px;
+        background: linear-gradient(90deg, var(--card) 25%, var(--bg) 50%, var(--card) 75%); background-size: 200% 100%; animation: sh 1.2s infinite; }
+      @keyframes sh { to { background-position: -200% 0; } }
     </style>
   </head>
   <body>
-    <h1>Usage</h1>
-    <div class="toolbar">
-      <input id="token" type="password" placeholder="Admin token" autocomplete="off" />
-      <label><input type="checkbox" id="remember" /> Remember on this device</label>
-      <select id="range">
-        <option value="30">Last 30 days</option>
-        <option value="60" selected>Last 60 days</option>
-        <option value="90">Last 90 days</option>
-      </select>
-      <button id="refresh" type="button">Refresh</button>
-      <label><input type="checkbox" id="auto" /> Auto</label>
+    <div class="wrap">
+      <div class="head">
+        <h1>Usage</h1>
+        <span id="status" class="status"><span class="dot"></span><span id="statusText">enter token to load</span></span>
+      </div>
+      <div class="toolbar">
+        <input id="token" type="password" placeholder="Admin token" autocomplete="off" spellcheck="false" aria-label="Admin token" />
+        <button id="showToken" class="ghost small" type="button">Show</button>
+        <label><input type="checkbox" id="remember" /> Remember on this device</label>
+        <select id="range" aria-label="Date range">
+          <option value="30">Last 30 days</option>
+          <option value="60" selected>Last 60 days</option>
+          <option value="90">Last 90 days</option>
+        </select>
+        <button id="refresh" type="button">Refresh</button>
+        <label><input type="checkbox" id="auto" /> Auto <span id="countdown" class="count"></span></label>
+      </div>
+      <div id="root"></div>
     </div>
-    <div id="root"></div>
     <script>
       const STORAGE_KEY = "metricsAdminToken";
       const RANGE_KEY = "metricsRange";
       const AUTO_KEY = "metricsAuto";
+      const AUTO_MS = 60_000;
       const root = document.getElementById("root");
       const tokenInput = document.getElementById("token");
       const rememberBox = document.getElementById("remember");
       const rangeSelect = document.getElementById("range");
       const autoBox = document.getElementById("auto");
+      const countdownEl = document.getElementById("countdown");
+      const statusEl = document.getElementById("status");
+      const statusText = document.getElementById("statusText");
       let autoTimer = null;
+      let countdownTimer = null;
+      let nextRefreshAt = 0;
+      let lastData = null;
 
-      // `sessionStorage` is cleared when the tab/browser closes, which is why
-      // "Remember on this device" never actually remembered anything.
-      // Use `localStorage` for anything that must survive a restart, with a
-      // `sessionStorage` fallback for reading legacy values.
       const persistent = {
         get(k) { try { return window.localStorage.getItem(k); } catch { return null; } },
         set(k, v) { try { window.localStorage.setItem(k, v); } catch { /* private mode */ } },
@@ -161,14 +176,20 @@
         del(k) { try { window.sessionStorage.removeItem(k); } catch { /* private mode */ } },
       };
 
+      function setStatus(mode, text) {
+        statusEl.classList.remove("ok", "err");
+        if (mode) statusEl.classList.add(mode);
+        statusText.textContent = text;
+      }
+
       const savedToken = persistent.get(STORAGE_KEY) || ephemeral.get(STORAGE_KEY) || "";
       if (savedToken) {
         tokenInput.value = savedToken;
         rememberBox.checked = true;
-        // Migrate legacy session-only tokens to persistent storage.
         if (!persistent.get(STORAGE_KEY)) persistent.set(STORAGE_KEY, savedToken);
       }
       rangeSelect.value = persistent.get(RANGE_KEY) || ephemeral.get(RANGE_KEY) || "60";
+      if (!["30", "60", "90"].includes(rangeSelect.value)) rangeSelect.value = "60";
       rangeSelect.addEventListener("change", () => {
         persistent.set(RANGE_KEY, rangeSelect.value);
         load();
@@ -186,27 +207,46 @@
       });
 
       document.getElementById("refresh").addEventListener("click", load);
+      document.getElementById("showToken").addEventListener("click", (e) => {
+        const show = tokenInput.type === "password";
+        tokenInput.type = show ? "text" : "password";
+        e.target.textContent = show ? "Hide" : "Show";
+      });
       tokenInput.addEventListener("keydown", (e) => { if (e.key === "Enter") load(); });
+
+      function startAuto() {
+        stopAuto();
+        nextRefreshAt = Date.now() + AUTO_MS;
+        autoTimer = setInterval(load, AUTO_MS);
+        countdownTimer = setInterval(() => {
+          const s = Math.max(0, Math.round((nextRefreshAt - Date.now()) / 1000));
+          countdownEl.textContent = autoBox.checked ? (s > 0 ? "(" + s + "s)" : "") : "";
+          if (s <= 0) nextRefreshAt = Date.now() + AUTO_MS;
+        }, 1000);
+      }
+      function stopAuto() {
+        if (autoTimer) clearInterval(autoTimer);
+        if (countdownTimer) clearInterval(countdownTimer);
+        autoTimer = null; countdownTimer = null;
+        countdownEl.textContent = "";
+      }
       autoBox.addEventListener("change", () => {
         if (autoBox.checked) persistent.set(AUTO_KEY, "1");
         else persistent.del(AUTO_KEY);
-        if (autoBox.checked) {
-          autoTimer = setInterval(load, 60_000);
-          load();
-        } else if (autoTimer) {
-          clearInterval(autoTimer);
-          autoTimer = null;
-        }
+        ephemeral.del(AUTO_KEY);
+        if (autoBox.checked) { startAuto(); load(); }
+        else stopAuto();
       });
       if (persistent.get(AUTO_KEY) || ephemeral.get(AUTO_KEY)) {
         autoBox.checked = true;
-        autoTimer = setInterval(load, 60_000);
+        startAuto();
       }
 
       async function load() {
         const token = tokenInput.value.trim();
         if (!token) {
-          renderError("Enter an admin token first.");
+          setStatus("", "enter token to load");
+          renderEmpty();
           return;
         }
         if (rememberBox.checked) {
@@ -216,6 +256,8 @@
           persistent.del(STORAGE_KEY);
           ephemeral.set(STORAGE_KEY, token);
         }
+        if (!lastData) root.innerHTML = '<div class="sk"></div><div class="sk"></div>';
+        setStatus("", "loading…");
         try {
           const res = await fetch("/v1/metrics/stats?days=" + encodeURIComponent(rangeSelect.value), {
             headers: { Authorization: "Bearer " + token },
@@ -224,18 +266,28 @@
           if (res.status === 404) throw new Error("Stats endpoint is not enabled on the server");
           if (!res.ok) throw new Error("HTTP " + res.status);
           const data = await res.json();
+          lastData = data;
+          if (autoBox.checked) nextRefreshAt = Date.now() + AUTO_MS;
           render(data);
         } catch (err) {
+          setStatus("err", "error");
           renderError(err.message || String(err));
         }
+      }
+
+      function renderEmpty() {
+        root.innerHTML =
+          '<div class="empty"><h2>Paste your admin token to view usage</h2>' +
+          "<p>Set <code>METRICS_ADMIN_TOKEN</code> on the backend, then paste it above and hit Refresh. " +
+          "Tick “Remember on this device” to persist via <code>localStorage</code>.</p></div>";
       }
 
       function renderError(message) {
         root.innerHTML = '<div class="error">' + escapeHtml(message) + "</div>";
       }
 
-      function deltaHint(current, previous) {
-        if (previous <= 0) return "";
+      function delta(current, previous) {
+        if (!(previous > 0)) return "";
         const pct = Math.round((current - previous) / previous * 100);
         if (pct === 0) return "";
         const cls = pct > 0 ? "up" : "down";
@@ -243,71 +295,92 @@
       }
 
       function render(d) {
-        const series = d.dauSeries || [];
+        setStatus("ok", "updated " + shortTime(d.generatedAt));
+        const series = Array.isArray(d.dauSeries) ? d.dauSeries : [];
         const dauPrev = series.length >= 2 ? series[series.length - 2].dau : 0;
-
-        const maxDau = Math.max(1, ...series.map((p) => p.dau));
+        const last7 = series.slice(-7);
+        const avg7 = last7.length ? Math.round(last7.reduce((a, p) => a + (p.dau || 0), 0) / last7.length) : 0;
+        const peak = series.reduce((m, p) => ((p.dau || 0) > (m?.dau ?? -1) ? p : m), null);
+        const maxDau = Math.max(1, ...series.map((p) => p.dau || 0));
         const first = series[0]?.date || "";
         const last = series[series.length - 1]?.date || "";
+        const stick = typeof d.stickiness === "number" ? Math.round(d.stickiness * 100) : (d.mau > 0 ? Math.round(d.dauToday / d.mau * 100) : 0);
+
         const html = [
           '<div class="grid">',
           card("Monthly active", fmt(d.mau), ""),
           card("Weekly active", fmt(d.wau), ""),
-          card("Active today", fmt(d.dauToday), d.mau > 0 ? Math.round(d.dauToday / d.mau * 100) + "% of MAU" + deltaHint(d.dauToday, dauPrev) : ""),
+          card("Active today", fmt(d.dauToday), (d.mau > 0 ? Math.round(d.dauToday / d.mau * 100) + "% of MAU" : "") + delta(d.dauToday, dauPrev)),
           card("New today", fmt(d.newToday), "installs today"),
           card("Total installs", fmt(d.totalInstalls), "deduplicated"),
           card("Accounts (MAU)", fmt(d.accountsMau), "from logins"),
+          card("Stickiness", stick + "%", "DAU ÷ MAU"),
+          card("Sessions today", fmt(d.sessionsToday ?? 0), avg7 ? "7d avg DAU " + fmt(avg7) : "reported today"),
           "</div>",
+
           '<div class="section">',
-          '<h2>Daily active — returning vs new (last ' + series.length + " days)</h2>",
-          '<div class="bar-chart">' + series.map((p) =>
-            stackBar(p, maxDau)
-          ).join("") + "</div>",
+          '<div class="section-head"><div><h2>Daily active — returning vs new (last ' + series.length + " days)</h2>",
+          '<div class="sub">' + (peak ? "peak " + escapeHtml(peak.date) + " (" + fmt(peak.dau) + ") • " : "") + "7d avg " + fmt(avg7) + "</div></div>",
+          '<div class="links"><button class="ghost small" id="csvBtn" type="button">CSV</button><button class="ghost small" id="jsonBtn" type="button">Copy JSON</button></div></div>',
+          '<div class="bar-chart">' + series.map((p) => stackBar(p, maxDau, peak)).join("") + "</div>",
           '<div class="x-axis"><span>' + escapeHtml(first) + "</span><span>" + escapeHtml(last) + "</span></div>",
-          '<div class="legend"><span>Returning</span><span class="new">New installs</span></div>',
+          '<div class="legend"><span><i></i>Returning</span><span><i class="new"></i>New installs</span></div>',
           "</div>",
+
           '<div class="cols">',
-          '<div class="section">',
-          "<h2>Versions</h2>",
-          labeledTable(d.versions.map((r) => [r.version, r.count]), "version"),
+          '<div class="section"><h2>Versions</h2><div class="sub">share of monthly devices</div>' + distTable((d.versions || []).map((r) => [r.version, r.count])) + "</div>",
+          '<div class="section"><h2>Android versions</h2><div class="sub">API level share</div>' + distTable((d.os || []).map((r) => [(r.label === "unknown" ? "unknown" : "API " + r.label), r.count])) + "</div>",
+          '<div class="section"><h2>Countries</h2><div class="sub">coarse locale</div>' + distTable((d.countries || []).map((r) => [r.label, r.count])) + "</div>",
           "</div>",
+
           '<div class="section">',
-          "<h2>Android versions</h2>",
-          labeledTable((d.os || []).map((r) => [r.label === "unknown" ? "unknown" : "API " + r.label, r.count]), "API level"),
-          "</div>",
-          '<div class="section">',
-          "<h2>Countries</h2>",
-          labeledTable((d.countries || []).map((r) => [r.label, r.count]), "country"),
-          "</div>",
-          "</div>",
-          '<div class="section">',
-          "<h2>Backend health (7 days)</h2>",
+          '<div class="section-head"><div><h2>Backend health (7 days)</h2><div class="sub">per-endpoint outcomes</div></div><div>' + healthSummary(d.counters && d.counters.week) + "</div></div>",
           healthTable(d.counters && d.counters.week),
           "</div>",
-          '<div class="meta">Generated ' + escapeHtml(d.generatedAt) + "</div>",
+          '<div class="meta">Generated ' + escapeHtml(d.generatedAt) + " • month " + escapeHtml(d.currentMonth || "") + "</div>",
         ].join("");
         root.innerHTML = html;
-      }
-
-      function stackBar(p, maxDau) {
-        const total = Math.max(2, Math.round(p.dau / maxDau * 100));
-        const newPct = p.dau > 0 ? Math.round(p.new / p.dau * 100) : 0;
-        return '<div class="bar" title="' + escapeHtml(p.date) + ": " + p.dau + " active (" + p.returning + " returning, " + p.new + ' new)" style="height:' + total + '%">' +
-          (newPct > 0 ? '<div class="bar new" style="height:' + newPct + '%"></div>' : "") +
-          "</div>";
+        document.getElementById("csvBtn").addEventListener("click", exportCsv);
+        document.getElementById("jsonBtn").addEventListener("click", copyJson);
       }
 
       function card(k, v, h) {
-        return '<div class="card"><div class="k">' + escapeHtml(k) + '</div><div class="v">' + escapeHtml(v) + '</div>' + (h ? '<div class="h">' + h + "</div>" : "") + "</div>";
+        return '<div class="card"><div class="k">' + escapeHtml(k) + '</div><div class="v">' + escapeHtml(v) + "</div>" + (h ? '<div class="h">' + h + "</div>" : "") + "</div>";
       }
 
-      function labeledTable(rows, emptyLabel) {
-        if (!rows || rows.length === 0) return "<p style=\"color:var(--muted)\">No " + escapeHtml(emptyLabel) + " data yet.</p>";
-        const total = rows.reduce((a, r) => a + r[1], 0);
-        return "<table><thead><tr><th>" + escapeHtml(emptyLabel.charAt(0).toUpperCase() + emptyLabel.slice(1)) + "</th><th class=\"num\">Devices</th><th class=\"num\">Share</th></tr></thead><tbody>" +
-          rows.map((r) =>
-            "<tr><td>" + escapeHtml(r[0]) + "</td><td class=\"num\">" + r[1] + "</td><td class=\"num\">" + Math.round(r[1] / total * 100) + "%</td></tr>"
-          ).join("") + "</tbody></table>";
+      function stackBar(p, maxDau, peak) {
+        const dau = p.dau || 0;
+        const total = Math.max(2, Math.round(dau / maxDau * 100));
+        const newPct = dau > 0 ? Math.round((p.new || 0) / dau * 100) : 0;
+        const isPeak = peak && p.date === peak.date && dau > 0;
+        return '<div class="bar' + (isPeak ? " peak" : "") + '" title="' + escapeHtml(p.date) + ": " + dau + " active (" + (p.returning || 0) + " returning, " + (p.new || 0) + ' new)" style="height:' + total + '%">' +
+          (newPct > 0 ? '<div class="new-seg" style="height:' + newPct + '%"></div>' : "") +
+          "</div>";
+      }
+
+      function distTable(rows) {
+        if (!rows || rows.length === 0) return '<p style="color:var(--muted)">No data yet.</p>';
+        const total = rows.reduce((a, r) => a + (r[1] || 0), 0) || 1;
+        const top = rows.slice(0, 8);
+        let out = '<table><thead><tr><th>Label</th><th class="num">Devices</th><th class="num">Share</th></tr></thead><tbody>' +
+          top.map((r) => {
+            const pct = Math.round((r[1] || 0) / total * 100);
+            return "<tr><td>" + escapeHtml(String(r[0])) + '<div class="share"><div style="width:' + pct + '%"></div></div></td><td class="num">' + fmt(r[1]) + '</td><td class="num">' + pct + "%</td></tr>";
+          }).join("") + "</tbody></table>";
+        if (rows.length > top.length) out += '<div class="meta">+' + (rows.length - top.length) + " more</div>";
+        return out;
+      }
+
+      function healthSummary(week) {
+        const endpoints = (week && week.endpoints) || {};
+        let total = 0, bad = 0;
+        for (const e of Object.values(endpoints)) {
+          total += (e.ok || 0) + (e.r4 || 0) + (e.r5 || 0) + (e.limited || 0) + (e.hmac || 0);
+          bad += (e.r5 || 0);
+        }
+        if (!total) return '<span class="pill">no traffic</span>';
+        if (bad > 0) return '<span class="pill bad">' + bad + " × 5xx</span>";
+        return '<span class="pill ok">' + fmt(total) + " req • ok</span>";
       }
 
       function healthTable(week) {
@@ -323,33 +396,61 @@
           const hmac = e.hmac || 0;
           const total = ok + r4 + r5 + limited + hmac;
           const errRate = total > 0 ? Math.round((r4 + r5) / total * 100) : 0;
+          const pill = r5 > 0 ? "bad" : (errRate >= 10 || limited > 0 ? "warn" : "ok");
           const parts = [];
-          if (r4) parts.push("4xx: " + r4);
-          if (r5) parts.push("5xx: " + r5);
-          if (limited) parts.push("limited: " + limited);
-          if (hmac) parts.push("hmac: " + hmac);
-          return "<tr><td>" + escapeHtml(name) + "</td><td class=\"num\">" + total + "</td><td class=\"num\">" + ok + "</td><td class=\"num\">" + errRate + "%</td><td>" + escapeHtml(parts.join(", ") || "—") + "</td></tr>";
+          if (r4) parts.push("4xx " + r4);
+          if (r5) parts.push("5xx " + r5);
+          if (limited) parts.push("limited " + limited);
+          if (hmac) parts.push("hmac " + hmac);
+          return "<tr><td>" + escapeHtml(name) + ' <span class="pill ' + pill + '">' + errRate + '%</span></td><td class="num">' + fmt(total) + '</td><td class="num">' + fmt(ok) + '</td><td class="num">' + errRate + '%</td><td>' + escapeHtml(parts.join(" • ") || "—") + "</td></tr>";
         });
         const oauth = (week && week.oauth) || {};
-        const oauthRows = Object.entries(oauth).map(([code, n]) => "<tr><td>" + escapeHtml(code) + "</td><td class=\"num\">" + n + "</td></tr>").join("");
         const pingC = (week && week.ping) || {};
-        const pingRows = Object.entries(pingC).map(([code, n]) => "<tr><td>" + escapeHtml(code) + "</td><td class=\"num\">" + n + "</td></tr>").join("");
         const accountC = (week && week.account) || {};
-        const accountRows = Object.entries(accountC).map(([code, n]) => "<tr><td>" + escapeHtml(code) + "</td><td class=\"num\">" + n + "</td></tr>").join("");
         return (
-          "<table><thead><tr><th>Endpoint</th><th class=\"num\">Requests</th><th class=\"num\">OK</th><th class=\"num\">Err%</th><th>Breakdown</th></tr></thead><tbody>" +
+          '<table><thead><tr><th>Endpoint</th><th class="num">Requests</th><th class="num">OK</th><th class="num">Err%</th><th>Breakdown</th></tr></thead><tbody>' +
           rows.join("") + "</tbody></table>" +
-          '<div class="cols" style="margin-top:12px">' +
-          miniSection("OAuth outcomes", oauthRows) +
-          miniSection("Ping outcomes", pingRows) +
-          miniSection("Account capture", accountRows) +
+          '<div class="mini-grid">' +
+          miniChips("OAuth outcomes", oauth) +
+          miniChips("Ping outcomes", pingC) +
+          miniChips("Account capture", accountC) +
           "</div>"
         );
       }
 
-      function miniSection(title, rows) {
-        if (!rows) return "";
-        return "<div><h2 style=\"font-size:12px;color:var(--muted)\">" + escapeHtml(title) + "</h2><table><tbody>" + rows + "</tbody></table></div>";
+      function miniChips(title, map) {
+        const entries = Object.entries(map || {}).sort((a, b) => b[1] - a[1]).slice(0, 10);
+        if (!entries.length) return '<div class="mini"><h3>' + escapeHtml(title) + '</h3><p style="color:var(--muted)">—</p></div>';
+        return '<div class="mini"><h3>' + escapeHtml(title) + '</h3><div class="chips">' +
+          entries.map(([k, n]) => '<span class="chip">' + escapeHtml(k) + " " + fmt(n) + "</span>").join("") +
+          "</div></div>";
+      }
+
+      function exportCsv() {
+        if (!lastData || !Array.isArray(lastData.dauSeries)) return;
+        const lines = ["date,dau,new,returning"];
+        for (const p of lastData.dauSeries) lines.push([p.date, p.dau, p.new, p.returning].join(","));
+        const blob = new Blob([lines.join("\n")], { type: "text/csv" });
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = "usage-" + (lastData.currentMonth || "stats") + ".csv";
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 500);
+      }
+
+      async function copyJson() {
+        if (!lastData) return;
+        try {
+          await navigator.clipboard.writeText(JSON.stringify(lastData, null, 2));
+          setStatus("ok", "copied to clipboard");
+        } catch {
+          renderError("Clipboard blocked — use CSV instead.");
+        }
+      }
+
+      function shortTime(iso) {
+        try { return new Date(iso).toLocaleTimeString(); } catch { return ""; }
       }
 
       function fmt(n) {
@@ -361,6 +462,7 @@
       }
 
       if (tokenInput.value) load();
+      else renderEmpty();
     </script>
   </body>
 </html>
