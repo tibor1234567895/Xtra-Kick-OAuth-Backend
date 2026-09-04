@@ -138,6 +138,7 @@
     <script>
       const STORAGE_KEY = "metricsAdminToken";
       const RANGE_KEY = "metricsRange";
+      const AUTO_KEY = "metricsAuto";
       const root = document.getElementById("root");
       const tokenInput = document.getElementById("token");
       const rememberBox = document.getElementById("remember");
@@ -145,21 +146,50 @@
       const autoBox = document.getElementById("auto");
       let autoTimer = null;
 
-      const saved = sessionStorage.getItem(STORAGE_KEY);
-      if (saved) {
-        tokenInput.value = saved;
+      // `sessionStorage` is cleared when the tab/browser closes, which is why
+      // "Remember on this device" never actually remembered anything.
+      // Use `localStorage` for anything that must survive a restart, with a
+      // `sessionStorage` fallback for reading legacy values.
+      const persistent = {
+        get(k) { try { return window.localStorage.getItem(k); } catch { return null; } },
+        set(k, v) { try { window.localStorage.setItem(k, v); } catch { /* private mode */ } },
+        del(k) { try { window.localStorage.removeItem(k); } catch { /* private mode */ } },
+      };
+      const ephemeral = {
+        get(k) { try { return window.sessionStorage.getItem(k); } catch { return null; } },
+        set(k, v) { try { window.sessionStorage.setItem(k, v); } catch { /* private mode */ } },
+        del(k) { try { window.sessionStorage.removeItem(k); } catch { /* private mode */ } },
+      };
+
+      const savedToken = persistent.get(STORAGE_KEY) || ephemeral.get(STORAGE_KEY) || "";
+      if (savedToken) {
+        tokenInput.value = savedToken;
         rememberBox.checked = true;
+        // Migrate legacy session-only tokens to persistent storage.
+        if (!persistent.get(STORAGE_KEY)) persistent.set(STORAGE_KEY, savedToken);
       }
-      rangeSelect.value = sessionStorage.getItem(RANGE_KEY) || "60";
+      rangeSelect.value = persistent.get(RANGE_KEY) || ephemeral.get(RANGE_KEY) || "60";
       rangeSelect.addEventListener("change", () => {
-        sessionStorage.setItem(RANGE_KEY, rangeSelect.value);
+        persistent.set(RANGE_KEY, rangeSelect.value);
         load();
+      });
+
+      rememberBox.addEventListener("change", () => {
+        const t = tokenInput.value.trim();
+        if (rememberBox.checked) {
+          if (t) persistent.set(STORAGE_KEY, t);
+          ephemeral.del(STORAGE_KEY);
+        } else {
+          persistent.del(STORAGE_KEY);
+          if (t) ephemeral.set(STORAGE_KEY, t);
+        }
       });
 
       document.getElementById("refresh").addEventListener("click", load);
       tokenInput.addEventListener("keydown", (e) => { if (e.key === "Enter") load(); });
       autoBox.addEventListener("change", () => {
-        sessionStorage.setItem("metricsAuto", autoBox.checked ? "1" : "");
+        if (autoBox.checked) persistent.set(AUTO_KEY, "1");
+        else persistent.del(AUTO_KEY);
         if (autoBox.checked) {
           autoTimer = setInterval(load, 60_000);
           load();
@@ -168,7 +198,7 @@
           autoTimer = null;
         }
       });
-      if (sessionStorage.getItem("metricsAuto")) {
+      if (persistent.get(AUTO_KEY) || ephemeral.get(AUTO_KEY)) {
         autoBox.checked = true;
         autoTimer = setInterval(load, 60_000);
       }
@@ -180,9 +210,11 @@
           return;
         }
         if (rememberBox.checked) {
-          sessionStorage.setItem(STORAGE_KEY, token);
+          persistent.set(STORAGE_KEY, token);
+          ephemeral.del(STORAGE_KEY);
         } else {
-          sessionStorage.removeItem(STORAGE_KEY);
+          persistent.del(STORAGE_KEY);
+          ephemeral.set(STORAGE_KEY, token);
         }
         try {
           const res = await fetch("/v1/metrics/stats?days=" + encodeURIComponent(rangeSelect.value), {
