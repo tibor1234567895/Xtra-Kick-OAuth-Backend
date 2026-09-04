@@ -5,8 +5,137 @@ import admin from "firebase-admin";
 import { getMessaging } from "firebase-admin/messaging";
 
 const PUSHER_URL = "wss://ws-us2.pusher.com/app/32cbd69e4b950bf97679?protocol=7&client=js&version=8.5.0&flash=false";
-const channelResolutionCache = new Map(); // slug/id -> { channelId, userId, slug, expiresAt }
+export const channelResolutionCache = new Map(); // slug/id -> { channelId, userId, slug, expiresAt }
 const RESOLUTION_TTL_MS = 24 * 60 * 60 * 1000;
+
+export function clearChannelResolutionCache() {
+  channelResolutionCache.clear();
+  cachedAppToken = null;
+  tokenFetchPromise = null;
+}
+
+let cachedAppToken = null; // { token, expiresAt }
+let tokenFetchPromise = null;
+
+export async function getKickAppAccessToken({
+  fetchFn = globalThis.fetch,
+  clientId = process.env.KICK_CLIENT_ID,
+  clientSecret = process.env.KICK_CLIENT_SECRET,
+  logger,
+} = {}) {
+  if (cachedAppToken && cachedAppToken.expiresAt > Date.now() + 60_000) {
+    return cachedAppToken.token;
+  }
+  if (!clientId || !clientSecret) {
+    return null;
+  }
+  if (tokenFetchPromise) {
+    return tokenFetchPromise;
+  }
+
+  tokenFetchPromise = (async () => {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 10_000);
+      const res = await fetchFn("https://id.kick.com/oauth/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "client_credentials",
+          client_id: clientId,
+          client_secret: clientSecret,
+        }),
+        signal: controller.signal,
+      }).finally(() => clearTimeout(timer));
+
+      if (!res.ok) {
+        logger?.warn({ status: res.status }, "kick_app_token_fetch_failed");
+        return null;
+      }
+      const data = await res.json();
+      if (!data || !data.access_token) return null;
+
+      const expiresInMs = (Number(data.expires_in) || 3600) * 1000;
+      cachedAppToken = {
+        token: data.access_token,
+        expiresAt: Date.now() + expiresInMs,
+      };
+      logger?.info("kick_app_token_refreshed");
+      return cachedAppToken.token;
+    } catch (err) {
+      logger?.warn({ err: err.message }, "kick_app_token_request_failed");
+      return null;
+    } finally {
+      tokenFetchPromise = null;
+    }
+  })();
+
+  return tokenFetchPromise;
+}
+
+export async function resolveKickBroadcasterUserIds(userIds, {
+  fetchFn = globalThis.fetch,
+  logger,
+  clientId = process.env.KICK_CLIENT_ID,
+  clientSecret = process.env.KICK_CLIENT_SECRET,
+  appToken,
+} = {}) {
+  const uniqueIds = Array.from(new Set((userIds || []).map((id) => String(id).trim()).filter((id) => /^\d+$/.test(id))));
+  if (uniqueIds.length === 0) return [];
+
+  const results = [];
+  const uncached = [];
+  for (const id of uniqueIds) {
+    const cached = channelResolutionCache.get(id);
+    if (cached && cached.expiresAt > Date.now()) {
+      results.push(cached);
+    } else {
+      uncached.push(id);
+    }
+  }
+
+  if (uncached.length === 0) return results;
+
+  const token = appToken || await getKickAppAccessToken({ fetchFn, clientId, clientSecret, logger });
+  if (!token) return results;
+
+  const BATCH_SIZE = 20;
+  for (let i = 0; i < uncached.length; i += BATCH_SIZE) {
+    const chunk = uncached.slice(i, i + BATCH_SIZE);
+    try {
+      const query = chunk.map((id) => `broadcaster_user_id=${encodeURIComponent(id)}`).join("&");
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 10_000);
+      const res = await fetchFn(`https://api.kick.com/public/v1/channels?${query}`, {
+        headers: {
+          "Authorization": `Bearer ${token}`,
+          "Accept": "application/json",
+        },
+        signal: controller.signal,
+      }).finally(() => clearTimeout(timer));
+
+      if (res.ok) {
+        const body = await res.json();
+        const data = Array.isArray(body?.data) ? body.data : [];
+        for (const item of data) {
+          const uId = item?.broadcaster_user_id ? String(item.broadcaster_user_id) : null;
+          const slug = item?.slug ? String(item.slug).trim() : null;
+          if (slug) {
+            const channel = await resolveKickChannel(slug, { fetchFn, logger });
+            if (channel) {
+              if (uId) channelResolutionCache.set(uId, channel);
+              results.push(channel);
+            }
+          }
+        }
+      }
+    } catch (err) {
+      logger?.warn({ err: err.message }, "kick_resolve_user_ids_batch_failed");
+    }
+  }
+
+  return results;
+}
 
 export async function resolveKickChannel(slugOrId, { fetchFn = globalThis.fetch, logger } = {}) {
   const key = String(slugOrId || "").trim().toLowerCase();
@@ -542,6 +671,240 @@ export function createPusherRelay({ fcmStore, messaging, logger }) {
       if (ws) {
         ws.close();
         ws = null;
+      }
+    },
+  };
+}
+
+export function createLiveStreamPoller({
+  fcmStore,
+  messaging,
+  config,
+  fetchFn = globalThis.fetch,
+  pollIntervalMs = 60_000,
+  logger,
+} = {}) {
+  let isClosed = false;
+  let timer = null;
+  let isPolling = false;
+  // Map of broadcaster_user_id (or slug/channel_id) -> streamStartTime
+  const seenStreams = new Map();
+
+  async function checkLiveStreams() {
+    if (isClosed || isPolling) return;
+    if (!fcmStore || !messaging) return;
+
+    isPolling = true;
+    try {
+      const allActive = fcmStore.getActiveChannels();
+      if (allActive.length === 0) return;
+
+      const token = await getKickAppAccessToken({
+        fetchFn,
+        clientId: config?.kickClientId,
+        clientSecret: config?.kickClientSecret,
+        logger,
+      });
+      if (!token) {
+        logger?.warn("live_poller_skipped_no_app_token");
+        return;
+      }
+
+      // Collect user IDs and slugs to poll
+      const userIds = new Set();
+      const slugs = new Set();
+
+      for (const ch of allActive) {
+        const cached = channelResolutionCache.get(ch);
+        if (cached && cached.userId) {
+          userIds.add(cached.userId);
+        } else if (/^\d+$/.test(ch)) {
+          userIds.add(ch);
+        } else {
+          slugs.add(ch);
+        }
+      }
+
+      const foundChannels = [];
+
+      // 1. Batch poll userIds (up to 25 per request)
+      const userIdsArr = Array.from(userIds);
+      const BATCH_SIZE = 25;
+      for (let i = 0; i < userIdsArr.length; i += BATCH_SIZE) {
+        if (isClosed) break;
+        const chunk = userIdsArr.slice(i, i + BATCH_SIZE);
+        const query = chunk.map((id) => `broadcaster_user_id=${encodeURIComponent(id)}`).join("&");
+        try {
+          const controller = new AbortController();
+          const abortTimer = setTimeout(() => controller.abort(), 10_000);
+          const res = await fetchFn(`https://api.kick.com/public/v1/channels?${query}`, {
+            headers: {
+              "Authorization": `Bearer ${token}`,
+              "Accept": "application/json",
+            },
+            signal: controller.signal,
+          }).finally(() => clearTimeout(abortTimer));
+
+          if (res.ok) {
+            const body = await res.json();
+            const data = Array.isArray(body?.data) ? body.data : [];
+            for (const ch of data) {
+              foundChannels.push(ch);
+            }
+          } else {
+            logger?.warn({ status: res.status }, "live_poller_batch_fetch_failed");
+          }
+        } catch (err) {
+          logger?.warn({ err: err.message }, "live_poller_batch_fetch_error");
+        }
+      }
+
+      // 2. Poll any remaining non-numeric slugs not yet resolved
+      const foundSlugsSet = new Set(
+        foundChannels
+          .map((c) => (c.slug ? String(c.slug).toLowerCase() : null))
+          .filter(Boolean)
+      );
+      const remainingSlugs = Array.from(slugs).filter((s) => !foundSlugsSet.has(s.toLowerCase()));
+
+      for (const slug of remainingSlugs) {
+        if (isClosed) break;
+        try {
+          const controller = new AbortController();
+          const abortTimer = setTimeout(() => controller.abort(), 8_000);
+          const res = await fetchFn(`https://api.kick.com/public/v1/channels?broadcaster_user_id=${encodeURIComponent(slug)}`, {
+            headers: {
+              "Authorization": `Bearer ${token}`,
+              "Accept": "application/json",
+            },
+            signal: controller.signal,
+          }).finally(() => clearTimeout(abortTimer));
+
+          if (res.ok) {
+            const body = await res.json();
+            const data = Array.isArray(body?.data) ? body.data : [];
+            for (const ch of data) {
+              foundChannels.push(ch);
+            }
+          }
+        } catch (err) {
+          // ignore single slug query error
+        }
+      }
+
+      // 3. Process channels and detect stream start transitions
+      let liveCount = 0;
+      let newStreamCount = 0;
+
+      for (const ch of foundChannels) {
+        const uId = ch.broadcaster_user_id ? String(ch.broadcaster_user_id) : null;
+        const slug = ch.slug ? String(ch.slug).toLowerCase() : null;
+        const channelKey = uId || slug;
+        if (!channelKey) continue;
+
+        const isLive = Boolean(ch.stream && ch.stream.is_live);
+        const startTime = ch.stream?.start_time ? String(ch.stream.start_time) : null;
+
+        if (isLive && startTime) {
+          liveCount++;
+          const lastStartTime = seenStreams.get(channelKey);
+          if (lastStartTime !== startTime) {
+            // Transition: stream just started!
+            seenStreams.set(channelKey, startTime);
+            newStreamCount++;
+
+            // Cache channel resolution details for aliases
+            const resolved = {
+              channelId: ch.channel_id ? String(ch.channel_id) : null,
+              userId: uId,
+              slug,
+              expiresAt: Date.now() + RESOLUTION_TTL_MS,
+            };
+            if (slug) channelResolutionCache.set(slug, resolved);
+            if (uId) channelResolutionCache.set(uId, resolved);
+            if (resolved.channelId) channelResolutionCache.set(resolved.channelId, resolved);
+
+            // Find all tokens registered to any of the streamer's keys
+            const candidateKeys = [uId, slug, resolved.channelId].filter(Boolean);
+            const tokenSet = new Set();
+            for (const key of candidateKeys) {
+              for (const tok of fcmStore.getTokensForChannel(key)) {
+                tokenSet.add(tok);
+              }
+            }
+            const tokens = Array.from(tokenSet);
+
+            if (tokens.length > 0) {
+              logger?.info(
+                { channelKey, slug, userId: uId, tokensCount: tokens.length, startTime },
+                "live_poller_new_stream_detected"
+              );
+              sendLivePushNotification({
+                messaging,
+                tokens,
+                channelId: resolved.channelId || uId,
+                userId: uId,
+                channelSlug: slug || uId,
+                title: ch.stream_title || `${slug || channelKey} is live!`,
+                description: ch.channel_description || "",
+                profilePicture: ch.banner_picture || "",
+                logger,
+                fcmStore,
+              }).catch(() => {});
+            }
+          }
+        } else {
+          // Stream is offline, remove from seenStreams so next stream triggers
+          if (seenStreams.has(channelKey)) {
+            seenStreams.delete(channelKey);
+          }
+        }
+      }
+
+      if (seenStreams.size > 5000) {
+        const oldestKey = seenStreams.keys().next().value;
+        if (oldestKey) seenStreams.delete(oldestKey);
+      }
+
+      logger?.info(
+        { queried: foundChannels.length, live: liveCount, newlyLive: newStreamCount },
+        "live_poller_cycle_complete"
+      );
+    } catch (err) {
+      logger?.warn({ err: err.message }, "live_poller_cycle_failed");
+    } finally {
+      isPolling = false;
+    }
+  }
+
+  function scheduleNext() {
+    if (isClosed) return;
+    timer = setTimeout(async () => {
+      timer = null;
+      await checkLiveStreams();
+      scheduleNext();
+    }, pollIntervalMs);
+    if (typeof timer.unref === "function") timer.unref();
+  }
+
+  // Initial poll after 5 seconds to let backfill / subscriptions initialize
+  timer = setTimeout(async () => {
+    timer = null;
+    await checkLiveStreams();
+    scheduleNext();
+  }, 5000);
+  if (typeof timer.unref === "function") timer.unref();
+
+  return {
+    checkLiveStreams,
+    getSeenStreams() {
+      return new Map(seenStreams);
+    },
+    close() {
+      isClosed = true;
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
       }
     },
   };

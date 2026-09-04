@@ -6,9 +6,9 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import pino from "pino";
-import { computeHmacSignature, createApp, loadConfig, redactPaths } from "./server.js";
+import { backfillStoredSubscriptions, computeHmacSignature, createApp, loadConfig, redactPaths } from "./server.js";
 import { createMetricsStore } from "./metrics.js";
-import { createFcmStore, createPusherRelay, sendLivePushNotification } from "./fcm.js";
+import { clearChannelResolutionCache, createFcmStore, createLiveStreamPoller, createPusherRelay, sendLivePushNotification } from "./fcm.js";
 
 const baseEnv = {
   KICK_CLIENT_ID: "client-id",
@@ -1032,5 +1032,202 @@ test("POST /v1/fcm/subscribe resolves non-numeric slugs in the background", asyn
     assert.deepEqual(fcmStore.getTokensForChannel("xqc"), [token]);
   });
 });
+
+test("POST /v1/fcm/subscribe resolves numeric broadcaster user IDs via app access token in the background", async () => {
+  clearChannelResolutionCache();
+  const fcmStore = createFcmStore({ dataFile: null });
+  const token = "w".repeat(32);
+
+  const mockFetch = async (url, options = {}) => {
+    if (url.includes("/oauth/token")) {
+      return {
+        ok: true,
+        json: async () => ({ access_token: "test_app_token", expires_in: 3600 }),
+      };
+    }
+    if (url.includes("/public/v1/channels?") && url.includes("broadcaster_user_id=1235212")) {
+      return {
+        ok: true,
+        json: async () => ({
+          data: [{ broadcaster_user_id: 1235212, slug: "kookie" }],
+        }),
+      };
+    }
+    if (url.includes("/api/v2/channels/kookie")) {
+      return {
+        ok: true,
+        json: async () => ({ id: 1193742, user_id: 1235212, slug: "kookie" }),
+      };
+    }
+    return { ok: false, status: 404 };
+  };
+
+  const app = createApp(
+    config({
+      fcm: { pusherRelayEnabled: false },
+    }),
+    {
+      fcmStore,
+      messaging: null,
+      fetch: mockFetch,
+    }
+  );
+
+  await withServer(app, async (baseUrl) => {
+    const response = await httpRequest(baseUrl, "POST", "/v1/fcm/subscribe", {
+      token,
+      channel_ids: ["1235212"],
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(response.body.ok, true);
+
+    // Wait briefly for background resolution to settle
+    await new Promise((r) => setTimeout(r, 100));
+
+    // Verify channel ID 1193742, user ID 1235212, and slug kookie were all registered to token
+    assert.deepEqual(fcmStore.getTokensForChannel("1193742"), [token]);
+    assert.deepEqual(fcmStore.getTokensForChannel("1235212"), [token]);
+    assert.deepEqual(fcmStore.getTokensForChannel("kookie"), [token]);
+  });
+});
+
+test("backfillStoredSubscriptions resolves stored numeric user IDs and adds channel aliases", async () => {
+  clearChannelResolutionCache();
+  const fcmStore = createFcmStore({ dataFile: null });
+  const token = "v".repeat(32);
+  fcmStore.subscribe({ token, channelIds: ["1235212"] });
+
+  let synced = false;
+  const mockPusherRelay = {
+    syncSubscriptions() {
+      synced = true;
+    },
+  };
+
+  const mockFetch = async (url) => {
+    if (url.includes("/oauth/token")) {
+      return {
+        ok: true,
+        json: async () => ({ access_token: "app_token", expires_in: 3600 }),
+      };
+    }
+    if (url.includes("/public/v1/channels?") && url.includes("broadcaster_user_id=1235212")) {
+      return {
+        ok: true,
+        json: async () => ({
+          data: [{ broadcaster_user_id: 1235212, slug: "kookie" }],
+        }),
+      };
+    }
+    if (url.includes("/api/v2/channels/kookie")) {
+      return {
+        ok: true,
+        json: async () => ({ id: 1193742, user_id: 1235212, slug: "kookie" }),
+      };
+    }
+    return { ok: false, status: 404 };
+  };
+
+  await backfillStoredSubscriptions(fcmStore, mockPusherRelay, {
+    config: { kickClientId: "test-client", kickClientSecret: "test-secret" },
+    fetchFn: mockFetch,
+  });
+
+  assert.equal(synced, true);
+  assert.deepEqual(fcmStore.getTokensForChannel("1193742"), [token]);
+  assert.deepEqual(fcmStore.getTokensForChannel("1235212"), [token]);
+  assert.deepEqual(fcmStore.getTokensForChannel("kookie"), [token]);
+});
+
+test("createLiveStreamPoller detects stream start, sends notification, and dedupes repeat polls", async () => {
+  clearChannelResolutionCache();
+  const fcmStore = createFcmStore({ dataFile: null });
+  const token = "w".repeat(32);
+  fcmStore.subscribe({ token, channelIds: ["131146"] });
+
+  let sentPayload = null;
+  const mockMessaging = {
+    async sendEachForMulticast(payload) {
+      sentPayload = payload;
+      return { successCount: payload.tokens.length, failureCount: 0, responses: payload.tokens.map(() => ({ success: true })) };
+    },
+  };
+
+  let mockIsLive = true;
+  let mockStartTime = "2026-09-04 08:53:37";
+
+  const mockFetch = async (url) => {
+    if (url.includes("/oauth/token")) {
+      return {
+        ok: true,
+        json: async () => ({ access_token: "mock-app-token", expires_in: 3600 }),
+      };
+    }
+    if (url.includes("/public/v1/channels?") && url.includes("broadcaster_user_id=131146")) {
+      return {
+        ok: true,
+        json: async () => ({
+          data: [
+            {
+              broadcaster_user_id: 131146,
+              channel_id: 129698,
+              slug: "dougthegiant",
+              stream_title: "Doug Stream Live",
+              channel_description: "Giant gaming",
+              banner_picture: "https://example.com/banner.jpg",
+              stream: {
+                is_live: mockIsLive,
+                start_time: mockStartTime,
+                viewer_count: 50,
+              },
+            },
+          ],
+        }),
+      };
+    }
+    return { ok: false, status: 404 };
+  };
+
+  const poller = createLiveStreamPoller({
+    fcmStore,
+    messaging: mockMessaging,
+    config: { kickClientId: "test-client", kickClientSecret: "test-secret" },
+    fetchFn: mockFetch,
+    pollIntervalMs: 60_000,
+  });
+
+  try {
+    // 1. First cycle: detects live stream and dispatches notification
+    await poller.checkLiveStreams();
+    assert.ok(sentPayload !== null, "Notification should be dispatched on first stream detection");
+    assert.deepEqual(sentPayload.tokens, [token]);
+    assert.equal(sentPayload.data.channel_slug, "dougthegiant");
+    assert.equal(sentPayload.data.channel_id, "129698");
+    assert.equal(sentPayload.data.user_id, "131146");
+    assert.equal(sentPayload.data.title, "Doug Stream Live");
+
+    // 2. Second cycle while stream is still running: should deduplicate (no notification)
+    sentPayload = null;
+    await poller.checkLiveStreams();
+    assert.equal(sentPayload, null, "Notification should be deduped for ongoing stream");
+
+    // 3. Stream goes offline
+    mockIsLive = false;
+    await poller.checkLiveStreams();
+    assert.equal(sentPayload, null);
+    assert.equal(poller.getSeenStreams().has("131146"), false, "Offline stream pruned from seenStreams");
+
+    // 4. Stream goes live again with new start time
+    mockIsLive = true;
+    mockStartTime = "2026-09-04 12:00:00";
+    await poller.checkLiveStreams();
+    assert.ok(sentPayload !== null, "Notification dispatched for new stream start");
+    assert.equal(sentPayload.data.title, "Doug Stream Live");
+  } finally {
+    poller.close();
+  }
+});
+
 
 

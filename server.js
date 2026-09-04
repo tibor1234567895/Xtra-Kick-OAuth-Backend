@@ -14,10 +14,13 @@ import {
   requireAdminToken,
 } from "./metrics.js";
 import {
+  channelResolutionCache,
   createFcmStore,
+  createLiveStreamPoller,
   createPusherRelay,
   initFirebaseMessaging,
   loadFcmConfig,
+  resolveKickBroadcasterUserIds,
   resolveKickChannel,
 } from "./fcm.js";
 
@@ -185,6 +188,29 @@ export function createApp(config, deps = {}) {
     : (config.fcm?.pusherRelayEnabled && messaging
         ? createPusherRelay({ fcmStore, messaging, logger: config.logger })
         : null);
+  const liveStreamPoller = deps.liveStreamPoller !== undefined
+    ? deps.liveStreamPoller
+    : (messaging && config.kickClientId && config.kickClientSecret
+        ? createLiveStreamPoller({
+            fcmStore,
+            messaging,
+            config,
+            fetchFn: upstreamFetch,
+            logger: config.logger,
+          })
+        : null);
+
+  app.locals.fcmStore = fcmStore;
+  app.locals.pusherRelay = pusherRelay;
+  app.locals.liveStreamPoller = liveStreamPoller;
+
+  if (pusherRelay && fcmStore) {
+    backfillStoredSubscriptions(fcmStore, pusherRelay, {
+      logger: config.logger,
+      config,
+      fetchFn: upstreamFetch,
+    }).catch(() => {});
+  }
 
   app.use("/v1/kick/oauth", createLimiter(120));
   registerPost("/v1/kick/oauth/exchange", createLimiter(20), exchangeHandler(config, upstreamFetch, metrics));
@@ -680,20 +706,46 @@ function fcmSubscribeHandler(fcmStore, pusherRelay, { upstreamFetch, config } = 
     (async () => {
       try {
         const nonNumeric = channelIds.filter((id) => !/^\d+$/.test(id));
-        if (nonNumeric.length === 0) return;
+        const numericIds = channelIds.filter((id) => /^\d+$/.test(id));
+        if (nonNumeric.length === 0 && numericIds.length === 0) return;
 
         const resolvedIds = [];
-        // Resolve with controlled concurrency
-        const BATCH_SIZE = 5;
-        for (let i = 0; i < nonNumeric.length; i += BATCH_SIZE) {
-          const batch = nonNumeric.slice(i, i + BATCH_SIZE);
-          const results = await Promise.all(
-            batch.map((slug) => resolveKickChannel(slug, { fetchFn, logger }))
-          );
-          for (const r of results) {
-            if (r) {
-              if (r.channelId) resolvedIds.push(r.channelId);
-              if (r.userId) resolvedIds.push(r.userId);
+        // 1. Resolve non-numeric slugs with controlled concurrency
+        if (nonNumeric.length > 0) {
+          const BATCH_SIZE = 5;
+          for (let i = 0; i < nonNumeric.length; i += BATCH_SIZE) {
+            const batch = nonNumeric.slice(i, i + BATCH_SIZE);
+            const results = await Promise.all(
+              batch.map((slug) => resolveKickChannel(slug, { fetchFn, logger }))
+            );
+            for (const r of results) {
+              if (r) {
+                if (r.channelId) resolvedIds.push(r.channelId);
+                if (r.userId) resolvedIds.push(r.userId);
+              }
+            }
+          }
+        }
+
+        // 2. Resolve numeric broadcaster user IDs that are not yet known as channelIds
+        if (numericIds.length > 0) {
+          const unknownNumeric = numericIds.filter((id) => {
+            const cached = channelResolutionCache.get(id);
+            return !cached || cached.channelId !== id;
+          });
+          if (unknownNumeric.length > 0) {
+            const results = await resolveKickBroadcasterUserIds(unknownNumeric, {
+              fetchFn,
+              logger,
+              clientId: config?.kickClientId,
+              clientSecret: config?.kickClientSecret,
+            });
+            for (const r of results) {
+              if (r) {
+                if (r.channelId) resolvedIds.push(r.channelId);
+                if (r.userId) resolvedIds.push(r.userId);
+                if (r.slug) resolvedIds.push(r.slug);
+              }
             }
           }
         }
@@ -706,7 +758,7 @@ function fcmSubscribeHandler(fcmStore, pusherRelay, { upstreamFetch, config } = 
           }
         }
       } catch (err) {
-        logger?.warn({ err: err.message }, "fcm_background_slug_resolution_failed");
+        logger?.warn({ err: err.message }, "fcm_background_resolution_failed");
       }
     })().catch(() => {});
 
@@ -731,6 +783,60 @@ function fcmStatsHandler(fcmStore) {
   return async (_req, res) => {
     return res.status(200).json({ ok: true, stats: fcmStore.stats() });
   };
+}
+
+export async function backfillStoredSubscriptions(fcmStore, pusherRelay, { logger, config, fetchFn = globalThis.fetch } = {}) {
+  try {
+    const allChannels = fcmStore.getActiveChannels();
+    const nonNumeric = allChannels.filter((id) => !/^\d+$/.test(id));
+    const numeric = allChannels.filter((id) => /^\d+$/.test(id));
+
+    let aliasesAdded = 0;
+
+    // 1. Resolve non-numeric slugs
+    for (const slug of nonNumeric) {
+      const res = await resolveKickChannel(slug, { fetchFn, logger });
+      if (res && res.channelId) {
+        const tokens = fcmStore.getTokensForChannel(slug);
+        for (const tok of tokens) {
+          aliasesAdded += fcmStore.addAliasesToToken(tok, [res.channelId, res.userId].filter(Boolean));
+        }
+      }
+    }
+
+    // 2. Resolve numeric IDs that may be broadcaster user IDs
+    const unknownNumeric = numeric.filter((id) => {
+      const cached = channelResolutionCache.get(id);
+      return !cached || cached.channelId !== id;
+    });
+
+    if (unknownNumeric.length > 0) {
+      const resolved = await resolveKickBroadcasterUserIds(unknownNumeric, {
+        fetchFn,
+        logger,
+        clientId: config?.kickClientId,
+        clientSecret: config?.kickClientSecret,
+      });
+      for (const res of resolved) {
+        if (res && res.channelId) {
+          const keys = [res.userId, res.slug].filter(Boolean);
+          for (const k of keys) {
+            const tokens = fcmStore.getTokensForChannel(k);
+            for (const tok of tokens) {
+              aliasesAdded += fcmStore.addAliasesToToken(tok, [res.channelId, res.userId, res.slug].filter(Boolean));
+            }
+          }
+        }
+      }
+    }
+
+    if (aliasesAdded > 0) {
+      pusherRelay?.syncSubscriptions();
+      logger?.info({ aliasesAdded }, "fcm_backfill_aliases_added_and_synced");
+    }
+  } catch (err) {
+    logger?.warn({ err: err.message }, "fcm_backfill_failed");
+  }
 }
 
 function tokenResponse(data) {
