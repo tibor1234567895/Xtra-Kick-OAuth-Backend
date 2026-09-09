@@ -127,6 +127,7 @@ export function createMetricsStore(options = {}) {
   let state = emptyState();
   let everSeenSet = new Set();
   let pendingFlush = null;
+  const monthCounts = { devices: new Map(), accounts: new Map() };
 
   if (dataPath && existsSync(dataPath)) {
     try {
@@ -181,10 +182,16 @@ export function createMetricsStore(options = {}) {
     const today = new Date();
     const cutoff = addMonths(monthKey(today), -retention);
     for (const key of Object.keys(state.devices)) {
-      if (key < cutoff) delete state.devices[key];
+      if (key < cutoff) {
+        delete state.devices[key];
+        monthCounts.devices.delete(key);
+      }
     }
     for (const key of Object.keys(state.accounts)) {
-      if (key < cutoff) delete state.accounts[key];
+      if (key < cutoff) {
+        delete state.accounts[key];
+        monthCounts.accounts.delete(key);
+      }
     }
     const counterCutoff = dayKey(new Date(today.getTime() - COUNTER_DAYS * 86_400_000));
     for (const key of Object.keys(state.counters)) {
@@ -194,6 +201,7 @@ export function createMetricsStore(options = {}) {
 
   function ensureMonth(month, kind) {
     if (!state[kind][month]) state[kind][month] = {};
+    if (!monthCounts[kind].has(month)) monthCounts[kind].set(month, Object.keys(state[kind][month]).length);
     return state[kind][month];
   }
 
@@ -293,7 +301,7 @@ export function createMetricsStore(options = {}) {
       scheduleFlush();
       return { isNewInstall: false, month: serverEpoch };
     }
-    if (Object.keys(month).length >= maxDevicesPerMonth) {
+    if (monthCounts.devices.get(serverEpoch) >= maxDevicesPerMonth) {
       const error = new Error("metrics device capacity reached");
       error.status = 429;
       error.code = "metrics_capacity_reached";
@@ -310,6 +318,7 @@ export function createMetricsStore(options = {}) {
     // If everSeen is at capacity the device is recorded for activity but not
     // counted as an install; install totals become best-effort at that point.
     month[pidHash] = entry;
+    monthCounts.devices.set(serverEpoch, monthCounts.devices.get(serverEpoch) + 1);
     scheduleFlush();
     return { isNewInstall: Boolean(entry.n), month: serverEpoch };
   }
@@ -321,13 +330,14 @@ export function createMetricsStore(options = {}) {
     prune();
     const month = ensureMonth(monthKey(now), "accounts");
     if (month[subHash]) return { isNewSession: false };
-    if (Object.keys(month).length >= maxDevicesPerMonth) {
+    if (monthCounts.accounts.get(monthKey(now)) >= maxDevicesPerMonth) {
       const error = new Error("metrics account capacity reached");
       error.status = 429;
       error.code = "metrics_capacity_reached";
       throw error;
     }
     month[subHash] = true;
+    monthCounts.accounts.set(monthKey(now), monthCounts.accounts.get(monthKey(now)) + 1);
     scheduleFlush();
     return { isNewSession: true };
   }

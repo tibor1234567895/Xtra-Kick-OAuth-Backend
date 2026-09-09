@@ -8,6 +8,26 @@ const PUSHER_URL = "wss://ws-us2.pusher.com/app/32cbd69e4b950bf97679?protocol=7&
 export const channelResolutionCache = new Map(); // slug/id -> { channelId, userId, slug, expiresAt }
 const RESOLUTION_TTL_MS = 24 * 60 * 60 * 1000;
 
+function cacheChannel(key, channel) {
+  channelResolutionCache.set(key, channel);
+  while (channelResolutionCache.size > 5000) {
+    channelResolutionCache.delete(channelResolutionCache.keys().next().value);
+  }
+}
+
+async function fetchJsonWithTimeout(fetchFn, url, options, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetchFn(url, { ...options, signal: controller.signal });
+    const body = response.ok ? await response.json() : null;
+    if (!response.ok) await response.body?.cancel();
+    return { ok: response.ok, status: response.status, body };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export function clearChannelResolutionCache() {
   channelResolutionCache.clear();
   cachedAppToken = null;
@@ -35,9 +55,7 @@ export async function getKickAppAccessToken({
 
   tokenFetchPromise = (async () => {
     try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 10_000);
-      const res = await fetchFn("https://id.kick.com/oauth/token", {
+      const res = await fetchJsonWithTimeout(fetchFn, "https://id.kick.com/oauth/token", {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body: new URLSearchParams({
@@ -45,14 +63,13 @@ export async function getKickAppAccessToken({
           client_id: clientId,
           client_secret: clientSecret,
         }),
-        signal: controller.signal,
-      }).finally(() => clearTimeout(timer));
+      }, 10_000);
 
       if (!res.ok) {
         logger?.warn({ status: res.status }, "kick_app_token_fetch_failed");
         return null;
       }
-      const data = await res.json();
+      const data = res.body;
       if (!data || !data.access_token) return null;
 
       const expiresInMs = (Number(data.expires_in) || 3600) * 1000;
@@ -104,18 +121,15 @@ export async function resolveKickBroadcasterUserIds(userIds, {
     const chunk = uncached.slice(i, i + BATCH_SIZE);
     try {
       const query = chunk.map((id) => `broadcaster_user_id=${encodeURIComponent(id)}`).join("&");
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 10_000);
-      const res = await fetchFn(`https://api.kick.com/public/v1/channels?${query}`, {
+      const res = await fetchJsonWithTimeout(fetchFn, `https://api.kick.com/public/v1/channels?${query}`, {
         headers: {
           "Authorization": `Bearer ${token}`,
           "Accept": "application/json",
         },
-        signal: controller.signal,
-      }).finally(() => clearTimeout(timer));
+      }, 10_000);
 
       if (res.ok) {
-        const body = await res.json();
+        const body = res.body;
         const data = Array.isArray(body?.data) ? body.data : [];
         for (const item of data) {
           const uId = item?.broadcaster_user_id ? String(item.broadcaster_user_id) : null;
@@ -123,7 +137,7 @@ export async function resolveKickBroadcasterUserIds(userIds, {
           if (slug) {
             const channel = await resolveKickChannel(slug, { fetchFn, logger });
             if (channel) {
-              if (uId) channelResolutionCache.set(uId, channel);
+              if (uId) cacheChannel(uId, channel);
               results.push(channel);
             }
           }
@@ -147,17 +161,14 @@ export async function resolveKickChannel(slugOrId, { fetchFn = globalThis.fetch,
   }
 
   try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 5000);
-    const res = await fetchFn(`https://kick.com/api/v2/channels/${encodeURIComponent(key)}`, {
+    const res = await fetchJsonWithTimeout(fetchFn, `https://kick.com/api/v2/channels/${encodeURIComponent(key)}`, {
       headers: {
         "Accept": "application/json",
       },
-      signal: controller.signal,
-    }).finally(() => clearTimeout(timer));
+    }, 5000);
 
     if (!res.ok) return null;
-    const body = await res.json();
+    const body = res.body;
     if (!body || !body.id) return null;
 
     const result = {
@@ -167,15 +178,10 @@ export async function resolveKickChannel(slugOrId, { fetchFn = globalThis.fetch,
       expiresAt: Date.now() + RESOLUTION_TTL_MS,
     };
 
-    channelResolutionCache.set(key, result);
-    channelResolutionCache.set(result.channelId, result);
-    if (result.userId) channelResolutionCache.set(result.userId, result);
-    if (result.slug) channelResolutionCache.set(result.slug, result);
-
-    if (channelResolutionCache.size > 5000) {
-      const oldestKey = channelResolutionCache.keys().next().value;
-      if (oldestKey) channelResolutionCache.delete(oldestKey);
-    }
+    cacheChannel(key, result);
+    cacheChannel(result.channelId, result);
+    if (result.userId) cacheChannel(result.userId, result);
+    if (result.slug) cacheChannel(result.slug, result);
 
     logger?.info({ key, channelId: result.channelId, slug: result.slug }, "kick_channel_resolved");
     return result;
@@ -196,10 +202,11 @@ export function loadFcmConfig(env = process.env) {
   };
 }
 
-export function createFcmStore({ dataFile, logger } = {}) {
+export function createFcmStore({ dataFile, logger, maxTokens = 100000 } = {}) {
   const tokens = new Map(); // token -> { kickUserId, channelIds: Set, updatedAt, lastActiveAt }
   const channelIndex = new Map(); // channelId -> Set<token>
   let saveTimer = null;
+  let nextRevision = 0;
 
   function load() {
     if (!dataFile || !existsSync(dataFile)) return;
@@ -273,6 +280,7 @@ export function createFcmStore({ dataFile, logger } = {}) {
       const now = Date.now();
 
       const existing = tokens.get(normalizedToken);
+      if (!existing && tokens.size >= maxTokens) return { error: "subscription_capacity" };
       if (existing) {
         for (const oldCh of existing.channelIds) {
           if (!normalizedChannels.has(oldCh)) {
@@ -291,6 +299,7 @@ export function createFcmStore({ dataFile, logger } = {}) {
       }
 
       tokens.set(normalizedToken, {
+        revision: ++nextRevision,
         kickUserId: kickUserId ? String(kickUserId).trim() : null,
         channelIds: normalizedChannels,
         updatedAt: now,
@@ -298,7 +307,7 @@ export function createFcmStore({ dataFile, logger } = {}) {
       });
 
       scheduleSave();
-      return { token: normalizedToken, subscribedChannels: normalizedChannels.size };
+      return { token: normalizedToken, subscribedChannels: normalizedChannels.size, revision: nextRevision };
     },
 
     unsubscribe({ token }) {
@@ -328,10 +337,15 @@ export function createFcmStore({ dataFile, logger } = {}) {
       return Array.from(channelIndex.keys());
     },
 
-    addAliasesToToken(token, aliases) {
+    isCurrentSubscription(token, revision) {
+      return tokens.get(String(token).trim())?.revision === revision;
+    },
+
+    addAliasesToToken(token, aliases, revision) {
       const normalizedToken = String(token).trim();
       const existing = tokens.get(normalizedToken);
       if (!existing || !Array.isArray(aliases) || aliases.length === 0) return 0;
+      if (revision !== undefined && existing.revision !== revision) return 0;
 
       let addedCount = 0;
       for (const alias of aliases) {
@@ -414,6 +428,19 @@ export async function sendLivePushNotification({
   fcmStore,
 }) {
   if (!messaging || !tokens || tokens.length === 0) return { successCount: 0, failureCount: 0 };
+  if (tokens.length > 500) {
+    const total = { successCount: 0, failureCount: 0, invalidTokens: [] };
+    for (let offset = 0; offset < tokens.length; offset += 500) {
+      const result = await sendLivePushNotification({
+        messaging, tokens: tokens.slice(offset, offset + 500), channelId, userId,
+        channelSlug, title, description, profilePicture, logger, fcmStore,
+      });
+      total.successCount += result.successCount;
+      total.failureCount += result.failureCount;
+      total.invalidTokens.push(...(result.invalidTokens || []));
+    }
+    return total;
+  }
 
   const cleanSlug = String(channelSlug || userId || "").trim().replace(/^\/+/, "");
   const payload = {
@@ -589,6 +616,13 @@ export function createPusherRelay({ fcmStore, messaging, logger }) {
   function syncSubscriptions() {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     const activeChannels = fcmStore.getActiveChannels();
+    const desiredChannels = new Set(activeChannels.map((channel) => `channel.${channel}`));
+    for (const channel of subscribedChannels) {
+      if (!desiredChannels.has(channel)) {
+        ws.send(JSON.stringify({ event: "pusher:unsubscribe", data: { channel } }));
+        subscribedChannels.delete(channel);
+      }
+    }
     let added = 0;
     for (const ch of activeChannels) {
       const pusherChannel = `channel.${ch}`;
@@ -736,18 +770,15 @@ export function createLiveStreamPoller({
         const chunk = userIdsArr.slice(i, i + BATCH_SIZE);
         const query = chunk.map((id) => `broadcaster_user_id=${encodeURIComponent(id)}`).join("&");
         try {
-          const controller = new AbortController();
-          const abortTimer = setTimeout(() => controller.abort(), 10_000);
-          const res = await fetchFn(`https://api.kick.com/public/v1/channels?${query}`, {
+          const res = await fetchJsonWithTimeout(fetchFn, `https://api.kick.com/public/v1/channels?${query}`, {
             headers: {
               "Authorization": `Bearer ${token}`,
               "Accept": "application/json",
             },
-            signal: controller.signal,
-          }).finally(() => clearTimeout(abortTimer));
+          }, 10_000);
 
           if (res.ok) {
-            const body = await res.json();
+            const body = res.body;
             const data = Array.isArray(body?.data) ? body.data : [];
             for (const ch of data) {
               foundChannels.push(ch);
@@ -771,18 +802,15 @@ export function createLiveStreamPoller({
       for (const slug of remainingSlugs) {
         if (isClosed) break;
         try {
-          const controller = new AbortController();
-          const abortTimer = setTimeout(() => controller.abort(), 8_000);
-          const res = await fetchFn(`https://api.kick.com/public/v1/channels?broadcaster_user_id=${encodeURIComponent(slug)}`, {
+          const res = await fetchJsonWithTimeout(fetchFn, `https://api.kick.com/public/v1/channels?broadcaster_user_id=${encodeURIComponent(slug)}`, {
             headers: {
               "Authorization": `Bearer ${token}`,
               "Accept": "application/json",
             },
-            signal: controller.signal,
-          }).finally(() => clearTimeout(abortTimer));
+          }, 8_000);
 
           if (res.ok) {
-            const body = await res.json();
+            const body = res.body;
             const data = Array.isArray(body?.data) ? body.data : [];
             for (const ch of data) {
               foundChannels.push(ch);
@@ -820,9 +848,9 @@ export function createLiveStreamPoller({
               slug,
               expiresAt: Date.now() + RESOLUTION_TTL_MS,
             };
-            if (slug) channelResolutionCache.set(slug, resolved);
-            if (uId) channelResolutionCache.set(uId, resolved);
-            if (resolved.channelId) channelResolutionCache.set(resolved.channelId, resolved);
+            if (slug) cacheChannel(slug, resolved);
+            if (uId) cacheChannel(uId, resolved);
+            if (resolved.channelId) cacheChannel(resolved.channelId, resolved);
 
             // Skip notifications on the first cycle (warm-up: seed seenStreams only)
             if (isFirstPoll) continue;
@@ -844,7 +872,7 @@ export function createLiveStreamPoller({
                 { channelKey, slug, userId: uId, tokensCount: tokens.length, startTime },
                 "live_poller_new_stream_detected"
               );
-              sendLivePushNotification({
+              const delivery = await sendLivePushNotification({
                 messaging,
                 tokens,
                 channelId: resolved.channelId || uId,
@@ -855,7 +883,10 @@ export function createLiveStreamPoller({
                 profilePicture: ch.banner_picture || "",
                 logger,
                 fcmStore,
-              }).catch(() => {});
+              });
+              if (delivery.successCount === 0 && delivery.failureCount > 0) {
+                seenStreams.delete(channelKey);
+              }
             }
           }
         } else {

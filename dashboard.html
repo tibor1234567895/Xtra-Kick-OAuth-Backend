@@ -182,11 +182,11 @@
         statusText.textContent = text;
       }
 
-      const savedToken = persistent.get(STORAGE_KEY) || ephemeral.get(STORAGE_KEY) || "";
+      const rememberedToken = persistent.get(STORAGE_KEY);
+      const savedToken = rememberedToken || ephemeral.get(STORAGE_KEY) || "";
       if (savedToken) {
         tokenInput.value = savedToken;
-        rememberBox.checked = true;
-        if (!persistent.get(STORAGE_KEY)) persistent.set(STORAGE_KEY, savedToken);
+        rememberBox.checked = Boolean(rememberedToken);
       }
       rangeSelect.value = persistent.get(RANGE_KEY) || ephemeral.get(RANGE_KEY) || "60";
       if (!["30", "60", "90"].includes(rangeSelect.value)) rangeSelect.value = "60";

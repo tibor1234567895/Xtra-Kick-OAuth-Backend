@@ -973,6 +973,31 @@ test("sendLivePushNotification includes channel_id and properly trims leading sl
   assert.equal(capturedPayload.android.priority, "high");
 });
 
+test("multicast sends no more than 500 tokens per batch and continues after failures", async () => {
+  const sizes = [];
+  const messaging = {
+    async sendEachForMulticast({ tokens }) {
+      sizes.push(tokens.length);
+      if (sizes.length === 2) throw new Error("temporary failure");
+      return { successCount: tokens.length, failureCount: 0, responses: tokens.map(() => ({ success: true })) };
+    },
+  };
+  const result = await sendLivePushNotification({
+    messaging, tokens: Array.from({ length: 1001 }, (_, index) => `token-${index}`), channelSlug: "test",
+  });
+  assert.deepEqual(sizes, [500, 500, 1]);
+  assert.equal(result.successCount, 501);
+  assert.equal(result.failureCount, 500);
+});
+
+test("stale alias resolution cannot change a replacement subscription", () => {
+  const store = createFcmStore();
+  const first = store.subscribe({ token: "test-token", channelIds: ["old"] });
+  store.subscribe({ token: "test-token", channelIds: ["new"] });
+  assert.equal(store.addAliasesToToken("test-token", ["stale"], first.revision), 0);
+  assert.deepEqual(store.getTokensForChannel("stale"), []);
+});
+
 test("fcmStore.addAliasesToToken adds new channels to existing token without wiping old ones", () => {
   const store = createFcmStore({ dataFile: null });
   const token = "x".repeat(32);

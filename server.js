@@ -230,7 +230,7 @@ export function createApp(config, deps = {}) {
 
   app.use("/v1/fcm", createLimiter(120));
   registerPost("/v1/fcm/subscribe", createLimiter(30), fcmSubscribeHandler(fcmStore, pusherRelay, { upstreamFetch, config }));
-  registerPost("/v1/fcm/unsubscribe", createLimiter(30), fcmUnsubscribeHandler(fcmStore));
+  registerPost("/v1/fcm/unsubscribe", createLimiter(30), fcmUnsubscribeHandler(fcmStore, pusherRelay));
   if (config.metrics?.adminToken) {
     app.get("/v1/fcm/stats", requireAdminToken(config.metrics), fcmStatsHandler(fcmStore));
   }
@@ -474,7 +474,8 @@ async function fetchWithTimeout(upstreamFetch, url, options, timeoutMs) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    return await upstreamFetch(url, { ...options, signal: controller.signal });
+    const response = await upstreamFetch(url, { ...options, signal: controller.signal });
+    return { ok: response.ok, status: response.status, body: await readJson(response) };
   } catch (error) {
     if (error?.name === "AbortError" || controller.signal.aborted) {
       const timeoutError = new Error(TIMEOUT_MESSAGE);
@@ -512,7 +513,7 @@ async function postKickForm(config, upstreamFetch, url, payload) {
     config.upstreamTimeoutMs
   );
 
-  const parsed = await readJson(response);
+  const parsed = response.body;
 
   if (!response.ok) {
     const mapped = mapKickOAuthError(parsed, response.status);
@@ -542,7 +543,7 @@ async function postKickAuthed(config, upstreamFetch, url, accessToken) {
   return {
     ok: response.ok,
     status: response.status,
-    body: await readJson(response),
+    body: response.body,
   };
 }
 
@@ -685,15 +686,20 @@ function introspectHandler(config, upstreamFetch) {
 }
 
 function fcmSubscribeHandler(fcmStore, pusherRelay, { upstreamFetch, config } = {}) {
+  let activeResolutions = 0;
   return async (req, res) => {
     const parsed = fcmSubscribeSchema.safeParse(req.body);
     if (!parsed.success) return validationError(res, parsed);
+    if (parsed.data.channel_ids.length > 0 && activeResolutions >= 4) {
+      return res.status(503).json({ ok: false, code: "subscription_busy" });
+    }
 
     const result = fcmStore.subscribe({
       token: parsed.data.token,
       kickUserId: parsed.data.kick_user_id,
       channelIds: parsed.data.channel_ids,
     });
+    if (result.error) return res.status(503).json({ ok: false, code: result.error });
     pusherRelay?.syncSubscriptions();
 
     // In the background, resolve any slugs or keys so numeric channel_ids are guaranteed
@@ -703,6 +709,7 @@ function fcmSubscribeHandler(fcmStore, pusherRelay, { upstreamFetch, config } = 
     const fetchFn = upstreamFetch || globalThis.fetch;
     const logger = req.log || config?.logger;
 
+    activeResolutions++;
     (async () => {
       try {
         const nonNumeric = channelIds.filter((id) => !/^\d+$/.test(id));
@@ -714,6 +721,7 @@ function fcmSubscribeHandler(fcmStore, pusherRelay, { upstreamFetch, config } = 
         if (nonNumeric.length > 0) {
           const BATCH_SIZE = 5;
           for (let i = 0; i < nonNumeric.length; i += BATCH_SIZE) {
+            if (!fcmStore.isCurrentSubscription(token, result.revision)) return;
             const batch = nonNumeric.slice(i, i + BATCH_SIZE);
             const results = await Promise.all(
               batch.map((slug) => resolveKickChannel(slug, { fetchFn, logger }))
@@ -729,6 +737,7 @@ function fcmSubscribeHandler(fcmStore, pusherRelay, { upstreamFetch, config } = 
 
         // 2. Resolve numeric broadcaster user IDs that are not yet known as channelIds
         if (numericIds.length > 0) {
+          if (!fcmStore.isCurrentSubscription(token, result.revision)) return;
           const unknownNumeric = numericIds.filter((id) => {
             const cached = channelResolutionCache.get(id);
             return !cached || cached.channelId !== id;
@@ -751,7 +760,7 @@ function fcmSubscribeHandler(fcmStore, pusherRelay, { upstreamFetch, config } = 
         }
 
         if (resolvedIds.length > 0) {
-          const added = fcmStore.addAliasesToToken(token, resolvedIds);
+          const added = fcmStore.addAliasesToToken(token, resolvedIds, result.revision);
           if (added > 0) {
             pusherRelay?.syncSubscriptions();
             logger?.info({ token: token.slice(-8), resolvedCount: resolvedIds.length, added }, "fcm_slugs_resolved_and_synced");
@@ -759,6 +768,8 @@ function fcmSubscribeHandler(fcmStore, pusherRelay, { upstreamFetch, config } = 
         }
       } catch (err) {
         logger?.warn({ err: err.message }, "fcm_background_resolution_failed");
+      } finally {
+        activeResolutions--;
       }
     })().catch(() => {});
 
@@ -769,12 +780,13 @@ function fcmSubscribeHandler(fcmStore, pusherRelay, { upstreamFetch, config } = 
   };
 }
 
-function fcmUnsubscribeHandler(fcmStore) {
+function fcmUnsubscribeHandler(fcmStore, pusherRelay) {
   return async (req, res) => {
     const parsed = fcmUnsubscribeSchema.safeParse(req.body);
     if (!parsed.success) return validationError(res, parsed);
 
     const removed = fcmStore.unsubscribe({ token: parsed.data.token });
+    if (removed) pusherRelay?.syncSubscriptions();
     return res.status(200).json({ ok: true, unsubscribed: removed });
   };
 }
@@ -966,7 +978,7 @@ async function recordAccountFromAccessToken({ accessToken, metrics, upstreamFetc
           config.upstreamTimeoutMs
         );
         if (userRes.ok) {
-          const userBody = await readJson(userRes);
+          const userBody = userRes.body;
           const userData = Array.isArray(userBody?.data) ? userBody.data[0] : userBody?.data;
           subRaw = userData?.user_id ?? userData?.id ?? null;
         }
