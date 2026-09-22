@@ -424,6 +424,7 @@ export async function sendLivePushNotification({
   title,
   description,
   profilePicture,
+  startTime,
   logger,
   fcmStore,
 }) {
@@ -433,7 +434,7 @@ export async function sendLivePushNotification({
     for (let offset = 0; offset < tokens.length; offset += 500) {
       const result = await sendLivePushNotification({
         messaging, tokens: tokens.slice(offset, offset + 500), channelId, userId,
-        channelSlug, title, description, profilePicture, logger, fcmStore,
+        channelSlug, title, description, profilePicture, startTime, logger, fcmStore,
       });
       total.successCount += result.successCount;
       total.failureCount += result.failureCount;
@@ -453,6 +454,7 @@ export async function sendLivePushNotification({
       title: String(title || `${cleanSlug} is live!`),
       description: String(description || ""),
       profile_picture: String(profilePicture || ""),
+      start_time: String(startTime || ""),
       timestamp: String(Date.now()),
     },
     android: {
@@ -685,6 +687,7 @@ export function createPusherRelay({ fcmStore, messaging, logger }) {
         title: data.title,
         description: data.description,
         profilePicture: data.profile_picture,
+        startTime: data.start_time || data.created_at || data.createdAt,
         logger,
         fcmStore,
       });
@@ -881,6 +884,7 @@ export function createLiveStreamPoller({
                 title: ch.stream_title || `${slug || channelKey} is live!`,
                 description: ch.channel_description || "",
                 profilePicture: ch.banner_picture || "",
+                startTime,
                 logger,
                 fcmStore,
               });
