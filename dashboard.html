@@ -317,6 +317,7 @@
           card("Stickiness", stick + "%", "DAU ÷ MAU"),
           card("Sessions today", fmt(d.sessionsToday ?? 0), avg7 ? "7d avg DAU " + fmt(avg7) : "reported today"),
           "</div>",
+          d.baselineDate ? '<div class="meta" style="margin:-4px 0 12px">Installs around <b>' + escapeHtml(d.baselineDate) + "</b> include a one-time migration baseline: devices that already had the app were each counted once as a new install on their first report.</div>" : "",
 
           '<div class="section">',
           '<div class="section-head"><div><h2>Daily active — returning vs new (last ' + series.length + " days)</h2>",
@@ -327,10 +328,16 @@
           '<div class="legend"><span><i></i>Returning</span><span><i class="new"></i>New installs</span></div>',
           "</div>",
 
+          '<div class="section">',
+          '<div class="section-head"><div><h2>Retention</h2><div class="sub">share of install-day cohort active N days later (last 30 days)</div></div></div>',
+          retentionTable(d.retention),
+          "</div>",
+
           '<div class="cols">',
           '<div class="section"><h2>Versions</h2><div class="sub">share of monthly devices</div>' + distTable((d.versions || []).map((r) => [r.version, r.count])) + "</div>",
           '<div class="section"><h2>Android versions</h2><div class="sub">API level share</div>' + distTable((d.os || []).map((r) => [(r.label === "unknown" ? "unknown" : "API " + r.label), r.count])) + "</div>",
-          '<div class="section"><h2>Countries</h2><div class="sub">coarse locale</div>' + distTable((d.countries || []).map((r) => [r.label, r.count])) + "</div>",
+          '<div class="section"><h2>Device language region</h2><div class="sub">reported locale country, not geolocation</div>' + distTable((d.countries || []).map((r) => [r.label, r.count])) + "</div>",
+          '<div class="section"><h2>Country (approx.)</h2><div class="sub">from request IP; IP itself is never stored</div>' + distTable((d.geoCountries || []).map((r) => [r.label, r.count])) + "</div>",
           "</div>",
 
           '<div class="section">',
@@ -371,6 +378,24 @@
         return out;
       }
 
+      function retentionTable(rows) {
+        if (!rows || rows.length === 0) return '<p style="color:var(--muted)">No install cohorts yet.</p>';
+        const avg = (key) => {
+          const vals = rows.map((r) => r[key]).filter((v) => typeof v === "number");
+          if (vals.length === 0) return "—";
+          return Math.round(vals.reduce((a, b) => a + b, 0) / vals.length * 10) / 10 + "%";
+        };
+        const body = rows.slice().reverse().map((r) => {
+          const cell = (v) => (typeof v === "number" ? v + "%" : "—");
+          return "<tr><td>" + escapeHtml(r.date) + '</td><td class="num">' + fmt(r.size) +
+            '</td><td class="num">' + cell(r.d1) + '</td><td class="num">' + cell(r.d7) +
+            '</td><td class="num">' + cell(r.d30) + "</td></tr>";
+        }).join("");
+        return '<table><thead><tr><th>Cohort</th><th class="num">Devices</th><th class="num">Day 1</th><th class="num">Day 7</th><th class="num">Day 30</th></tr></thead><tbody>' +
+          body + "</tbody></table>" +
+          '<div class="meta">Average: day 1 ' + avg("d1") + " • day 7 " + avg("d7") + " • day 30 " + avg("d30") + "</div>";
+      }
+
       function healthSummary(week) {
         const endpoints = (week && week.endpoints) || {};
         let total = 0, bad = 0;
@@ -402,7 +427,7 @@
           if (r5) parts.push("5xx " + r5);
           if (limited) parts.push("limited " + limited);
           if (hmac) parts.push("hmac " + hmac);
-          return "<tr><td>" + escapeHtml(name) + ' <span class="pill ' + pill + '">' + errRate + '%</span></td><td class="num">' + fmt(total) + '</td><td class="num">' + fmt(ok) + '</td><td class="num">' + errRate + '%</td><td>' + escapeHtml(parts.join(" • ") || "—") + "</td></tr>";
+          return "<tr><td>" + escapeHtml(name === "OTHER / 404" ? "Other (bots/scanners)" : name) + ' <span class="pill ' + pill + '">' + errRate + '%</span></td><td class="num">' + fmt(total) + '</td><td class="num">' + fmt(ok) + '</td><td class="num">' + errRate + '%</td><td>' + escapeHtml(parts.join(" • ") || "—") + "</td></tr>";
         });
         const oauth = (week && week.oauth) || {};
         const pingC = (week && week.ping) || {};

@@ -8,6 +8,7 @@ import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
+import geoip from "geoip-country";
 import {
   createMetricsStore,
   loadMetricsConfig,
@@ -140,6 +141,9 @@ export function createApp(config, deps = {}) {
 
   if (metrics) {
     app.use((req, res, next) => {
+      // Browsers request this on every dashboard visit; counting it would
+      // pollute the unmatched-path row with the owner's own traffic.
+      if (req.method === "GET" && req.path === "/favicon.ico") return next();
       const rawEndpoint = `${req.method} ${req.originalUrl.split("?")[0]}`;
       const endpoint = KNOWN_ENDPOINTS.has(rawEndpoint) ? rawEndpoint : "OTHER / 404";
       res.on("finish", () => {
@@ -220,7 +224,7 @@ export function createApp(config, deps = {}) {
 
   if (metrics) {
     app.use("/v1/metrics", createLimiter(120));
-    registerPost("/v1/metrics/ping", createLimiter(10), pingHandler(metrics));
+    registerPost("/v1/metrics/ping", createLimiter(10), pingHandler(metrics, createCountryLookup(config.metrics)));
     app.get("/v1/metrics/stats", requireAdminToken(config.metrics), statsHandler(metrics));
     if (config.metrics.dashPath) {
       // The page is only a login shell; its data request remains token-protected.
@@ -286,6 +290,7 @@ const pingSchema = z.object({
   os: z.string().regex(/^\d{1,3}$/).optional(),
   cc: z.string().regex(/^[A-Za-z]{2}$/).optional(),
   s: z.number().int().min(0).max(100_000).optional(),
+  ah: z.string().regex(/^[0-9a-f]{64}$/).optional(),
 });
 
 function createLimiter(max) {
@@ -880,7 +885,18 @@ export function startServer(env = process.env, deps = {}) {
   });
 }
 
-function pingHandler(metrics) {
+// Approximates the country of a ping from its (already proxy-resolved)
+// client IP using the bundled offline GeoLite2 country database. Only the
+// resulting two-letter code travels further; the IP itself is never stored.
+// The store re-validates the code, so invalid lookups degrade to no country.
+export function createCountryLookup(metricsConfig) {
+  if (!metricsConfig?.geoipEnabled) {
+    return () => null;
+  }
+  return (ip) => geoip.lookup(ip)?.country ?? null;
+}
+
+function pingHandler(metrics, lookupCountry) {
   return async (req, res) => {
     const parsed = pingSchema.safeParse(req.body);
     if (!parsed.success) {
@@ -903,6 +919,8 @@ function pingHandler(metrics) {
           os: parsed.data.os,
           cc: parsed.data.cc,
           sessions: parsed.data.s,
+          accountAid: parsed.data.ah,
+          geoCountry: lookupCountry(req.ip),
         },
         now
       );
@@ -991,8 +1009,7 @@ async function recordAccountFromAccessToken({ accessToken, metrics, upstreamFetc
       metrics.countersAccount("no_sub");
       return;
     }
-    const subHash = metrics.hashSub(String(subRaw));
-    metrics.recordAccount({ subHash });
+    metrics.recordAccount({ sub: String(subRaw) });
     metrics.countersAccount("recorded");
   } catch {
     metrics.countersAccount("error");

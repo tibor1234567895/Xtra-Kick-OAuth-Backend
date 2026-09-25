@@ -7,19 +7,31 @@
 //     "devices": { "2026-08": { "<pidHash>": { "v": "1.4.2", "d": 5, "n": 1, "os": "35", "cc": "DE", "s": 3 } } },
 //     "accounts": { "2026-08": { "<subHash>": true } },
 //     "everSeen": "<concatenated 16-hex pidHash prefixes, install dedup>",
+//     "accountsEverSeen": "<concatenated 16-hex aidHash prefixes, reinstall dedup>",
+//     "baselineDate": "2026-08-31",
 //     "counters": { "2026-08-31": { "endpoints": {...}, "oauth": {...}, "ping": {...}, "account": {...} } }
 //   }
 //
 // Per-device fields: `v` app version, `d` active-day bitmask (1..31), `n`
 // new-install-day bitmask, `os` last-reported Android API level, `cc`
-// last-reported coarse locale country, `s` last-reported sessions that day.
+// last-reported coarse locale country, `s` last-reported sessions that day,
+// `gc` approximated country from the ping request IP (IP itself is never
+// persisted; disable with METRICS_GEOIP=off), `t` first-seen day (enables
+// install revocation), `am` set when this device registered its account hash
+// itself (exempt from revocation).
 //
 // Months not in `retentionMonths` are pruned on each write and on each stats
 // call; daily counters are pruned after `COUNTER_DAYS`. All hashes are SHA-256
 // over (raw + salt); no raw identifiers, IPs, or usage traces are persisted and
 // the salt is not stored with the data. `everSeen` stores only 64-bit hash
 // prefixes so returning devices are not recounted as installs; it is never
-// used to track activity and is capped in size.
+// used to track activity and is capped in size. `accountsEverSeen` mirrors
+// that for account hashes derived from the ping's one-way `ah` field
+// (sha256 of the logged-in user id, salted again server-side) so reinstalls
+// by a known account revoke their recent install count instead of inflating
+// it. `baselineDate` records when the store first saw traffic; installs
+// counted on and shortly after that date include a one-time migration
+// baseline of already-existing devices.
 //
 // Schema 1 files (monthly-rotating pids, no everSeen/counters) are migrated in
 // place: existing buckets are kept, everSeen starts empty so every first v2
@@ -32,6 +44,7 @@ import { dirname, resolve } from "node:path";
 export const SCHEMA_VERSION = 2;
 export const COUNTER_DAYS = 35;
 export const EVERSEEN_PREFIX_CHARS = 16;
+export const INSTALL_REVOKE_DAYS = 7;
 
 export function loadMetricsConfig(env = process.env) {
   const salt = (env.METRICS_SALT || "").trim();
@@ -56,6 +69,7 @@ export function loadMetricsConfig(env = process.env) {
     maxDevicesPerMonth,
     maxEverSeen,
     dashPath,
+    geoipEnabled: (env.METRICS_GEOIP || "").trim().toLowerCase() !== "off",
   };
 }
 
@@ -98,6 +112,8 @@ function emptyState() {
     devices: {},
     accounts: {},
     everSeen: "",
+    accountsEverSeen: "",
+    baselineDate: null,
     counters: {},
   };
 }
@@ -126,6 +142,7 @@ export function createMetricsStore(options = {}) {
 
   let state = emptyState();
   let everSeenSet = new Set();
+  let accountEverSeenSet = new Set();
   let pendingFlush = null;
   const monthCounts = { devices: new Map(), accounts: new Map() };
 
@@ -140,10 +157,20 @@ export function createMetricsStore(options = {}) {
           devices: parsed.devices && typeof parsed.devices === "object" ? parsed.devices : {},
           accounts: parsed.accounts && typeof parsed.accounts === "object" ? parsed.accounts : {},
           everSeen: typeof parsed.everSeen === "string" ? parsed.everSeen : "",
+          accountsEverSeen: typeof parsed.accountsEverSeen === "string" ? parsed.accountsEverSeen : "",
+          baselineDate: typeof parsed.baselineDate === "string" ? parsed.baselineDate : null,
           counters: parsed.counters && typeof parsed.counters === "object" ? parsed.counters : {},
         };
         for (let i = 0; i + EVERSEEN_PREFIX_CHARS <= state.everSeen.length; i += EVERSEEN_PREFIX_CHARS) {
           everSeenSet.add(state.everSeen.slice(i, i + EVERSEEN_PREFIX_CHARS));
+        }
+        for (let i = 0; i + EVERSEEN_PREFIX_CHARS <= state.accountsEverSeen.length; i += EVERSEEN_PREFIX_CHARS) {
+          accountEverSeenSet.add(state.accountsEverSeen.slice(i, i + EVERSEEN_PREFIX_CHARS));
+        }
+        // First-seen traffic date marks the migration baseline for installs.
+        if (!state.baselineDate) {
+          const counterDays = Object.keys(state.counters).sort();
+          state.baselineDate = counterDays.length > 0 ? counterDays[0] : null;
         }
       }
     } catch (error) {
@@ -205,8 +232,13 @@ export function createMetricsStore(options = {}) {
     return state[kind][month];
   }
 
+  function noteTraffic(now) {
+    if (!state.baselineDate) state.baselineDate = dayKey(now);
+  }
+
   function counterBucket(now) {
     const key = dayKey(now);
+    noteTraffic(now);
     if (!state.counters[key]) {
       state.counters[key] = { endpoints: {}, oauth: {}, ping: {}, account: {} };
     }
@@ -273,9 +305,21 @@ export function createMetricsStore(options = {}) {
     return true;
   }
 
-  function recordPing({ pidHash, version, clientEpoch, os, cc, sessions }, now = new Date()) {
+  function markAccountEverSeen(aidHash) {
+    const prefix = aidHash.slice(0, EVERSEEN_PREFIX_CHARS);
+    if (accountEverSeenSet.has(prefix)) return false;
+    if (accountEverSeenSet.size >= maxEverSeen) return false;
+    accountEverSeenSet.add(prefix);
+    state.accountsEverSeen += prefix;
+    return true;
+  }
+
+  function recordPing({ pidHash, version, clientEpoch, os, cc, sessions, accountAid, geoCountry }, now = new Date()) {
     if (typeof pidHash !== "string" || !/^[0-9a-f]{64}$/.test(pidHash)) {
       throw new Error("recordPing: invalid pidHash");
+    }
+    if (accountAid !== null && accountAid !== undefined && !/^[0-9a-f]{64}$/.test(accountAid)) {
+      throw new Error("recordPing: invalid accountAid");
     }
     const serverEpoch = monthKey(now);
     if (clientEpoch !== null && clientEpoch !== undefined && clientEpoch !== serverEpoch) {
@@ -287,8 +331,13 @@ export function createMetricsStore(options = {}) {
     const safeVersion = String(version || "").slice(0, 32) || "unknown";
     const safeOs = typeof os === "string" && /^\d{1,3}$/.test(os) ? os.slice(0, 3) : null;
     const safeCc = typeof cc === "string" && /^[A-Za-z]{2}$/.test(cc) ? cc.toUpperCase() : null;
+    const safeGeo = typeof geoCountry === "string" && /^[A-Za-z]{2}$/.test(geoCountry) ? geoCountry.toUpperCase() : null;
     const safeSessions = clampInt(sessions, 0, 100_000, null);
+    const aidHash = accountAid ? hashWithSalt(accSalt, accountAid) : null;
+    const aidPrefix = aidHash ? aidHash.slice(0, EVERSEEN_PREFIX_CHARS) : null;
+    const accountKnown = aidPrefix !== null && accountEverSeenSet.has(aidPrefix);
     prune();
+    noteTraffic(now);
     const month = ensureMonth(serverEpoch, "devices");
     const existing = month[pidHash];
     const dayBit = 1 << (dayIndexUtc(now) - 1);
@@ -297,7 +346,25 @@ export function createMetricsStore(options = {}) {
       if (safeVersion) existing.v = safeVersion;
       if (safeOs) existing.os = safeOs;
       if (safeCc) existing.cc = safeCc;
+      if (safeGeo) existing.gc = safeGeo;
       if (safeSessions !== null) existing.s = safeSessions;
+      // Reinstall revocation: a recently counted install whose account turns
+      // out to be a pre-existing one (device was not logged in on first ping)
+      // gives its install count back.
+      if (
+        accountKnown &&
+        existing.n &&
+        !existing.am &&
+        existing.t &&
+        now.getTime() - Date.parse(`${existing.t}T00:00:00Z`) <= INSTALL_REVOKE_DAYS * 86_400_000
+      ) {
+        state.totalInstalls = Math.max(0, state.totalInstalls - 1);
+        existing.n = 0;
+      }
+      if (aidPrefix && !accountKnown) {
+        markAccountEverSeen(aidHash);
+        existing.am = 1;
+      }
       scheduleFlush();
       return { isNewInstall: false, month: serverEpoch };
     }
@@ -307,13 +374,23 @@ export function createMetricsStore(options = {}) {
       error.code = "metrics_capacity_reached";
       throw error;
     }
-    const entry = { v: safeVersion, d: dayBit };
+    const entry = { v: safeVersion, d: dayBit, t: dayKey(now) };
     if (safeOs) entry.os = safeOs;
     if (safeCc) entry.cc = safeCc;
+    if (safeGeo) entry.gc = safeGeo;
     if (safeSessions !== null) entry.s = safeSessions;
-    if (markEverSeen(pidHash)) {
-      entry.n = dayBit;
-      state.totalInstalls += 1;
+    if (accountKnown) {
+      // A device whose account is already known is a reinstall or an
+      // additional device of an existing user, not a new install.
+    } else {
+      if (markEverSeen(pidHash)) {
+        entry.n = dayBit;
+        state.totalInstalls += 1;
+      }
+      if (aidPrefix) {
+        markAccountEverSeen(aidHash);
+        entry.am = 1;
+      }
     }
     // If everSeen is at capacity the device is recorded for activity but not
     // counted as an install; install totals become best-effort at that point.
@@ -323,10 +400,14 @@ export function createMetricsStore(options = {}) {
     return { isNewInstall: Boolean(entry.n), month: serverEpoch };
   }
 
-  function recordAccount({ subHash }, now = new Date()) {
-    if (typeof subHash !== "string" || subHash.length === 0) {
-      throw new Error("recordAccount: invalid subHash");
+  function recordAccount({ sub }, now = new Date()) {
+    if (typeof sub !== "string" || sub.length === 0) {
+      throw new Error("recordAccount: invalid sub");
     }
+    const subHash = hashSub(sub);
+    const aidHash = hashWithSalt(accSalt, createHash("sha256").update(sub).digest("hex"));
+    markAccountEverSeen(aidHash);
+    noteTraffic(now);
     prune();
     const month = ensureMonth(monthKey(now), "accounts");
     if (month[subHash]) return { isNewSession: false };
@@ -432,6 +513,62 @@ export function createMetricsStore(options = {}) {
     return rollup;
   }
 
+  function computeRetention(now, days = 30) {
+    const today = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+    // pidHash -> { month -> day bitmask }, so cohorts can be followed across
+    // month boundaries (same pidHash appears once per month bucket).
+    const activityByDevice = new Map();
+    const cohorts = new Map();
+    for (const [month, bucket] of Object.entries(state.devices)) {
+      if (!bucket) continue;
+      for (const [pidHash, entry] of Object.entries(bucket)) {
+        if (!entry) continue;
+        let masks = activityByDevice.get(pidHash);
+        if (!masks) {
+          masks = {};
+          activityByDevice.set(pidHash, masks);
+        }
+        masks[month] = entry.d || 0;
+        const installMask = entry.n || 0;
+        if (installMask) {
+          for (let day = 1; day <= 31; day++) {
+            if ((installMask & (1 << (day - 1))) !== 0) {
+              const dateKey = `${month}-${String(day).padStart(2, "0")}`;
+              let members = cohorts.get(dateKey);
+              if (!members) {
+                members = new Set();
+                cohorts.set(dateKey, members);
+              }
+              members.add(pidHash);
+            }
+          }
+        }
+      }
+    }
+    const series = [];
+    for (let offset = days - 1; offset >= 0; offset -= 1) {
+      const cohortDay = new Date(today - offset * 86_400_000);
+      const dateKey = cohortDay.toISOString().slice(0, 10);
+      const members = cohorts.get(dateKey);
+      if (!members || members.size === 0) continue;
+      const rate = (offsetDays) => {
+        const target = offsetDays * 86_400_000;
+        if (cohortDay.getTime() + target > today) return null;
+        const targetDate = new Date(cohortDay.getTime() + target);
+        const m = monthKey(targetDate);
+        const dayBit = 1 << (dayIndexUtc(targetDate) - 1);
+        let active = 0;
+        for (const pidHash of members) {
+          const masks = activityByDevice.get(pidHash);
+          if (masks && (masks[m] & dayBit) !== 0) active += 1;
+        }
+        return Math.round((active / members.size) * 1000) / 10;
+      };
+      series.push({ date: dateKey, size: members.size, d1: rate(1), d7: rate(7), d30: rate(30) });
+    }
+    return series;
+  }
+
   function computeStats(now = new Date(), days = 60) {
     prune();
     const seriesDays = clampInt(days, 1, 90, 60);
@@ -445,6 +582,7 @@ export function createMetricsStore(options = {}) {
     const versions = {};
     const osCounts = {};
     const countryCounts = {};
+    const geoCountryCounts = {};
     for (const entry of Object.values(devicesBucket)) {
       if (!entry) continue;
       if ((entry.d & todayBit) !== 0) {
@@ -458,6 +596,8 @@ export function createMetricsStore(options = {}) {
       osCounts[osKey] = (osCounts[osKey] || 0) + 1;
       const ccKey = entry.cc || "unknown";
       countryCounts[ccKey] = (countryCounts[ccKey] || 0) + 1;
+      const gcKey = entry.gc || "unknown";
+      geoCountryCounts[gcKey] = (geoCountryCounts[gcKey] || 0) + 1;
     }
     const mau = Object.keys(devicesBucket).length;
     const accountsMau = Object.keys(accountsBucket).length;
@@ -470,6 +610,7 @@ export function createMetricsStore(options = {}) {
       generatedAt: now.toISOString(),
       currentMonth: month,
       totalInstalls: state.totalInstalls,
+      baselineDate: state.baselineDate,
       mau,
       wau: computeWeeklyActive(now, 7),
       dauToday,
@@ -482,7 +623,9 @@ export function createMetricsStore(options = {}) {
         .sort((a, b) => b.count - a.count),
       os: toRanked(osCounts),
       countries: toRanked(countryCounts),
+      geoCountries: toRanked(geoCountryCounts),
       dauSeries,
+      retention: computeRetention(now, 30),
       counters: {
         today: rollupCounters(now, 1),
         week: rollupCounters(now, 7),

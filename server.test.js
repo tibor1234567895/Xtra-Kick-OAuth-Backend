@@ -6,7 +6,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import pino from "pino";
-import { backfillStoredSubscriptions, computeHmacSignature, createApp, loadConfig, redactPaths } from "./server.js";
+import { backfillStoredSubscriptions, computeHmacSignature, createApp, createCountryLookup, loadConfig, redactPaths } from "./server.js";
 import { createMetricsStore } from "./metrics.js";
 import { clearChannelResolutionCache, createFcmStore, createLiveStreamPoller, createPusherRelay, sendLivePushNotification } from "./fcm.js";
 
@@ -512,14 +512,187 @@ test("dashboard shell loads without admin token while stats stays protected", as
 
 test("account counter records hashed sub once per month", () => {
   const store = createMetricsStore({ salt: "a".repeat(32), accountSalt: "b".repeat(32), dataPath: null });
-  const subHash = store.hashSub("user-42");
-  const first = store.recordAccount({ subHash });
-  const second = store.recordAccount({ subHash });
+  const first = store.recordAccount({ sub: "user-42" });
+  const second = store.recordAccount({ sub: "user-42" });
   assert.equal(first.isNewSession, true);
   assert.equal(second.isNewSession, false);
   const stats = store.computeStats();
   assert.equal(stats.accountsMau, 1);
   store.close();
+});
+
+function sha256HexClient(value) {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+test("new install with unknown account is counted and registers the account", () => {
+  const store = createMetricsStore({ salt: "a".repeat(32), accountSalt: "b".repeat(32), dataPath: null });
+  const result = store.recordPing({
+    pidHash: "a".repeat(64),
+    version: "2.0.0",
+    clientEpoch: aMonthString(),
+    accountAid: sha256HexClient("user-42"),
+  });
+  assert.equal(result.isNewInstall, true);
+  const stats = store.computeStats();
+  assert.equal(stats.totalInstalls, 1);
+  store.close();
+});
+
+test("reinstall by a known account does not count as a new install", () => {
+  const store = createMetricsStore({ salt: "a".repeat(32), accountSalt: "b".repeat(32), dataPath: null });
+  store.recordAccount({ sub: "user-42" });
+  const result = store.recordPing({
+    pidHash: "b".repeat(64),
+    version: "2.0.0",
+    clientEpoch: aMonthString(),
+    accountAid: sha256HexClient("user-42"),
+  });
+  assert.equal(result.isNewInstall, false);
+  assert.equal(store.computeStats().totalInstalls, 0);
+  store.close();
+});
+
+test("install is revoked when a recent install turns out to be a known account", () => {
+  const store = createMetricsStore({ salt: "a".repeat(32), accountSalt: "b".repeat(32), dataPath: null });
+  const pidHash = "c".repeat(64);
+  const aid = sha256HexClient("user-42");
+
+  // Fresh device pings before login: no account hash, counted as install.
+  store.recordPing({ pidHash, version: "2.0.0", clientEpoch: aMonthString() });
+  assert.equal(store.computeStats().totalInstalls, 1);
+
+  // User logs in; next ping carries the account hash of a pre-existing account.
+  store.recordAccount({ sub: "user-42" });
+  store.recordPing({ pidHash, version: "2.0.0", clientEpoch: aMonthString(), accountAid: aid });
+  assert.equal(store.computeStats().totalInstalls, 0);
+  const month = store.state.devices[aMonthString()];
+  assert.ok(!month[pidHash].n, "install day bit should be cleared");
+  store.close();
+});
+
+test("install by a self-registered account is not revoked later", () => {
+  const store = createMetricsStore({ salt: "a".repeat(32), accountSalt: "b".repeat(32), dataPath: null });
+  const pidHash = "d".repeat(64);
+  const aid = sha256HexClient("user-42");
+
+  store.recordPing({ pidHash, version: "2.0.0", clientEpoch: aMonthString(), accountAid: aid });
+  assert.equal(store.computeStats().totalInstalls, 1);
+  store.recordPing({ pidHash, version: "2.0.0", clientEpoch: aMonthString(), accountAid: aid });
+  assert.equal(store.computeStats().totalInstalls, 1);
+  store.close();
+});
+
+test("old installs without a first-seen day are never revoked", () => {
+  const store = createMetricsStore({ salt: "a".repeat(32), accountSalt: "b".repeat(32), dataPath: null });
+  const pidHash = "e".repeat(64);
+  store.recordAccount({ sub: "user-42" });
+  // Simulate a pre-linkage entry: counted install with no t marker.
+  store.recordPing({ pidHash, version: "2.0.0", clientEpoch: aMonthString() });
+  const month = store.state.devices[aMonthString()];
+  delete month[pidHash].t;
+  month[pidHash].n = 1;
+  store.recordPing({ pidHash, version: "2.0.0", clientEpoch: aMonthString(), accountAid: sha256HexClient("user-42") });
+  assert.equal(store.computeStats().totalInstalls, 1);
+  store.close();
+});
+
+test("retention series tracks install cohorts across days", () => {
+  const store = createMetricsStore({ salt: "a".repeat(32), accountSalt: "b".repeat(32), dataPath: null });
+  const now = new Date();
+  const yesterday = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - 1));
+  const firstDevice = "a".repeat(64);
+  const secondDevice = "b".repeat(64);
+
+  store.recordPing({ pidHash: firstDevice, version: "2.0.0", clientEpoch: monthStringOf(yesterday) }, yesterday);
+  // Second install today: separate cohort, must not inflate yesterday's.
+  store.recordPing({ pidHash: secondDevice, version: "2.0.0", clientEpoch: monthStringOf(now) }, now);
+  // First device returns today (day 1 for its cohort).
+  store.recordPing({ pidHash: firstDevice, version: "2.0.0", clientEpoch: monthStringOf(now) }, now);
+
+  const stats = store.computeStats();
+  assert.equal(stats.retention.length, 2);
+  const yesterdayCohort = stats.retention.find((r) => r.date === yesterday.toISOString().slice(0, 10));
+  const todayCohort = stats.retention.find((r) => r.date === now.toISOString().slice(0, 10));
+  assert.equal(yesterdayCohort.size, 1);
+  assert.equal(yesterdayCohort.d1, 100);
+  assert.equal(todayCohort.size, 1);
+  assert.equal(todayCohort.d1, null);
+  store.close();
+});
+
+test("baselineDate is recorded for stores with existing traffic", () => {
+  const store = createMetricsStore({ salt: "a".repeat(32), accountSalt: "b".repeat(32), dataPath: null });
+  store.recordPing({ pidHash: "f".repeat(64), version: "2.0.0", clientEpoch: aMonthString() });
+  const stats = store.computeStats();
+  assert.ok(stats.baselineDate, "baselineDate should be derived from first counter day");
+  store.close();
+});
+
+test("recordPing stores a validated geo country code", () => {
+  const store = createMetricsStore({ salt: "a".repeat(32), accountSalt: "b".repeat(32), dataPath: null });
+  const pidHash = "a".repeat(64);
+  store.recordPing({ pidHash, version: "2.0.0", clientEpoch: aMonthString(), geoCountry: "si" });
+  store.recordPing({ pidHash: "b".repeat(64), version: "2.0.0", clientEpoch: aMonthString(), geoCountry: "TOOLONG" });
+  const month = store.state.devices[aMonthString()];
+  assert.equal(month[pidHash].gc, "SI");
+  assert.ok(!month["b".repeat(64)].gc, "invalid geo country must be ignored");
+  const stats = store.computeStats();
+  assert.deepEqual(stats.geoCountries, [
+    { label: "SI", count: 1 },
+    { label: "unknown", count: 1 },
+  ]);
+  store.close();
+});
+
+test("country lookup resolves public IPs and skips private or disabled setups", () => {
+  const enabled = createCountryLookup({ geoipEnabled: true });
+  assert.equal(enabled("8.8.8.8"), "US");
+  assert.equal(enabled("127.0.0.1"), null);
+  assert.equal(enabled(""), null);
+  const disabled = createCountryLookup({ geoipEnabled: false });
+  assert.equal(disabled("8.8.8.8"), null);
+});
+
+test("pings from private addresses store no geo country", async () => {
+  const { app, store } = appWithMetrics(async () => jsonResponse(200, {}));
+  await withServer(app, (baseUrl) =>
+    httpRequest(baseUrl, "POST", "/v1/metrics/ping", makePingBody())
+  );
+  const stats = store.computeStats();
+  assert.deepEqual(stats.geoCountries, [{ label: "unknown", count: 1 }]);
+  store.close();
+});
+
+test("store reload keeps new fields and install dedup working", () => {
+  const dir = mkdtempSync(join(tmpdir(), "metrics-reload-"));
+  const file = join(dir, "m.json");
+  const aid = sha256HexClient("user-42");
+  const first = "a".repeat(64);
+  try {
+    const store = createMetricsStore({ salt: "s", accountSalt: "s", dataPath: file });
+    store.recordPing({ pidHash: first, version: "2.0.0", clientEpoch: aMonthString(), accountAid: aid, geoCountry: "si", sessions: 3 });
+    store.close();
+
+    const reloaded = createMetricsStore({ salt: "s", accountSalt: "s", dataPath: file });
+    assert.ok(reloaded.computeStats().baselineDate, "baselineDate must survive reload");
+
+    // Same device pings again after reload: no second install.
+    reloaded.recordPing({ pidHash: first, version: "2.0.0", clientEpoch: aMonthString(), accountAid: aid, geoCountry: "de" });
+    assert.equal(reloaded.computeStats().totalInstalls, 1);
+
+    // A second device with the known account after reload: not a new install.
+    reloaded.recordPing({ pidHash: "b".repeat(64), version: "2.0.0", clientEpoch: aMonthString(), accountAid: aid });
+    assert.equal(reloaded.computeStats().totalInstalls, 1);
+
+    const month = reloaded.state.devices[aMonthString()];
+    assert.equal(month[first].gc, "DE", "geo country should update on later pings");
+    assert.equal(month[first].am, 1, "account registration marker must survive reload");
+    assert.ok(month[first].t, "first-seen day must survive reload");
+    reloaded.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("install is deduped across months for a returning device", () => {

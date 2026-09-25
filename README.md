@@ -46,6 +46,10 @@ Minimal OAuth proxy for Kick token operations.
 - Do not treat an HMAC secret shipped in the Android APK as confidential. The
   long-term fix is to replace shared APK signing with a public-client auth
   design; keep the server-side HMAC as defense-in-depth during that migration.
+- Country approximation for anonymous usage pings uses the `geoip-country`
+  package, which bundles data derived from GeoLite2 created by MaxMind
+  (https://www.maxmind.com). Only the resolved two-letter country code is
+  stored; request IPs are never persisted. Set `METRICS_GEOIP=off` to disable.
 
 ## Ubuntu service
 
