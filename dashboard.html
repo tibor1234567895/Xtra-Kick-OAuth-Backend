@@ -334,12 +334,11 @@
           "</div>",
 
           '<div class="cols">',
-          '<div class="section"><h2>Versions</h2><div class="sub">share of monthly devices</div>' + distTable((d.versions || []).map((r) => [r.version, r.count])) + "</div>",
-          '<div class="section"><h2>Android versions</h2><div class="sub">API level share</div>' + distTable((d.os || []).map((r) => [(r.label === "unknown" ? "unknown" : "API " + r.label), r.count])) + "</div>",
-          '<div class="section"><h2>Device language region</h2><div class="sub">reported locale country, not geolocation</div>' + distTable((d.countries || []).map((r) => [r.label, r.count])) + "</div>",
-          '<div class="section"><h2>Country (approx.)</h2><div class="sub">from request IP; IP itself is never stored</div>' + distTable((d.geoCountries || []).map((r) => [r.label, r.count])) + "</div>",
+          '<div class="section"><h2>Versions</h2><div class="sub">share of monthly devices</div>' + distTable((d.versions || []).map((r) => [r.version, r.count]), "versions") + "</div>",
+          '<div class="section"><h2>Android versions</h2><div class="sub">API level share</div>' + distTable((d.os || []).map((r) => [(r.label === "unknown" ? "unknown" : "API " + r.label), r.count]), "os") + "</div>",
+          '<div class="section"><h2>Device language region</h2><div class="sub">reported locale country, not geolocation</div>' + distTable((d.countries || []).map((r) => [countryLabel(r.label), r.count]), "countries") + "</div>",
+          '<div class="section"><h2>Country (approx.)</h2><div class="sub">from request IP; IP itself is never stored</div>' + distTable((d.geoCountries || []).map((r) => [countryLabel(r.label), r.count]), "geoCountries") + "</div>",
           "</div>",
-
           '<div class="section">',
           '<div class="section-head"><div><h2>Backend health (7 days)</h2><div class="sub">per-endpoint outcomes</div></div><div>' + healthSummary(d.counters && d.counters.week) + "</div></div>",
           healthTable(d.counters && d.counters.week),
@@ -365,16 +364,61 @@
           "</div>";
       }
 
-      function distTable(rows) {
+      const expandedSections = new Set();
+      const regionNames = typeof Intl !== "undefined" && Intl.DisplayNames
+        ? new Intl.DisplayNames(["en"], { type: "region" })
+        : null;
+
+      function countryLabel(code) {
+        if (!code || code === "unknown") return "unknown";
+        const upper = String(code).trim().toUpperCase();
+        if (regionNames && /^[A-Z]{2}$/.test(upper)) {
+          try {
+            const name = regionNames.of(upper);
+            if (name && name.toUpperCase() !== upper) {
+              return name + " (" + upper + ")";
+            }
+          } catch {
+            // Fallback to code
+          }
+        }
+        return code;
+      }
+
+      window.toggleDistRows = function(btn) {
+        const key = btn.getAttribute("data-key");
+        const section = btn.closest(".section");
+        if (!section) return;
+        const extraRows = section.querySelectorAll("tr.dist-extra");
+        if (!extraRows.length) return;
+        const isHidden = extraRows[0].style.display === "none";
+        extraRows.forEach((r) => { r.style.display = isHidden ? "" : "none"; });
+        if (key) {
+          if (isHidden) expandedSections.add(key);
+          else expandedSections.delete(key);
+        }
+        const count = btn.getAttribute("data-count");
+        btn.textContent = isHidden ? "Show less" : "+" + count + " more (show all)";
+      };
+
+      function distTable(rows, key = "", limit = 8) {
         if (!rows || rows.length === 0) return '<p style="color:var(--muted)">No data yet.</p>';
         const total = rows.reduce((a, r) => a + (r[1] || 0), 0) || 1;
-        const top = rows.slice(0, 8);
+        const hasExtra = rows.length > limit;
+        const isExpanded = Boolean(key && expandedSections.has(key));
         let out = '<table><thead><tr><th>Label</th><th class="num">Devices</th><th class="num">Share</th></tr></thead><tbody>' +
-          top.map((r) => {
+          rows.map((r, i) => {
             const pct = Math.round((r[1] || 0) / total * 100);
-            return "<tr><td>" + escapeHtml(String(r[0])) + '<div class="share"><div style="width:' + pct + '%"></div></div></td><td class="num">' + fmt(r[1]) + '</td><td class="num">' + pct + "%</td></tr>";
+            const isExtra = i >= limit;
+            const trAttrs = isExtra ? ' class="dist-extra"' + (isExpanded ? '' : ' style="display:none"') : '';
+            return '<tr' + trAttrs + '><td>' + escapeHtml(String(r[0])) + '<div class="share"><div style="width:' + pct + '%"></div></div></td><td class="num">' + fmt(r[1]) + '</td><td class="num">' + pct + "%</td></tr>";
           }).join("") + "</tbody></table>";
-        if (rows.length > top.length) out += '<div class="meta">+' + (rows.length - top.length) + " more</div>";
+        if (hasExtra) {
+          const count = rows.length - limit;
+          out += '<div class="meta" style="margin-top:8px"><button class="ghost small" type="button" data-key="' + escapeHtml(key) + '" data-count="' + count + '" onclick="toggleDistRows(this)">' +
+            (isExpanded ? "Show less" : "+" + count + " more (show all)") +
+            '</button></div>';
+        }
         return out;
       }
 
