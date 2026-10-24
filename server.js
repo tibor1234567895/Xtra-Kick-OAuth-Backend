@@ -19,10 +19,14 @@ import {
   createFcmStore,
   createLiveStreamPoller,
   createPusherRelay,
+  getKickPublicKey,
+  handleWebhookLiveEvent,
   initFirebaseMessaging,
   loadFcmConfig,
   resolveKickBroadcasterUserIds,
   resolveKickChannel,
+  scheduleKickSubscriptionSync,
+  verifyKickWebhookSignature,
 } from "./fcm.js";
 
 const KICK_TOKEN_URL = "https://id.kick.com/oauth/token";
@@ -115,6 +119,8 @@ export const KNOWN_ENDPOINTS = new Set([
   "POST /v1/fcm/unsubscribe",
   "GET /v1/fcm/stats",
   "GET /healthz",
+  "POST /api/events/webhook",
+  "POST /v1/events/webhook",
 ]);
 
 const BLOCKED_PROBE_REGEX = /(\.env|\.git|\.php|\.bak|\.asp|\.jsp|graphql|wp-admin|phpmyadmin|\.\.)/i;
@@ -192,6 +198,7 @@ export function createApp(config, deps = {}) {
     : (config.fcm?.pusherRelayEnabled && messaging
         ? createPusherRelay({ fcmStore, messaging, logger: config.logger })
         : null);
+  const seenStreams = deps.seenStreams || new Map();
   const liveStreamPoller = deps.liveStreamPoller !== undefined
     ? deps.liveStreamPoller
     : (messaging && config.kickClientId && config.kickClientSecret
@@ -201,14 +208,25 @@ export function createApp(config, deps = {}) {
             config,
             fetchFn: upstreamFetch,
             logger: config.logger,
+            seenStreams,
           })
         : null);
+  const kickWebhookHandler = deps.kickWebhookHandler || createKickWebhookHandler({
+    fcmStore,
+    messaging,
+    seenStreams,
+    logger: config.logger,
+    fetchFn: upstreamFetch,
+    kickApiBaseUrl: config.kickApiBaseUrl || "https://api.kick.com",
+  });
 
   app.locals.fcmStore = fcmStore;
   app.locals.pusherRelay = pusherRelay;
   app.locals.liveStreamPoller = liveStreamPoller;
+  app.locals.seenStreams = seenStreams;
+  app.locals.kickWebhookHandler = kickWebhookHandler;
 
-  if (pusherRelay && fcmStore) {
+  if (fcmStore) {
     backfillStoredSubscriptions(fcmStore, pusherRelay, {
       logger: config.logger,
       config,
@@ -238,6 +256,10 @@ export function createApp(config, deps = {}) {
   if (config.metrics?.adminToken) {
     app.get("/v1/fcm/stats", requireAdminToken(config.metrics), fcmStatsHandler(fcmStore));
   }
+
+  const webhookLimiter = createLimiter(600);
+  app.post("/api/events/webhook", webhookLimiter, kickWebhookHandler);
+  app.post("/v1/events/webhook", webhookLimiter, kickWebhookHandler);
 
   app.get("/healthz", (_req, res) => {
     res.status(200).json({ ok: true });
@@ -771,6 +793,17 @@ function fcmSubscribeHandler(fcmStore, pusherRelay, { upstreamFetch, config } = 
             logger?.info({ token: token.slice(-8), resolvedCount: resolvedIds.length, added }, "fcm_slugs_resolved_and_synced");
           }
         }
+
+        if (config?.kickClientId && config?.kickClientSecret) {
+          scheduleKickSubscriptionSync({
+            fcmStore,
+            fetchFn,
+            clientId: config.kickClientId,
+            clientSecret: config.kickClientSecret,
+            kickApiBaseUrl: config.kickApiBaseUrl || "https://api.kick.com",
+            logger,
+          }).catch(() => {});
+        }
       } catch (err) {
         logger?.warn({ err: err.message }, "fcm_background_resolution_failed");
       } finally {
@@ -799,6 +832,82 @@ function fcmUnsubscribeHandler(fcmStore, pusherRelay) {
 function fcmStatsHandler(fcmStore) {
   return async (_req, res) => {
     return res.status(200).json({ ok: true, stats: fcmStore.stats() });
+  };
+}
+
+export function createKickWebhookHandler({
+  fcmStore,
+  messaging,
+  seenStreams,
+  logger,
+  fetchFn = globalThis.fetch,
+  kickApiBaseUrl = "https://api.kick.com",
+  seenWebhookMessages = new Map(),
+} = {}) {
+  return async (req, res) => {
+    const messageId = req.headers["kick-event-message-id"];
+    const timestamp = req.headers["kick-event-message-timestamp"];
+    const signature = req.headers["kick-event-signature"];
+    const eventType = req.headers["kick-event-type"];
+
+    if (!messageId || !timestamp || !signature) {
+      return res.status(400).json({
+        code: "invalid_request",
+        message: "Missing Kick webhook signature headers",
+      });
+    }
+
+    const now = Date.now();
+    const cachedExpiry = seenWebhookMessages.get(messageId);
+    if (cachedExpiry && cachedExpiry > now) {
+      return res.status(200).json({ ok: true, duplicate: true });
+    }
+
+    const publicKey = await getKickPublicKey({ fetchFn, kickApiBaseUrl, logger });
+    if (!publicKey) {
+      logger?.error("kick_webhook_public_key_unavailable");
+      return res.status(502).json({
+        code: "upstream_unavailable",
+        message: "Unable to retrieve Kick public key",
+      });
+    }
+
+    const isValid = verifyKickWebhookSignature({
+      publicKey,
+      messageId,
+      timestamp,
+      signature,
+      rawBody: req.rawBody,
+      now,
+    });
+
+    if (!isValid) {
+      logger?.warn({ messageId }, "kick_webhook_signature_verification_failed");
+      return res.status(401).json({
+        code: "invalid_signature",
+        message: "Webhook signature verification failed",
+      });
+    }
+
+    seenWebhookMessages.set(messageId, now + 10 * 60 * 1000);
+    while (seenWebhookMessages.size > 10000) {
+      seenWebhookMessages.delete(seenWebhookMessages.keys().next().value);
+    }
+
+    try {
+      await handleWebhookLiveEvent({
+        eventType,
+        payload: req.body,
+        fcmStore,
+        messaging,
+        seenStreams,
+        logger,
+      });
+    } catch (err) {
+      logger?.error({ err: err.message, messageId }, "kick_webhook_processing_error");
+    }
+
+    return res.status(200).json({ ok: true });
   };
 }
 
@@ -850,6 +959,17 @@ export async function backfillStoredSubscriptions(fcmStore, pusherRelay, { logge
     if (aliasesAdded > 0) {
       pusherRelay?.syncSubscriptions();
       logger?.info({ aliasesAdded }, "fcm_backfill_aliases_added_and_synced");
+    }
+
+    if (config?.kickClientId && config?.kickClientSecret) {
+      scheduleKickSubscriptionSync({
+        fcmStore,
+        fetchFn,
+        clientId: config.kickClientId,
+        clientSecret: config.kickClientSecret,
+        kickApiBaseUrl: config.kickApiBaseUrl || "https://api.kick.com",
+        logger,
+      }).catch(() => {});
     }
   } catch (err) {
     logger?.warn({ err: err.message }, "fcm_backfill_failed");

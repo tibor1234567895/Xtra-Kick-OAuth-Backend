@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import http from "node:http";
-import { createHash } from "node:crypto";
+import { createHash, createSign, generateKeyPairSync } from "node:crypto";
 import { test } from "node:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -8,7 +8,18 @@ import { tmpdir } from "node:os";
 import pino from "pino";
 import { backfillStoredSubscriptions, computeHmacSignature, createApp, createCountryLookup, loadConfig, redactPaths } from "./server.js";
 import { createMetricsStore } from "./metrics.js";
-import { clearChannelResolutionCache, createFcmStore, createLiveStreamPoller, createPusherRelay, sendLivePushNotification } from "./fcm.js";
+import {
+  clearChannelResolutionCache,
+  clearKickPublicKeyCache,
+  createFcmStore,
+  createLiveStreamPoller,
+  createPusherRelay,
+  getKickPublicKey,
+  handleWebhookLiveEvent,
+  sendLivePushNotification,
+  syncKickEventSubscriptions,
+  verifyKickWebhookSignature,
+} from "./fcm.js";
 
 const baseEnv = {
   KICK_CLIENT_ID: "client-id",
@@ -1425,6 +1436,476 @@ test("createLiveStreamPoller detects stream start, sends notification, and dedup
     poller.close();
   }
 });
+
+test("getKickPublicKey fetches and caches public key", async () => {
+  clearKickPublicKeyCache();
+  let fetchCount = 0;
+  const mockFetch = async (url) => {
+    fetchCount++;
+    assert.ok(url.includes("/public/v1/public-key"));
+    return {
+      ok: true,
+      json: async () => ({
+        data: {
+          public_key: "-----BEGIN PUBLIC KEY-----\nMOCK_KEY\n-----END PUBLIC KEY-----",
+        },
+        message: "OK",
+      }),
+    };
+  };
+
+  const key1 = await getKickPublicKey({ fetchFn: mockFetch });
+  assert.equal(key1, "-----BEGIN PUBLIC KEY-----\nMOCK_KEY\n-----END PUBLIC KEY-----");
+  assert.equal(fetchCount, 1);
+
+  // Cached call
+  const key2 = await getKickPublicKey({ fetchFn: mockFetch });
+  assert.equal(key2, key1);
+  assert.equal(fetchCount, 1);
+
+  clearKickPublicKeyCache();
+});
+
+test("verifyKickWebhookSignature verifies RSA-SHA256 signature and rejects invalid/stale", () => {
+  const { publicKey, privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const pubPem = publicKey.export({ type: "spki", format: "pem" });
+
+  const messageId = "msg_test_123";
+  const now = Date.now();
+  const timestamp = new Date(now).toISOString();
+  const rawBody = JSON.stringify({ hello: "world" });
+
+  const signer = createSign("RSA-SHA256");
+  signer.update(`${messageId}.${timestamp}.${rawBody}`);
+  const validSignature = signer.sign(privateKey, "base64");
+
+  // 1. Valid signature
+  assert.equal(
+    verifyKickWebhookSignature({
+      publicKey: pubPem,
+      messageId,
+      timestamp,
+      signature: validSignature,
+      rawBody,
+      now,
+    }),
+    true
+  );
+
+  // 2. Tampered body
+  assert.equal(
+    verifyKickWebhookSignature({
+      publicKey: pubPem,
+      messageId,
+      timestamp,
+      signature: validSignature,
+      rawBody: JSON.stringify({ hello: "tampered" }),
+      now,
+    }),
+    false
+  );
+
+  // 3. Invalid signature
+  assert.equal(
+    verifyKickWebhookSignature({
+      publicKey: pubPem,
+      messageId,
+      timestamp,
+      signature: "aW52YWxpZA==",
+      rawBody,
+      now,
+    }),
+    false
+  );
+
+  // 4. Stale timestamp (10 minutes ago, default tolerance 5 minutes)
+  assert.equal(
+    verifyKickWebhookSignature({
+      publicKey: pubPem,
+      messageId,
+      timestamp: new Date(now - 10 * 60 * 1000).toISOString(),
+      signature: validSignature,
+      rawBody,
+      now,
+    }),
+    false
+  );
+
+  // 5. Missing headers/body
+  assert.equal(
+    verifyKickWebhookSignature({
+      publicKey: pubPem,
+      messageId: "",
+      timestamp,
+      signature: validSignature,
+      rawBody,
+    }),
+    false
+  );
+});
+
+test("handleWebhookLiveEvent dispatches notification and updates seenStreams", async () => {
+  const fcmStore = createFcmStore();
+  const token = "fcm-token-user-webhook-1234567890";
+  fcmStore.subscribe({
+    token,
+    channelIds: ["131146", "dougthegiant"],
+  });
+
+  let sentPayload = null;
+  const mockMessaging = {
+    sendEachForMulticast: async (payload) => {
+      sentPayload = payload;
+      return { successCount: payload.tokens.length, failureCount: 0, responses: payload.tokens.map(() => ({ success: true })) };
+    },
+  };
+
+  const seenStreams = new Map();
+
+  // 1. Stream goes live
+  const livePayload = {
+    broadcaster: {
+      user_id: 131146,
+      username: "dougthegiant",
+      channel_slug: "dougthegiant",
+      profile_picture: "https://example.com/avatar.jpg",
+    },
+    is_live: true,
+    title: "Awesome Live Stream",
+    started_at: "2026-10-24T18:00:00Z",
+  };
+
+  const result1 = await handleWebhookLiveEvent({
+    eventType: "livestream.status.updated",
+    payload: livePayload,
+    fcmStore,
+    messaging: mockMessaging,
+    seenStreams,
+  });
+
+  assert.equal(result1.ok, true);
+  assert.equal(result1.is_live, true);
+  assert.ok(sentPayload !== null);
+  assert.deepEqual(sentPayload.tokens, [token]);
+  assert.equal(sentPayload.data.channel_slug, "dougthegiant");
+  assert.equal(sentPayload.data.title, "Awesome Live Stream");
+  assert.equal(seenStreams.get("131146"), "2026-10-24T18:00:00Z");
+
+  // 2. Duplicate live webhook (same started_at)
+  sentPayload = null;
+  const result2 = await handleWebhookLiveEvent({
+    eventType: "livestream.status.updated",
+    payload: livePayload,
+    fcmStore,
+    messaging: mockMessaging,
+    seenStreams,
+  });
+
+  assert.equal(result2.ok, true);
+  assert.equal(result2.duplicate, true);
+  assert.equal(sentPayload, null, "Should not dispatch duplicate notification");
+
+  // 3. Stream ends (is_live: false)
+  const offlinePayload = {
+    broadcaster: {
+      user_id: 131146,
+      channel_slug: "dougthegiant",
+    },
+    is_live: false,
+  };
+
+  const result3 = await handleWebhookLiveEvent({
+    eventType: "livestream.status.updated",
+    payload: offlinePayload,
+    fcmStore,
+    messaging: mockMessaging,
+    seenStreams,
+  });
+
+  assert.equal(result3.ok, true);
+  assert.equal(result3.is_live, false);
+  assert.equal(seenStreams.has("131146"), false, "Stream pruned from seenStreams on offline");
+});
+
+test("POST /api/events/webhook and /v1/events/webhook validate signatures and handle live events", async () => {
+  const { publicKey, privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const pubPem = publicKey.export({ type: "spki", format: "pem" });
+
+  clearKickPublicKeyCache();
+
+  const fcmStore = createFcmStore();
+  const token = "fcm-token-webhook-server-test-123456";
+  fcmStore.subscribe({
+    token,
+    channelIds: ["999888", "gamerstreamer"],
+  });
+
+  let sentPayload = null;
+  const mockMessaging = {
+    sendEachForMulticast: async (payload) => {
+      sentPayload = payload;
+      return { successCount: payload.tokens.length, failureCount: 0, responses: payload.tokens.map(() => ({ success: true })) };
+    },
+  };
+
+  const mockFetch = async (url) => {
+    if (url.includes("/public/v1/public-key")) {
+      return {
+        ok: true,
+        json: async () => ({
+          data: { public_key: pubPem },
+          message: "OK",
+        }),
+      };
+    }
+    return { ok: false, status: 404 };
+  };
+
+  const server = http.createServer(createApp(config(), {
+    fetch: mockFetch,
+    fcmStore,
+    messaging: mockMessaging,
+  }));
+  await new Promise((resolve) => server.listen(0, resolve));
+  const port = server.address().port;
+
+  try {
+    // 1. Missing headers -> 400
+    const res1 = await fetch(`http://127.0.0.1:${port}/api/events/webhook`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    assert.equal(res1.status, 400);
+
+    // 2. Invalid signature -> 401
+    const res2 = await fetch(`http://127.0.0.1:${port}/api/events/webhook`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Kick-Event-Message-Id": "msg_invalid_sig",
+        "Kick-Event-Message-Timestamp": new Date().toISOString(),
+        "Kick-Event-Signature": "aW52YWxpZA==",
+        "Kick-Event-Type": "livestream.status.updated",
+      },
+      body: JSON.stringify({}),
+    });
+    assert.equal(res2.status, 401);
+
+    // 3. Valid signature -> 200 and dispatches push
+    const messageId = "msg_valid_1";
+    const timestamp = new Date().toISOString();
+    const eventBody = JSON.stringify({
+      broadcaster: {
+        user_id: 999888,
+        username: "gamerstreamer",
+        channel_slug: "gamerstreamer",
+        profile_picture: "https://example.com/pfp.jpg",
+      },
+      is_live: true,
+      title: "Epic Gaming Live",
+      started_at: "2026-10-24T18:30:00Z",
+    });
+
+    const signer = createSign("RSA-SHA256");
+    signer.update(`${messageId}.${timestamp}.${eventBody}`);
+    const signature = signer.sign(privateKey, "base64");
+
+    const res3 = await fetch(`http://127.0.0.1:${port}/api/events/webhook`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Kick-Event-Message-Id": messageId,
+        "Kick-Event-Message-Timestamp": timestamp,
+        "Kick-Event-Signature": signature,
+        "Kick-Event-Type": "livestream.status.updated",
+      },
+      body: eventBody,
+    });
+    assert.equal(res3.status, 200);
+    const body3 = await res3.json();
+    assert.equal(body3.ok, true);
+    assert.ok(sentPayload !== null);
+    assert.deepEqual(sentPayload.tokens, [token]);
+    assert.equal(sentPayload.data.channel_slug, "gamerstreamer");
+
+    // 4. Duplicate messageId replay -> 200 duplicate
+    const res4 = await fetch(`http://127.0.0.1:${port}/api/events/webhook`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Kick-Event-Message-Id": messageId,
+        "Kick-Event-Message-Timestamp": timestamp,
+        "Kick-Event-Signature": signature,
+        "Kick-Event-Type": "livestream.status.updated",
+      },
+      body: eventBody,
+    });
+    assert.equal(res4.status, 200);
+    const body4 = await res4.json();
+    assert.equal(body4.duplicate, true);
+
+    // 5. Also works on /v1/events/webhook
+    const msgV1Id = "msg_v1_test";
+    const tsV1 = new Date().toISOString();
+    const signerV1 = createSign("RSA-SHA256");
+    signerV1.update(`${msgV1Id}.${tsV1}.${eventBody}`);
+    const sigV1 = signerV1.sign(privateKey, "base64");
+
+    const res5 = await fetch(`http://127.0.0.1:${port}/v1/events/webhook`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Kick-Event-Message-Id": msgV1Id,
+        "Kick-Event-Message-Timestamp": tsV1,
+        "Kick-Event-Signature": sigV1,
+        "Kick-Event-Type": "livestream.status.updated",
+      },
+      body: eventBody,
+    });
+    assert.equal(res5.status, 200);
+  } finally {
+    server.close();
+    clearKickPublicKeyCache();
+  }
+});
+
+test("Webhook and Live Poller share seenStreams and prevent duplicate alerts", async () => {
+  const fcmStore = createFcmStore();
+  const token = "fcm-token-shared-dedup-12345";
+  fcmStore.subscribe({
+    token,
+    channelIds: ["555444", "sharedstreamer"],
+  });
+
+  let notificationsCount = 0;
+  const mockMessaging = {
+    sendEachForMulticast: async (payload) => {
+      notificationsCount++;
+      return { successCount: payload.tokens.length, failureCount: 0, responses: payload.tokens.map(() => ({ success: true })) };
+    },
+  };
+
+  const seenStreams = new Map();
+
+  const mockFetch = async (url) => {
+    if (url.includes("/oauth/token")) {
+      return {
+        ok: true,
+        json: async () => ({ access_token: "mock-app-token", expires_in: 3600 }),
+      };
+    }
+    if (url.includes("/public/v1/channels?")) {
+      return {
+        ok: true,
+        json: async () => ({
+          data: [
+            {
+              broadcaster_user_id: 555444,
+              channel_id: 555444,
+              slug: "sharedstreamer",
+              stream: {
+                is_live: true,
+                start_time: "2026-10-24T19:00:00Z",
+              },
+            },
+          ],
+        }),
+      };
+    }
+    return { ok: false, status: 404 };
+  };
+
+  const poller = createLiveStreamPoller({
+    fcmStore,
+    messaging: mockMessaging,
+    config: { kickClientId: "cid", kickClientSecret: "csec" },
+    fetchFn: mockFetch,
+    seenStreams,
+    pollIntervalMs: 60_000,
+  });
+
+  try {
+    // 1. Webhook arrives FIRST when stream goes live
+    await handleWebhookLiveEvent({
+      eventType: "livestream.status.updated",
+      payload: {
+        broadcaster: { user_id: 555444, channel_slug: "sharedstreamer" },
+        is_live: true,
+        started_at: "2026-10-24T19:00:00Z",
+      },
+      fcmStore,
+      messaging: mockMessaging,
+      seenStreams,
+    });
+
+    assert.equal(notificationsCount, 1, "Webhook sent 1 notification");
+    assert.equal(seenStreams.get("555444"), "2026-10-24T19:00:00Z");
+
+    // 2. Poller runs after warmup: sees stream with same start_time, SKIPS notification
+    await poller.checkLiveStreams(); // First poll warmup
+    await poller.checkLiveStreams(); // Second poll regular check
+    assert.equal(notificationsCount, 1, "Poller did NOT duplicate webhook notification!");
+  } finally {
+    poller.close();
+  }
+});
+
+test("syncKickEventSubscriptions creates missing webhook subscriptions on Kick", async () => {
+  const fcmStore = createFcmStore();
+  fcmStore.subscribe({
+    token: "tok1",
+    channelIds: ["111222", "333444"],
+  });
+
+  const createdSubs = [];
+  const existingSubs = [
+    { broadcaster_user_id: 111222, event: "livestream.status.updated" },
+  ];
+
+  const mockFetch = async (url, options = {}) => {
+    if (url.includes("/oauth/token")) {
+      return {
+        ok: true,
+        json: async () => ({ access_token: "mock-app-token", expires_in: 3600 }),
+      };
+    }
+    if (url.endsWith("/public/v1/events/subscriptions") && (!options.method || options.method === "GET")) {
+      return {
+        ok: true,
+        json: async () => ({ data: existingSubs }),
+      };
+    }
+    if (url.endsWith("/public/v1/events/subscriptions") && options.method === "POST") {
+      const parsedBody = JSON.parse(options.body);
+      createdSubs.push(parsedBody);
+      return {
+        ok: true,
+        json: async () => ({
+          data: {
+            id: `sub_${parsedBody.broadcaster_user_id}`,
+            ...parsedBody,
+          },
+        }),
+      };
+    }
+    return { ok: false, status: 404 };
+  };
+
+  const result = await syncKickEventSubscriptions({
+    fcmStore,
+    fetchFn: mockFetch,
+    clientId: "cid",
+    clientSecret: "csec",
+  });
+
+  assert.equal(result.synced, 2);
+  assert.equal(result.added, 1);
+  assert.equal(createdSubs.length, 1);
+  assert.equal(createdSubs[0].broadcaster_user_id, 333444);
+  assert.equal(createdSubs[0].event, "livestream.status.updated");
+});
+
 
 
 

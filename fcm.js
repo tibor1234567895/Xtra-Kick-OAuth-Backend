@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import WebSocket from "ws";
@@ -32,6 +33,7 @@ export function clearChannelResolutionCache() {
   channelResolutionCache.clear();
   cachedAppToken = null;
   tokenFetchPromise = null;
+  clearKickPublicKeyCache();
 }
 
 let cachedAppToken = null; // { token, expiresAt }
@@ -194,7 +196,7 @@ export async function resolveKickChannel(slugOrId, { fetchFn = globalThis.fetch,
 export function loadFcmConfig(env = process.env) {
   const serviceAccountPath = env.FCM_SERVICE_ACCOUNT_KEY_PATH || "./firebase-service-account.json";
   const dataFile = env.FCM_DATA_FILE || "./data/fcm_subscriptions.json";
-  const pusherRelayEnabled = env.FCM_PUSHER_RELAY_ENABLED !== "false";
+  const pusherRelayEnabled = env.FCM_PUSHER_RELAY_ENABLED === "true";
   return {
     serviceAccountPath,
     dataFile,
@@ -591,8 +593,8 @@ export function createPusherRelay({ fcmStore, messaging, logger }) {
         }
       });
 
-      ws.on("close", () => {
-        logger?.warn("pusher_relay_disconnected");
+      ws.on("close", (code, reason) => {
+        logger?.warn({ code, reason: reason?.toString() }, "pusher_relay_disconnected");
         stopHeartbeat();
         ws = null;
         scheduleReconnect();
@@ -720,13 +722,12 @@ export function createLiveStreamPoller({
   fetchFn = globalThis.fetch,
   pollIntervalMs = 60_000,
   logger,
+  seenStreams = new Map(),
 } = {}) {
   let isClosed = false;
   let timer = null;
   let isPolling = false;
   let isFirstPoll = true;
-  // Map of broadcaster_user_id (or slug/channel_id) -> streamStartTime
-  const seenStreams = new Map();
 
   async function checkLiveStreams() {
     if (isClosed || isPolling) return;
@@ -839,10 +840,13 @@ export function createLiveStreamPoller({
 
         if (isLive && startTime) {
           liveCount++;
-          const lastStartTime = seenStreams.get(channelKey);
+          const lastStartTime = seenStreams.get(channelKey) || (slug && seenStreams.get(slug)) || (uId && seenStreams.get(uId));
           if (lastStartTime !== startTime) {
             // Transition: stream just started (or first time seeing it)
             seenStreams.set(channelKey, startTime);
+            if (slug) seenStreams.set(slug, startTime);
+            if (uId) seenStreams.set(uId, startTime);
+            if (ch.channel_id) seenStreams.set(String(ch.channel_id), startTime);
 
             // Cache channel resolution details for aliases
             const resolved = {
@@ -890,14 +894,18 @@ export function createLiveStreamPoller({
               });
               if (delivery.successCount === 0 && delivery.failureCount > 0) {
                 seenStreams.delete(channelKey);
+                if (slug) seenStreams.delete(slug);
+                if (uId) seenStreams.delete(uId);
+                if (ch.channel_id) seenStreams.delete(String(ch.channel_id));
               }
             }
           }
         } else {
           // Stream is offline, remove from seenStreams so next stream triggers
-          if (seenStreams.has(channelKey)) {
-            seenStreams.delete(channelKey);
-          }
+          seenStreams.delete(channelKey);
+          if (slug) seenStreams.delete(slug);
+          if (uId) seenStreams.delete(uId);
+          if (ch.channel_id) seenStreams.delete(String(ch.channel_id));
         }
       }
 
@@ -939,7 +947,7 @@ export function createLiveStreamPoller({
   return {
     checkLiveStreams,
     getSeenStreams() {
-      return new Map(seenStreams);
+      return seenStreams;
     },
     close() {
       isClosed = true;
@@ -949,4 +957,334 @@ export function createLiveStreamPoller({
       }
     },
   };
+}
+
+let cachedKickPublicKey = null;
+let kickPublicKeyPromise = null;
+
+export function clearKickPublicKeyCache() {
+  cachedKickPublicKey = null;
+  kickPublicKeyPromise = null;
+}
+
+export async function getKickPublicKey({
+  fetchFn = globalThis.fetch,
+  kickApiBaseUrl = "https://api.kick.com",
+  logger,
+  ttlMs = 24 * 60 * 60 * 1000,
+} = {}) {
+  if (cachedKickPublicKey && cachedKickPublicKey.expiresAt > Date.now()) {
+    return cachedKickPublicKey.key;
+  }
+  if (kickPublicKeyPromise) {
+    return kickPublicKeyPromise;
+  }
+  kickPublicKeyPromise = (async () => {
+    try {
+      const res = await fetchJsonWithTimeout(fetchFn, `${kickApiBaseUrl}/public/v1/public-key`, {
+        headers: { Accept: "application/json" },
+      }, 5000);
+      if (!res.ok) {
+        logger?.warn({ status: res.status }, "kick_public_key_fetch_failed");
+        return null;
+      }
+      const data = res.body?.data;
+      const key = data?.public_key;
+      if (typeof key === "string" && key.includes("PUBLIC KEY")) {
+        cachedKickPublicKey = {
+          key,
+          expiresAt: Date.now() + ttlMs,
+        };
+        logger?.info("kick_public_key_cached");
+        return key;
+      }
+      logger?.warn({ body: res.body }, "kick_public_key_invalid_format");
+      return null;
+    } catch (err) {
+      logger?.warn({ err: err.message }, "kick_public_key_request_error");
+      return null;
+    } finally {
+      kickPublicKeyPromise = null;
+    }
+  })();
+  return kickPublicKeyPromise;
+}
+
+export function verifyKickWebhookSignature({
+  publicKey,
+  messageId,
+  timestamp,
+  signature,
+  rawBody,
+  maxAgeMs = 5 * 60 * 1000,
+  now = Date.now(),
+} = {}) {
+  if (!publicKey || !messageId || !timestamp || !signature || rawBody === undefined || rawBody === null) {
+    return false;
+  }
+
+  let timestampMs;
+  if (typeof timestamp === "number") {
+    timestampMs = timestamp < 1e11 ? timestamp * 1000 : timestamp;
+  } else if (typeof timestamp === "string") {
+    const numeric = Number(timestamp);
+    if (!Number.isNaN(numeric) && numeric > 0) {
+      timestampMs = numeric < 1e11 ? numeric * 1000 : numeric;
+    } else {
+      timestampMs = Date.parse(timestamp);
+    }
+  }
+
+  if (!Number.isFinite(timestampMs)) {
+    return false;
+  }
+
+  if (Math.abs(now - timestampMs) > maxAgeMs) {
+    return false;
+  }
+
+  try {
+    const bodyBuf = Buffer.isBuffer(rawBody) ? rawBody : Buffer.from(String(rawBody), "utf8");
+    const prefixBuf = Buffer.from(`${messageId}.${timestamp}.`, "utf8");
+    const payloadBuf = Buffer.concat([prefixBuf, bodyBuf]);
+
+    const verifier = crypto.createVerify("RSA-SHA256");
+    verifier.update(payloadBuf);
+    return verifier.verify(publicKey, signature, "base64");
+  } catch {
+    return false;
+  }
+}
+
+export async function handleWebhookLiveEvent({
+  eventType,
+  payload,
+  fcmStore,
+  messaging,
+  seenStreams,
+  logger,
+} = {}) {
+  if (eventType !== "livestream.status.updated") {
+    logger?.info({ eventType }, "kick_webhook_ignored_event_type");
+    return { ignored: true, reason: "unsupported_event_type" };
+  }
+
+  const data = (payload && typeof payload === "object" && payload.data) ? payload.data : (payload || {});
+  const broadcaster = data.broadcaster || {};
+  const userId = broadcaster.user_id ? String(broadcaster.user_id).trim() : (data.user_id ? String(data.user_id).trim() : null);
+  const slug = String(broadcaster.channel_slug || broadcaster.username || data.channel_slug || data.slug || "")
+    .trim()
+    .replace(/^\/+/, "")
+    .toLowerCase();
+  const isLive = Boolean(data.is_live);
+  const startTime = String(data.started_at || data.start_time || new Date().toISOString());
+  const title = String(data.title || (slug ? `${slug} is live!` : "Stream is live!"));
+  const profilePicture = String(broadcaster.profile_picture || data.profile_picture || "");
+
+  const cached = (slug && channelResolutionCache.get(slug)) || (userId && channelResolutionCache.get(userId));
+  const channelId = cached?.channelId || null;
+
+  if (!isLive) {
+    if (userId) seenStreams?.delete(userId);
+    if (slug) seenStreams?.delete(slug);
+    if (channelId) seenStreams?.delete(channelId);
+    logger?.info({ userId, slug, channelId }, "kick_webhook_stream_ended");
+    return { ok: true, is_live: false };
+  }
+
+  // Stream is live: check deduplication
+  const streamKey = userId || slug;
+  if (
+    (streamKey && seenStreams?.get(streamKey) === startTime) ||
+    (slug && seenStreams?.get(slug) === startTime) ||
+    (userId && seenStreams?.get(userId) === startTime)
+  ) {
+    logger?.info({ streamKey, startTime }, "kick_webhook_stream_already_seen");
+    return { ok: true, duplicate: true };
+  }
+
+  // Mark as seen immediately across all identifiers
+  if (userId) seenStreams?.set(userId, startTime);
+  if (slug) seenStreams?.set(slug, startTime);
+  if (channelId) seenStreams?.set(channelId, startTime);
+
+  // Update resolution cache
+  const resolved = {
+    channelId,
+    userId,
+    slug,
+    expiresAt: Date.now() + RESOLUTION_TTL_MS,
+  };
+  if (slug) cacheChannel(slug, resolved);
+  if (userId) cacheChannel(userId, resolved);
+
+  // Find subscribers for candidate keys
+  const candidateKeys = [userId, slug, channelId].filter(Boolean);
+  const tokenSet = new Set();
+  for (const key of candidateKeys) {
+    for (const tok of fcmStore?.getTokensForChannel(key) || []) {
+      tokenSet.add(tok);
+    }
+  }
+  const tokens = Array.from(tokenSet);
+
+  if (tokens.length === 0) {
+    logger?.info({ userId, slug, candidateKeys }, "kick_webhook_no_subscribers_found");
+    return { ok: true, is_live: true, subscriberCount: 0 };
+  }
+
+  logger?.info(
+    { userId, slug, tokensCount: tokens.length, title, startTime },
+    "kick_webhook_sending_live_push"
+  );
+
+  const delivery = await sendLivePushNotification({
+    messaging,
+    tokens,
+    channelId: channelId || userId,
+    userId,
+    channelSlug: slug || userId,
+    title,
+    description: "",
+    profilePicture,
+    startTime,
+    logger,
+    fcmStore,
+  });
+
+  return {
+    ok: true,
+    is_live: true,
+    subscriberCount: tokens.length,
+    delivery,
+  };
+}
+
+export async function syncKickEventSubscriptions({
+  fcmStore,
+  fetchFn = globalThis.fetch,
+  clientId = process.env.KICK_CLIENT_ID,
+  clientSecret = process.env.KICK_CLIENT_SECRET,
+  kickApiBaseUrl = "https://api.kick.com",
+  logger,
+} = {}) {
+  if (!fcmStore || !clientId || !clientSecret) return { synced: 0, added: 0 };
+
+  const activeChannels = fcmStore.getActiveChannels();
+  if (activeChannels.length === 0) return { synced: 0, added: 0 };
+
+  const userIds = new Set();
+  const unresolvedSlugs = [];
+
+  for (const ch of activeChannels) {
+    const cached = channelResolutionCache.get(ch);
+    if (cached && cached.userId) {
+      userIds.add(cached.userId);
+    } else if (/^\d+$/.test(ch)) {
+      userIds.add(ch);
+    } else {
+      unresolvedSlugs.push(ch);
+    }
+  }
+
+  for (const slug of unresolvedSlugs) {
+    const res = await resolveKickChannel(slug, { fetchFn, logger });
+    if (res && res.userId) {
+      userIds.add(res.userId);
+    }
+  }
+
+  const targetUserIds = Array.from(userIds).filter((id) => /^\d+$/.test(id));
+  if (targetUserIds.length === 0) return { synced: 0, added: 0 };
+
+  const appToken = await getKickAppAccessToken({
+    fetchFn,
+    clientId,
+    clientSecret,
+    logger,
+  });
+  if (!appToken) {
+    logger?.warn("kick_webhook_sync_skipped_no_app_token");
+    return { synced: 0, added: 0 };
+  }
+
+  let existingSubscribedIds = new Set();
+  try {
+    const res = await fetchJsonWithTimeout(fetchFn, `${kickApiBaseUrl}/public/v1/events/subscriptions`, {
+      headers: {
+        Authorization: `Bearer ${appToken}`,
+        Accept: "application/json",
+      },
+    }, 10000);
+
+    if (res.ok) {
+      const data = Array.isArray(res.body?.data) ? res.body.data : [];
+      for (const sub of data) {
+        if (sub?.event === "livestream.status.updated" && sub?.broadcaster_user_id) {
+          existingSubscribedIds.add(String(sub.broadcaster_user_id));
+        }
+      }
+    } else {
+      logger?.warn({ status: res.status }, "kick_webhook_subscriptions_fetch_failed");
+    }
+  } catch (err) {
+    logger?.warn({ err: err.message }, "kick_webhook_subscriptions_fetch_error");
+  }
+
+  let added = 0;
+  for (const userId of targetUserIds) {
+    if (!existingSubscribedIds.has(userId)) {
+      try {
+        const subRes = await fetchJsonWithTimeout(fetchFn, `${kickApiBaseUrl}/public/v1/events/subscriptions`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${appToken}`,
+            "Content-Type": "application/json",
+            Accept: "application/json",
+          },
+          body: JSON.stringify({
+            broadcaster_user_id: Number(userId),
+            event: "livestream.status.updated",
+            method: "webhook",
+            version: 1,
+          }),
+        }, 10000);
+
+        if (subRes.ok) {
+          added++;
+          existingSubscribedIds.add(userId);
+          logger?.info({ userId }, "kick_webhook_subscription_created");
+        } else {
+          logger?.warn({ userId, status: subRes.status, body: subRes.body }, "kick_webhook_subscription_create_failed");
+        }
+      } catch (err) {
+        logger?.warn({ userId, err: err.message }, "kick_webhook_subscription_create_error");
+      }
+    }
+  }
+
+  logger?.info({ targetChannels: targetUserIds.length, existing: existingSubscribedIds.size, added }, "kick_webhook_sync_complete");
+  return { synced: targetUserIds.length, added };
+}
+
+let syncInProgress = null;
+let syncQueued = false;
+
+export async function scheduleKickSubscriptionSync(options) {
+  if (syncInProgress) {
+    syncQueued = true;
+    return syncInProgress;
+  }
+  syncInProgress = (async () => {
+    try {
+      await syncKickEventSubscriptions(options);
+    } finally {
+      syncInProgress = null;
+      if (syncQueued) {
+        syncQueued = false;
+        scheduleKickSubscriptionSync(options).catch(() => {});
+      }
+    }
+  })();
+  return syncInProgress;
 }
