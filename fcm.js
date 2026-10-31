@@ -22,7 +22,9 @@ async function fetchJsonWithTimeout(fetchFn, url, options, timeoutMs) {
   try {
     const response = await fetchFn(url, { ...options, signal: controller.signal });
     const body = response.ok ? await response.json() : null;
-    if (!response.ok) await response.body?.cancel();
+    if (!response.ok && typeof response.body?.cancel === "function") {
+      await response.body.cancel();
+    }
     return { ok: response.ok, status: response.status, body };
   } finally {
     clearTimeout(timer);
@@ -1167,6 +1169,8 @@ export async function syncKickEventSubscriptions({
   clientSecret = process.env.KICK_CLIENT_SECRET,
   kickApiBaseUrl = "https://api.kick.com",
   logger,
+  throttleMs = 50,
+  retryDelayMs = 1000,
 } = {}) {
   if (!fcmStore || !clientId || !clientSecret) return { synced: 0, added: 0 };
 
@@ -1234,8 +1238,11 @@ export async function syncKickEventSubscriptions({
   let added = 0;
   for (const userId of targetUserIds) {
     if (!existingSubscribedIds.has(userId)) {
+      if (throttleMs > 0 && added > 0) {
+        await new Promise((resolve) => setTimeout(resolve, throttleMs));
+      }
       try {
-        const subRes = await fetchJsonWithTimeout(fetchFn, `${kickApiBaseUrl}/public/v1/events/subscriptions`, {
+        const payload = {
           method: "POST",
           headers: {
             Authorization: `Bearer ${appToken}`,
@@ -1248,7 +1255,18 @@ export async function syncKickEventSubscriptions({
             method: "webhook",
             version: 1,
           }),
-        }, 10000);
+        };
+
+        let subRes = await fetchJsonWithTimeout(fetchFn, `${kickApiBaseUrl}/public/v1/events/subscriptions`, payload, 10000);
+
+        // If rate-limited by Kick API, back off and retry once
+        if (subRes.status === 429) {
+          logger?.warn({ userId }, "kick_webhook_subscription_rate_limited_backing_off");
+          if (retryDelayMs > 0) {
+            await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
+          }
+          subRes = await fetchJsonWithTimeout(fetchFn, `${kickApiBaseUrl}/public/v1/events/subscriptions`, payload, 10000);
+        }
 
         if (subRes.ok) {
           added++;

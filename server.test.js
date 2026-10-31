@@ -1906,6 +1906,62 @@ test("syncKickEventSubscriptions creates missing webhook subscriptions on Kick",
   assert.equal(createdSubs[0].event, "livestream.status.updated");
 });
 
+test("syncKickEventSubscriptions retries on 429 rate limit and succeeds", async () => {
+  clearChannelResolutionCache();
+  const fcmStore = createFcmStore();
+  fcmStore.subscribe({
+    token: "tok2",
+    channelIds: ["999888"],
+  });
+
+  let postAttempts = 0;
+  const mockFetch = async (url, options = {}) => {
+    if (url.includes("/oauth/token")) {
+      return {
+        ok: true,
+        json: async () => ({ access_token: "mock-app-token", expires_in: 3600 }),
+      };
+    }
+    if (url.endsWith("/public/v1/events/subscriptions") && (!options.method || options.method === "GET")) {
+      return {
+        ok: true,
+        json: async () => ({ data: [] }),
+      };
+    }
+    if (url.endsWith("/public/v1/events/subscriptions") && options.method === "POST") {
+      postAttempts++;
+      if (postAttempts === 1) {
+        return { ok: false, status: 429, body: { message: "Too Many Requests" } };
+      }
+      const parsedBody = JSON.parse(options.body);
+      return {
+        ok: true,
+        json: async () => ({
+          data: {
+            id: `sub_${parsedBody.broadcaster_user_id}`,
+            ...parsedBody,
+          },
+        }),
+      };
+    }
+    return { ok: false, status: 404 };
+  };
+
+  const result = await syncKickEventSubscriptions({
+    fcmStore,
+    fetchFn: mockFetch,
+    clientId: "cid",
+    clientSecret: "csec",
+    throttleMs: 0,
+    retryDelayMs: 5,
+  });
+
+  assert.equal(result.synced, 1);
+  assert.equal(result.added, 1);
+  assert.equal(postAttempts, 2);
+});
+
+
 
 
 
