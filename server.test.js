@@ -514,6 +514,8 @@ test("dashboard shell loads without admin token while stats stays protected", as
     const noToken = await httpRequest(baseUrl, "GET", "/v1/metrics/dashboard");
     assert.equal(noToken.status, 200);
     assert.match(noToken.headers["content-type"], /text\/html/);
+    assert.match(noToken.body.raw, /--accent-new/);
+    assert.match(noToken.body.raw, /\.new-seg/);
 
     const stats = await httpRequest(baseUrl, "GET", "/v1/metrics/stats");
     assert.equal(stats.status, 401);

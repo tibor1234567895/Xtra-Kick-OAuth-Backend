@@ -14,6 +14,7 @@
         --border: #e5e5e5;
         --accent: #15803d;
         --accent-soft: rgba(21, 128, 61, 0.18);
+        --accent-new: #0284c7;
         --good: #16a34a;
         --warn: #b45309;
         --bad: #dc2626;
@@ -28,6 +29,7 @@
           --border: #2a2a2e;
           --accent: #4ade80;
           --accent-soft: rgba(74, 222, 128, 0.2);
+          --accent-new: #38bdf8;
           --good: #4ade80;
           --warn: #fbbf24;
           --bad: #f87171;
@@ -94,15 +96,15 @@
       .bar-chart { display: flex; align-items: flex-end; gap: 2px; height: 140px; margin-top: 12px; }
       .bar {
         flex: 1 1 0; background: var(--accent); border-radius: 2px 2px 0 0;
-        min-height: 1px; display: flex; align-items: flex-end; min-width: 2px;
+        min-height: 1px; display: flex; flex-direction: column; justify-content: flex-start;
+        min-width: 2px; overflow: hidden;
       }
-      .bar.new-seg-wrap { background: var(--accent); }
-      .bar .new-seg { width: 100%; background: var(--accent-soft); border-top: 1px solid var(--accent); border-radius: 2px 2px 0 0; }
+      .bar .new-seg { width: 100%; background: var(--accent-new); flex-shrink: 0; pointer-events: none; }
       .bar:hover { filter: brightness(1.12); }
       .bar.peak { outline: 2px solid var(--warn); outline-offset: 1px; }
       .legend { display: flex; gap: 14px; color: var(--muted); font-size: 12px; margin-top: 8px; }
       .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; background: var(--accent); }
-      .legend i.new { background: var(--accent-soft); border: 1px solid var(--accent); }
+      .legend i.new { background: var(--accent-new); }
       .x-axis { display: flex; justify-content: space-between; color: var(--muted); font-size: 11px; margin-top: 6px; font-family: var(--mono); }
       .pill {
         display: inline-block; font-family: var(--mono); font-size: 11px;
@@ -357,7 +359,7 @@
       function stackBar(p, maxDau, peak) {
         const dau = p.dau || 0;
         const total = Math.max(2, Math.round(dau / maxDau * 100));
-        const newPct = dau > 0 ? Math.round((p.new || 0) / dau * 100) : 0;
+        const newPct = dau > 0 ? Math.min(100, Math.max(0, Math.round((p.new || 0) / dau * 100))) : 0;
         const isPeak = peak && p.date === peak.date && dau > 0;
         return '<div class="bar' + (isPeak ? " peak" : "") + '" title="' + escapeHtml(p.date) + ": " + dau + " active (" + (p.returning || 0) + " returning, " + (p.new || 0) + ' new)" style="height:' + total + '%">' +
           (newPct > 0 ? '<div class="new-seg" style="height:' + newPct + '%"></div>' : "") +
