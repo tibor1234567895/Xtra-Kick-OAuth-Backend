@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import WebSocket from "ws";
 import admin from "firebase-admin";
@@ -529,7 +529,7 @@ export function createPusherRelay({ fcmStore, messaging, logger }) {
             if (typeof pongTimeout.unref === "function") pongTimeout.unref();
           }
         } catch (e) {
-          // send failure will trigger close
+          logger?.debug({ err: e?.message }, "pusher_relay_ping_send_failed");
         }
       }
     }, intervalMs);
@@ -578,7 +578,9 @@ export function createPusherRelay({ fcmStore, messaging, logger }) {
             try {
               const estData = typeof msg.data === "string" ? JSON.parse(msg.data) : msg.data;
               if (estData?.activity_timeout) timeout = Number(estData.activity_timeout);
-            } catch {}
+            } catch (err) {
+              logger?.debug({ err: err?.message }, "pusher_relay_connection_established_parse_failed");
+            }
             startHeartbeat(timeout);
             syncSubscriptions();
             return;
@@ -591,7 +593,7 @@ export function createPusherRelay({ fcmStore, messaging, logger }) {
             handleLiveEvent(msg);
           }
         } catch (e) {
-          // ignore parsing error
+          logger?.debug({ err: e?.message }, "pusher_relay_message_parse_failed");
         }
       });
 
@@ -823,7 +825,7 @@ export function createLiveStreamPoller({
             }
           }
         } catch (err) {
-          // ignore single slug query error
+          logger?.debug({ err: err?.message, slug }, "pusher_poll_slug_query_failed");
         }
       }
 

@@ -105,6 +105,29 @@ function signedHeaders({ secret, method, path, bodyObject, timestamp, nonce }) {
   };
 }
 
+test("malformed JSON returns a controlled 400 without reaching upstream", async () => {
+  const app = appWithFetch(() => { throw new Error("Upstream must not be called"); });
+  await withServer(app, async (baseUrl) => {
+    const response = await fetch(`${baseUrl}/v1/kick/oauth/exchange`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: "{",
+    });
+    assert.equal(response.status, 400);
+    assert.match(response.headers.get("content-type"), /application\/json/);
+    assert.deepEqual(await response.json(), { code: "invalid_json", message: "Invalid JSON" });
+  });
+});
+
+test("oversized JSON returns a controlled 413 without reaching upstream", async () => {
+  const app = appWithFetch(() => { throw new Error("Upstream must not be called"); });
+  await withServer(app, async (baseUrl) => {
+    const response = await fetch(`${baseUrl}/v1/kick/oauth/exchange`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ value: "x".repeat(40000) }),
+    });
+    assert.equal(response.status, 413);
+    assert.deepEqual(await response.json(), { code: "payload_too_large", message: "Request body too large" });
+  });
+});
+
 async function signedRequest(baseUrl, method, path, bodyObject, overrides = {}) {
   const response = await fetch(`${baseUrl}${path}`, {
     method,

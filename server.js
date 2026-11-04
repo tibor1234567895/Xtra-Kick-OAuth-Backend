@@ -169,6 +169,7 @@ export function createApp(config, deps = {}) {
     }
     return next();
   });
+  app.use(pinoHttp({ logger: config.logger }));
   app.use(
     express.json({
       limit: "32kb",
@@ -177,7 +178,6 @@ export function createApp(config, deps = {}) {
       },
     })
   );
-  app.use(pinoHttp({ logger: config.logger }));
 
   const requireHmac = config.appHmacSecret ? createHmacMiddleware(config, metrics) : null;
   const registerPost = (path, limiter, handler) =>
@@ -270,7 +270,13 @@ export function createApp(config, deps = {}) {
   });
 
   app.use((err, req, res, _next) => {
-    req.log.error({ err: { message: err.message, code: err.code, status: err.status } }, "unhandled error");
+    if (err.type === "entity.parse.failed") {
+      return res.status(400).json({ code: "invalid_json", message: "Invalid JSON" });
+    }
+    if (err.type === "entity.too.large") {
+      return res.status(413).json({ code: "payload_too_large", message: "Request body too large" });
+    }
+    (req.log || config.logger).error({ err: { message: err.message, code: err.code, status: err.status } }, "unhandled error");
     return res.status(500).json({ code: "internal_error", message: "Unexpected server error" });
   });
 

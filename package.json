@@ -26,6 +26,9 @@
     "uuid": "^11.1.1",
     "geoip-country": {
       "ip-address": "^10.4.0"
+    },
+    "google-gax": {
+      "rimraf": "^6.1.4"
     }
   }
 }
