@@ -475,15 +475,20 @@ export function createMetricsStore(options = {}) {
   }
 
   function computeWeeklyActive(now, windowDays) {
-    const active = new Set();
+    const masksByMonth = new Map();
     for (let offset = 0; offset < windowDays; offset += 1) {
       const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
       d.setUTCDate(d.getUTCDate() - offset);
-      const bucket = state.devices[monthKey(d)];
-      if (!bucket) continue;
+      const month = monthKey(d);
       const dayBit = 1 << (dayIndexUtc(d) - 1);
+      masksByMonth.set(month, (masksByMonth.get(month) || 0) | dayBit);
+    }
+    const active = new Set();
+    for (const [month, mask] of masksByMonth) {
+      const bucket = state.devices[month];
+      if (!bucket) continue;
       for (const [hash, entry] of Object.entries(bucket)) {
-        if (entry && (entry.d & dayBit) !== 0) active.add(hash);
+        if (entry && (entry.d & mask) !== 0) active.add(hash);
       }
     }
     return active.size;

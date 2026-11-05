@@ -193,12 +193,12 @@ export function createApp(config, deps = {}) {
         serviceAccountPath: config.fcm?.serviceAccountPath,
         logger: config.logger,
       });
+  const seenStreams = deps.seenStreams || new Map();
   const pusherRelay = deps.pusherRelay !== undefined
     ? deps.pusherRelay
     : (config.fcm?.pusherRelayEnabled && messaging
-        ? createPusherRelay({ fcmStore, messaging, logger: config.logger })
+        ? createPusherRelay({ fcmStore, messaging, logger: config.logger, seenStreams })
         : null);
-  const seenStreams = deps.seenStreams || new Map();
   const liveStreamPoller = deps.liveStreamPoller !== undefined
     ? deps.liveStreamPoller
     : (messaging && config.kickClientId && config.kickClientSecret

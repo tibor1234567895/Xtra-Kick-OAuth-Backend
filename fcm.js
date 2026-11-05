@@ -506,7 +506,33 @@ export async function sendLivePushNotification({
   }
 }
 
-export function createPusherRelay({ fcmStore, messaging, logger }) {
+function sameStreamStartTime(left, right) {
+  if (!left || !right) return false;
+  if (left === right) return true;
+  const utcMillis = (value) => {
+    const text = String(value).trim();
+    const unzoned = /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?$/.test(text);
+    return Date.parse(unzoned ? `${text.replace(" ", "T")}Z` : text);
+  };
+  const first = utcMillis(left);
+  return Number.isFinite(first) && first === utcMillis(right);
+}
+
+function markStreamSeen(seenStreams, keys, startTime) {
+  if (!seenStreams || !startTime) return;
+  for (const key of keys) {
+    if (key) seenStreams.set(key, startTime);
+  }
+  while (seenStreams.size > 5000) seenStreams.delete(seenStreams.keys().next().value);
+}
+
+function clearFailedStream(seenStreams, keys, startTime) {
+  for (const key of keys) {
+    if (key && sameStreamStartTime(seenStreams?.get(key), startTime)) seenStreams.delete(key);
+  }
+}
+
+export function createPusherRelay({ fcmStore, messaging, logger, seenStreams = new Map() }) {
   let ws = null;
   let isClosed = false;
   let reconnectTimeout = null;
@@ -651,7 +677,7 @@ export function createPusherRelay({ fcmStore, messaging, logger }) {
     );
   }
 
-  function handleLiveEvent(msg) {
+  async function handleLiveEvent(msg) {
     try {
       const data = typeof msg.data === "string" ? JSON.parse(msg.data) : (msg.data || {});
       const channelFromPusher = typeof msg.channel === "string" ? msg.channel.replace(/^channel\./, "").trim() : null;
@@ -663,6 +689,8 @@ export function createPusherRelay({ fcmStore, messaging, logger }) {
         .toLowerCase();
 
       const candidateKeys = [channelFromPusher, channelIdFromData, userId, slug].filter(Boolean);
+      const startTime = data.start_time || data.created_at || data.createdAt;
+      if (candidateKeys.some((key) => sameStreamStartTime(seenStreams.get(key), startTime))) return;
       const tokenSet = new Set();
       for (const key of candidateKeys) {
         for (const tok of fcmStore.getTokensForChannel(key)) {
@@ -684,7 +712,8 @@ export function createPusherRelay({ fcmStore, messaging, logger }) {
         return;
       }
 
-      sendLivePushNotification({
+      markStreamSeen(seenStreams, candidateKeys, startTime);
+      const delivery = await sendLivePushNotification({
         messaging,
         tokens,
         channelId: channelFromPusher || channelIdFromData,
@@ -693,10 +722,13 @@ export function createPusherRelay({ fcmStore, messaging, logger }) {
         title: data.title,
         description: data.description,
         profilePicture: data.profile_picture,
-        startTime: data.start_time || data.created_at || data.createdAt,
+        startTime,
         logger,
         fcmStore,
       });
+      if (delivery.successCount === 0 && delivery.failureCount > 0) {
+        clearFailedStream(seenStreams, candidateKeys, startTime);
+      }
     } catch (e) {
       logger?.warn({ err: e.message }, "pusher_relay_event_handling_failed");
     }
@@ -844,13 +876,10 @@ export function createLiveStreamPoller({
 
         if (isLive && startTime) {
           liveCount++;
-          const lastStartTime = seenStreams.get(channelKey) || (slug && seenStreams.get(slug)) || (uId && seenStreams.get(uId));
-          if (lastStartTime !== startTime) {
+          const seenKeys = [channelKey, slug, uId, ch.channel_id ? String(ch.channel_id) : null];
+          if (!seenKeys.some((key) => key && sameStreamStartTime(seenStreams.get(key), startTime))) {
             // Transition: stream just started (or first time seeing it)
-            seenStreams.set(channelKey, startTime);
-            if (slug) seenStreams.set(slug, startTime);
-            if (uId) seenStreams.set(uId, startTime);
-            if (ch.channel_id) seenStreams.set(String(ch.channel_id), startTime);
+            markStreamSeen(seenStreams, seenKeys, startTime);
 
             // Cache channel resolution details for aliases
             const resolved = {
@@ -897,10 +926,7 @@ export function createLiveStreamPoller({
                 fcmStore,
               });
               if (delivery.successCount === 0 && delivery.failureCount > 0) {
-                seenStreams.delete(channelKey);
-                if (slug) seenStreams.delete(slug);
-                if (uId) seenStreams.delete(uId);
-                if (ch.channel_id) seenStreams.delete(String(ch.channel_id));
+                clearFailedStream(seenStreams, seenKeys, startTime);
               }
             }
           }
@@ -911,11 +937,6 @@ export function createLiveStreamPoller({
           if (uId) seenStreams.delete(uId);
           if (ch.channel_id) seenStreams.delete(String(ch.channel_id));
         }
-      }
-
-      if (seenStreams.size > 5000) {
-        const oldestKey = seenStreams.keys().next().value;
-        if (oldestKey) seenStreams.delete(oldestKey);
       }
 
       logger?.info(
@@ -1098,19 +1119,14 @@ export async function handleWebhookLiveEvent({
 
   // Stream is live: check deduplication
   const streamKey = userId || slug;
-  if (
-    (streamKey && seenStreams?.get(streamKey) === startTime) ||
-    (slug && seenStreams?.get(slug) === startTime) ||
-    (userId && seenStreams?.get(userId) === startTime)
-  ) {
+  const candidateKeys = [userId, slug, channelId].filter(Boolean);
+  if (candidateKeys.some((key) => sameStreamStartTime(seenStreams?.get(key), startTime))) {
     logger?.info({ streamKey, startTime }, "kick_webhook_stream_already_seen");
     return { ok: true, duplicate: true };
   }
 
   // Mark as seen immediately across all identifiers
-  if (userId) seenStreams?.set(userId, startTime);
-  if (slug) seenStreams?.set(slug, startTime);
-  if (channelId) seenStreams?.set(channelId, startTime);
+  markStreamSeen(seenStreams, candidateKeys, startTime);
 
   // Update resolution cache
   const resolved = {
@@ -1123,7 +1139,6 @@ export async function handleWebhookLiveEvent({
   if (userId) cacheChannel(userId, resolved);
 
   // Find subscribers for candidate keys
-  const candidateKeys = [userId, slug, channelId].filter(Boolean);
   const tokenSet = new Set();
   for (const key of candidateKeys) {
     for (const tok of fcmStore?.getTokensForChannel(key) || []) {
@@ -1155,6 +1170,9 @@ export async function handleWebhookLiveEvent({
     logger,
     fcmStore,
   });
+  if (delivery.successCount === 0 && delivery.failureCount > 0) {
+    clearFailedStream(seenStreams, candidateKeys, startTime);
+  }
 
   return {
     ok: true,

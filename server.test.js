@@ -780,6 +780,62 @@ test("same-day returning pings keep new/returning split intact", async () => {
   store.close();
 });
 
+test("weekly activity deduplicates devices across month and year boundaries", () => {
+  const store = createMetricsStore({ salt: "s", dataPath: null, retentionMonths: 24 });
+  const now = new Date(Date.UTC(new Date().getUTCFullYear() + 1, 0, 3));
+  const currentMonth = monthStringOf(now);
+  const previousMonth = monthStringOf(new Date(Date.UTC(now.getUTCFullYear(), 0, 0)));
+  store.state.devices[previousMonth] = {
+    returning: { d: (1 << 30) | (1 << 29) },
+    previousOnly: { d: 1 << 27 },
+    tooOld: { d: 1 << 26 },
+    empty: null,
+  };
+  store.state.devices[currentMonth] = {
+    returning: { d: 1 },
+    currentOnly: { d: 1 << 2 },
+    futureOnly: { d: 1 << 3 },
+    inactive: { d: 0 },
+  };
+
+  assert.equal(store.computeStats(now).wau, 3);
+  store.close();
+});
+
+test("weekly activity matches daily union for varied masks and window positions", () => {
+  const store = createMetricsStore({ salt: "s", dataPath: null, retentionMonths: 24 });
+  let seed = 42;
+  const nextMask = () => {
+    seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+    return seed & 0x7fffffff;
+  };
+  const year = new Date().getUTCFullYear() + 1;
+  for (const month of [0, 1, 2, 11]) {
+    const currentMonth = monthStringOf(new Date(Date.UTC(year, month, 1)));
+    const previousMonth = monthStringOf(new Date(Date.UTC(year, month, 0)));
+    store.state.devices = {};
+    for (const key of [previousMonth, currentMonth]) {
+      store.state.devices[key] = Object.fromEntries(
+        Array.from({ length: 100 }, (_, index) => [`device-${index}`, { d: nextMask() }])
+      );
+    }
+    for (const day of [1, 3, 7, 8, 28]) {
+      const now = new Date(Date.UTC(year, month, day, 23, 59));
+      const expected = new Set();
+      for (let offset = 0; offset < 7; offset++) {
+        const date = new Date(Date.UTC(year, month, day - offset));
+        const bucket = store.state.devices[monthStringOf(date)] || {};
+        const bit = 1 << (date.getUTCDate() - 1);
+        for (const [hash, entry] of Object.entries(bucket)) {
+          if (entry.d & bit) expected.add(hash);
+        }
+      }
+      assert.equal(store.computeStats(now).wau, expected.size, now.toISOString());
+    }
+  }
+  store.close();
+});
+
 test("endpoint and oauth outcome counters are recorded", async () => {
   const { app, store } = appWithMetrics(async () =>
     jsonResponse(400, { error: "invalid_grant" })
@@ -1459,6 +1515,111 @@ test("createLiveStreamPoller detects stream start, sends notification, and dedup
     assert.equal(sentPayload.data.title, "Doug Stream Live");
   } finally {
     poller.close();
+  }
+});
+
+test("failed webhook delivery can retry the same stream without duplicating a successful retry", async () => {
+  clearChannelResolutionCache();
+  const fcmStore = createFcmStore({ dataFile: null });
+  fcmStore.subscribe({ token: "retry-token", channelIds: ["42", "retry-streamer"] });
+  const seenStreams = new Map();
+  let calls = 0;
+  const messaging = {
+    async sendEachForMulticast(payload) {
+      if (++calls === 1) throw new Error("temporary FCM outage");
+      return { successCount: payload.tokens.length, failureCount: 0, responses: payload.tokens.map(() => ({ success: true })) };
+    },
+  };
+  const options = { eventType: "livestream.status.updated", fcmStore, messaging, seenStreams,
+    payload: { broadcaster: { user_id: 42, channel_slug: "retry-streamer" }, is_live: true, started_at: "2026-11-05T12:00:00Z" } };
+
+  const failed = await handleWebhookLiveEvent(options);
+  assert.equal(failed.delivery.failureCount, 1);
+  assert.equal(seenStreams.has("42"), false);
+  const retried = await handleWebhookLiveEvent(options);
+  assert.equal(retried.delivery.successCount, 1);
+  assert.equal((await handleWebhookLiveEvent(options)).duplicate, true);
+  assert.equal(calls, 2);
+});
+
+test("an older failed webhook delivery cannot clear a newer stream's deduplication state", async () => {
+  clearChannelResolutionCache();
+  const fcmStore = createFcmStore({ dataFile: null });
+  fcmStore.subscribe({ token: "overlap-token", channelIds: ["42", "overlap-streamer"] });
+  const seenStreams = new Map();
+  let failOld;
+  let calls = 0;
+  const messaging = {
+    async sendEachForMulticast(payload) {
+      if (++calls === 1) return await new Promise((_, reject) => { failOld = reject; });
+      return { successCount: payload.tokens.length, failureCount: 0, responses: payload.tokens.map(() => ({ success: true })) };
+    },
+  };
+  const options = { eventType: "livestream.status.updated", fcmStore, messaging, seenStreams };
+  const payload = { broadcaster: { user_id: 42, channel_slug: "overlap-streamer" }, is_live: true };
+  const oldDelivery = handleWebhookLiveEvent({ ...options, payload: { ...payload, started_at: "2026-11-05T12:00:00Z" } });
+  const current = { ...payload, started_at: "2026-11-05T13:00:00Z" };
+  await handleWebhookLiveEvent({ ...options, payload: current });
+  failOld(new Error("old request failed"));
+  await oldDelivery;
+
+  assert.equal(seenStreams.get("42"), current.started_at);
+  assert.equal((await handleWebhookLiveEvent({ ...options, payload: current })).duplicate, true);
+  assert.equal(calls, 2);
+});
+
+test("poller and webhook deduplicate equivalent UTC start-time formats after warmup", async () => {
+  clearChannelResolutionCache();
+  const fcmStore = createFcmStore({ dataFile: null });
+  fcmStore.subscribe({ token: "format-token", channelIds: ["42", "format-streamer"] });
+  const seenStreams = new Map();
+  let live = false;
+  let calls = 0;
+  const messaging = {
+    async sendEachForMulticast(payload) {
+      calls++;
+      return { successCount: payload.tokens.length, failureCount: 0, responses: payload.tokens.map(() => ({ success: true })) };
+    },
+  };
+  const poller = createLiveStreamPoller({ fcmStore, messaging, seenStreams,
+    config: { kickClientId: "test-client", kickClientSecret: "test-secret" },
+    fetchFn: async (url) => url.includes("/oauth/token")
+      ? jsonResponse(200, { access_token: "test-app-token", expires_in: 3600 })
+      : jsonResponse(200, { data: [{ broadcaster_user_id: 42, channel_id: 44, slug: "format-streamer",
+        stream: { is_live: live, start_time: "2026-11-05 12:00:00" } }] }),
+  });
+  try {
+    await poller.checkLiveStreams();
+    live = true;
+    await handleWebhookLiveEvent({ eventType: "livestream.status.updated", fcmStore, messaging, seenStreams,
+      payload: { broadcaster: { user_id: 42, channel_slug: "format-streamer" }, is_live: true, started_at: "2026-11-05T12:00:00.000Z" } });
+    await poller.checkLiveStreams();
+    assert.equal(calls, 1);
+  } finally {
+    poller.close();
+  }
+});
+
+test("Pusher relay shares stream deduplication with webhook delivery", async () => {
+  clearChannelResolutionCache();
+  const fcmStore = createFcmStore({ dataFile: null });
+  fcmStore.subscribe({ token: "pusher-shared-token", channelIds: ["42", "pusher-streamer"] });
+  const seenStreams = new Map();
+  let calls = 0;
+  const messaging = {
+    async sendEachForMulticast(payload) {
+      calls++;
+      return { successCount: payload.tokens.length, failureCount: 0, responses: payload.tokens.map(() => ({ success: true })) };
+    },
+  };
+  const relay = createPusherRelay({ fcmStore, messaging, seenStreams });
+  try {
+    await handleWebhookLiveEvent({ eventType: "livestream.status.updated", fcmStore, messaging, seenStreams,
+      payload: { broadcaster: { user_id: 42, channel_slug: "pusher-streamer" }, is_live: true, started_at: "2026-11-05T12:00:00Z" } });
+    await relay.handleLiveEvent({ channel: "channel.44", data: { user_id: 42, path: "/pusher-streamer", start_time: "2026-11-05 12:00:00" } });
+    assert.equal(calls, 1);
+  } finally {
+    relay.close();
   }
 });
 
