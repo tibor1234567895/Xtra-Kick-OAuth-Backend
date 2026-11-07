@@ -537,8 +537,30 @@ test("dashboard shell loads without admin token while stats stays protected", as
     const noToken = await httpRequest(baseUrl, "GET", "/v1/metrics/dashboard");
     assert.equal(noToken.status, 200);
     assert.match(noToken.headers["content-type"], /text\/html/);
-    assert.match(noToken.body.raw, /--accent-new/);
-    assert.match(noToken.body.raw, /\.new-seg/);
+    assert.match(noToken.body.raw, /Xtra Backend Ops/);
+    assert.match(noToken.body.raw, /Connecting to backend telemetry/);
+
+    const stats = await httpRequest(baseUrl, "GET", "/v1/metrics/stats");
+    assert.equal(stats.status, 401);
+  });
+  store.close();
+});
+
+test("dashboard is served on /v1/metrics/dashboard and aliased on /v2", async () => {
+  const { app, store } = appWithMetrics(async () => jsonResponse(200, {}), {
+    METRICS_DASHBOARD_FILE: join(process.cwd(), "dashboard.html"),
+  });
+
+  await withServer(app, async (baseUrl) => {
+    const main = await httpRequest(baseUrl, "GET", "/v1/metrics/dashboard");
+    assert.equal(main.status, 200);
+    assert.match(main.headers["content-type"], /text\/html/);
+    assert.match(main.body.raw, /Xtra Backend Ops/);
+
+    const v2 = await httpRequest(baseUrl, "GET", "/v1/metrics/dashboard/v2");
+    assert.equal(v2.status, 200);
+    assert.match(v2.headers["content-type"], /text\/html/);
+    assert.match(v2.body.raw, /Xtra Backend Ops/);
 
     const stats = await httpRequest(baseUrl, "GET", "/v1/metrics/stats");
     assert.equal(stats.status, 401);

@@ -115,6 +115,7 @@ export const KNOWN_ENDPOINTS = new Set([
   "POST /v1/metrics/ping",
   "GET /v1/metrics/stats",
   "GET /v1/metrics/dashboard",
+  "GET /v1/metrics/dashboard/v2",
   "POST /v1/fcm/subscribe",
   "POST /v1/fcm/unsubscribe",
   "GET /v1/fcm/stats",
@@ -246,7 +247,10 @@ export function createApp(config, deps = {}) {
     app.get("/v1/metrics/stats", requireAdminToken(config.metrics), statsHandler(metrics));
     if (config.metrics.dashPath) {
       // The page is only a login shell; its data request remains token-protected.
-      app.get("/v1/metrics/dashboard", dashboardHandler(config.metrics));
+      const dash = dashboardHandler(config.metrics);
+      app.get("/v1/metrics/dashboard", dash);
+      // Backward-compatible alias for bookmarks and links pointing to /v2.
+      app.get("/v1/metrics/dashboard/v2", dash);
     }
   }
 

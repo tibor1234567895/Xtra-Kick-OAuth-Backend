@@ -10,7 +10,8 @@ Minimal OAuth proxy for Kick token operations.
 - `POST /v1/kick/oauth/introspect`
 - `POST /v1/metrics/ping` (enabled when `METRICS_SALT` is set)
 - `GET /v1/metrics/stats` (requires `METRICS_ADMIN_TOKEN`)
-- `GET /v1/metrics/dashboard` (static login shell; requires `METRICS_DASHBOARD_FILE`)
+- `GET /v1/metrics/dashboard` (static operations cockpit; requires `METRICS_DASHBOARD_FILE`)
+- `GET /v1/metrics/dashboard/v2` (backward-compatible alias for the operations dashboard)
 
 ## Setup
 1. Copy `.env.example` to `.env` and fill values.

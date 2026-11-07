@@ -1,539 +1,1860 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="dark">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Usage</title>
+    <meta name="color-scheme" content="dark light" />
+    <title>Xtra Backend Ops</title>
     <style>
       :root {
-        color-scheme: light dark;
+        --font-ui: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+        --font-mono: "JetBrains Mono", "SF Mono", "Cascadia Code", ui-monospace, Consolas, monospace;
+        --radius-panel: 14px;
+        --radius-card: 12px;
+        --radius-control: 8px;
+        --radius-tag: 4px;
+        --ease: cubic-bezier(0.22, 1, 0.36, 1);
+      }
+
+      html[data-theme="dark"] {
+        color-scheme: dark;
+        --bg: #141415;
+        --surface: #19191b;
+        --surface-raised: #232325;
+        --surface-subtle: #0f0f10;
+        --border: rgba(255, 255, 255, 0.08);
+        --border-subtle: rgba(255, 255, 255, 0.04);
+        --fg: #ededed;
+        --fg-dim: #a1a1a6;
+        --muted: #85858b;
+        --accent: #38bdf8;
+        --accent-soft: rgba(56, 189, 248, 0.12);
+        --bar-ret: #334155;
+        --trend: #f8fafc;
+        --good: #4cc38a;
+        --good-soft: rgba(76, 195, 138, 0.12);
+        --warn: #f59e0b;
+        --warn-soft: rgba(245, 158, 11, 0.12);
+        --bad: #e5484d;
+        --bad-soft: rgba(229, 72, 77, 0.14);
+        --shadow-pop: 0 12px 32px rgba(0, 0, 0, 0.55);
+      }
+
+      html[data-theme="light"] {
+        color-scheme: light;
         --bg: #fafafa;
-        --fg: #1a1a1a;
-        --muted: #6b6b6b;
-        --card: #ffffff;
-        --border: #e5e5e5;
-        --accent: #15803d;
-        --accent-soft: rgba(21, 128, 61, 0.18);
-        --accent-new: #0284c7;
+        --surface: #ffffff;
+        --surface-raised: #f4f4f5;
+        --surface-subtle: #f0f0f2;
+        --border: rgba(0, 0, 0, 0.08);
+        --border-subtle: rgba(0, 0, 0, 0.04);
+        --fg: #171717;
+        --fg-dim: #525252;
+        --muted: #737373;
+        --accent: #0284c7;
+        --accent-soft: rgba(2, 132, 199, 0.10);
+        --bar-ret: #cbd5e1;
+        --trend: #0f172a;
         --good: #16a34a;
-        --warn: #b45309;
+        --good-soft: rgba(22, 163, 74, 0.10);
+        --warn: #d97706;
+        --warn-soft: rgba(217, 119, 6, 0.10);
         --bad: #dc2626;
-        --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        --bad-soft: rgba(220, 38, 38, 0.10);
+        --shadow-pop: 0 12px 32px rgba(0, 0, 0, 0.12);
       }
-      @media (prefers-color-scheme: dark) {
-        :root {
-          --bg: #0f0f10;
-          --fg: #ededed;
-          --muted: #9a9a9a;
-          --card: #18181b;
-          --border: #2a2a2e;
-          --accent: #4ade80;
-          --accent-soft: rgba(74, 222, 128, 0.2);
-          --accent-new: #38bdf8;
-          --good: #4ade80;
-          --warn: #fbbf24;
-          --bad: #f87171;
-        }
-      }
+
       * { box-sizing: border-box; }
       body {
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-        margin: 0; padding: 24px;
-        background: var(--bg); color: var(--fg);
+        margin: 0;
+        font: 13px/1.5 var(--font-ui);
+        background: var(--bg);
+        color: var(--fg);
+        -webkit-font-smoothing: antialiased;
+        min-height: 100vh;
       }
-      .wrap { max-width: 1080px; margin: 0 auto; }
-      .head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
-      h1 { font-size: 20px; font-weight: 650; margin: 0; letter-spacing: -0.01em; }
-      .status { font-family: var(--mono); font-size: 12px; color: var(--muted); }
-      .status .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--muted); margin-right: 6px; vertical-align: 1px; }
-      .status.ok .dot { background: var(--good); }
-      .status.err .dot { background: var(--bad); }
-      .toolbar {
-        display: flex; gap: 8px; align-items: center;
-        margin-bottom: 16px; flex-wrap: wrap;
+
+      a { color: inherit; text-decoration: none; }
+      kbd {
+        font-family: var(--font-mono);
+        font-size: 11px;
+        color: var(--fg-dim);
+        background: var(--surface-raised);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-tag);
+        padding: 1px 5px;
       }
-      input[type="password"], input[type="text"], select {
-        padding: 8px 10px; font: inherit;
-        background: var(--card); color: var(--fg);
-        border: 1px solid var(--border); border-radius: 6px;
-      }
-      input[type="password"], input[type="text"] { flex: 1 1 220px; min-width: 200px; font-family: var(--mono); font-size: 13px; }
+
+      /* Buttons & Controls */
       button {
-        padding: 8px 14px; background: var(--accent);
-        color: #fff; border: 0; border-radius: 6px;
-        font: inherit; font-weight: 600; cursor: pointer;
+        font: inherit;
+        font-size: 12px;
+        color: var(--fg);
+        cursor: pointer;
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-control);
+        padding: 6px 12px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 6px;
+        user-select: none;
+        transition: background 140ms var(--ease), border-color 140ms var(--ease), color 140ms var(--ease);
       }
-      @media (prefers-color-scheme: dark) { button { color: #06130a; } }
-      button.ghost { background: transparent; color: var(--fg); border: 1px solid var(--border); font-weight: 500; }
-      button.small { padding: 5px 10px; font-size: 12.5px; font-weight: 500; }
-      label { font-size: 13px; color: var(--muted); display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
-      .count { font-family: var(--mono); font-size: 12px; }
-      .grid {
+      button:hover {
+        background: var(--surface-raised);
+        border-color: rgba(255, 255, 255, 0.16);
+      }
+      html[data-theme="light"] button:hover {
+        border-color: rgba(0, 0, 0, 0.16);
+      }
+      button:active { transform: scale(0.98); }
+      button.primary {
+        background: var(--fg);
+        color: var(--bg);
+        border-color: var(--fg);
+        font-weight: 500;
+      }
+      button.primary:hover { opacity: 0.92; }
+      button.small {
+        padding: 0 10px;
+        font-size: 12px;
+        height: 28px;
+        line-height: 28px;
+      }
+      button svg {
+        display: block;
+        flex-shrink: 0;
+      }
+      button.active, button[aria-pressed="true"] {
+        background: var(--surface-raised);
+        border-color: var(--accent);
+        color: var(--fg);
+        font-weight: 500;
+      }
+
+      input, select {
+        font: inherit;
+        font-size: 12px;
+        color: var(--fg);
+        background: var(--surface-raised);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-control);
+        padding: 6px 10px;
+        outline: none;
+        transition: border-color 140ms var(--ease);
+      }
+      input:focus, select:focus { border-color: var(--accent); }
+      input.mono { font-family: var(--font-mono); }
+      select#rangeSelect {
+        height: 28px;
+        padding: 0 8px;
+        font-size: 12px;
+      }
+
+      /* Top Navigation Bar — Fixed Viewport Plane */
+      .topbar {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        width: 100%;
+        height: 56px;
+        z-index: 60;
+        background: var(--bg);
+        border-bottom: 1px solid var(--border);
+        transform: translateZ(0);
+        -webkit-transform: translateZ(0);
+        backface-visibility: hidden;
+      }
+      .topbar-inner {
+        max-width: 1440px;
+        margin: 0 auto;
+        padding: 0 24px;
+        height: 56px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+      }
+      .brand-box {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+      }
+      .brand-title {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 14px;
+        font-weight: 600;
+      }
+      .brand-tag {
+        font-family: var(--font-mono);
+        font-size: 10px;
+        font-weight: 500;
+        color: var(--muted);
+        background: var(--surface-raised);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-tag);
+        padding: 1px 5px;
+      }
+      .status-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        font-family: var(--font-mono);
+        font-size: 11.5px;
+        color: var(--fg-dim);
+        padding-left: 12px;
+        border-left: 1px solid var(--border);
+      }
+      .status-dot {
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        background: var(--muted);
+      }
+      .status-pill.ok .status-dot { background: var(--good); }
+      .status-pill.err .status-dot { background: var(--bad); }
+      .status-pill.busy .status-dot { background: var(--warn); }
+
+      .top-actions {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        position: relative;
+      }
+
+      /* Token Popover */
+      .token-popover {
+        position: absolute;
+        top: calc(100% + 8px);
+        right: 0;
+        width: 320px;
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-card);
+        box-shadow: var(--shadow-pop);
+        padding: 16px;
+        z-index: 70;
+        display: none;
+      }
+      .token-popover.open { display: block; }
+      .token-popover-title {
+        font-size: 13px;
+        font-weight: 600;
+        margin-bottom: 6px;
+      }
+      .token-popover-sub {
+        font-size: 11.5px;
+        color: var(--muted);
+        margin-bottom: 12px;
+      }
+
+      /* Container */
+      .container {
+        max-width: 1440px;
+        margin: 0 auto;
+        padding: 80px 24px 24px;
+      }
+
+      /* Panels */
+      .panel {
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-panel);
+        overflow: hidden;
+      }
+      .panel-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 16px 20px;
+        border-bottom: 1px solid var(--border-subtle);
+        flex-wrap: wrap;
+      }
+      .panel-title {
+        font-size: 14px;
+        font-weight: 600;
+        margin: 0;
+        color: var(--fg);
+      }
+      .panel-sub {
+        font-size: 12px;
+        color: var(--muted);
+        margin-top: 2px;
+      }
+      .panel-body { padding: 20px; }
+
+      /* Symmetrical 4-Column KPI Grid */
+      .kpi-grid {
         display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-        gap: 12px; margin-bottom: 20px;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 12px;
+        margin-bottom: 12px;
       }
-      .card {
-        background: var(--card); border: 1px solid var(--border);
-        border-radius: 8px; padding: 13px 14px;
+      .kpi-card {
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-card);
+        padding: 18px 20px;
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
       }
-      .card .k { color: var(--muted); font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.05em; }
-      .card .v { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 23px; font-weight: 700; margin-top: 4px; letter-spacing: -0.02em; }
-      .card .h { color: var(--muted); font-size: 12px; margin-top: 4px; }
-      .card .h .up { color: var(--good); font-weight: 700; }
-      .card .h .down { color: var(--bad); font-weight: 700; }
-      .section { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
-      .section h2 { font-size: 14px; font-weight: 650; margin: 0; }
-      .section .sub { color: var(--muted); font-size: 12px; margin: 2px 0 12px; font-family: var(--mono); }
-      .section-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; flex-wrap: wrap; margin-bottom: 4px; }
-      .links { display: flex; gap: 8px; }
-      table { width: 100%; border-collapse: collapse; font-size: 13px; }
-      th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--border); }
-      th { color: var(--muted); font-weight: 500; font-size: 12px; }
-      td.num, th.num { text-align: right; font-family: var(--mono); font-variant-numeric: tabular-nums; }
-      .share { height: 4px; border-radius: 99px; background: var(--accent-soft); margin-top: 5px; overflow: hidden; }
-      .share > div { height: 100%; background: var(--accent); }
-      .bar-chart { display: flex; align-items: flex-end; gap: 2px; height: 140px; margin-top: 12px; }
-      .bar {
-        flex: 1 1 0; background: var(--accent); border-radius: 2px 2px 0 0;
-        min-height: 1px; display: flex; flex-direction: column; justify-content: flex-start;
-        min-width: 2px; overflow: hidden;
+      .kpi-label {
+        font-size: 12px;
+        font-weight: 500;
+        color: var(--fg-dim);
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
       }
-      .bar .new-seg { width: 100%; background: var(--accent-new); flex-shrink: 0; pointer-events: none; }
-      .bar:hover { filter: brightness(1.12); }
-      .bar.peak { outline: 2px solid var(--warn); outline-offset: 1px; }
-      .legend { display: flex; gap: 14px; color: var(--muted); font-size: 12px; margin-top: 8px; }
-      .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; background: var(--accent); }
-      .legend i.new { background: var(--accent-new); }
-      .x-axis { display: flex; justify-content: space-between; color: var(--muted); font-size: 11px; margin-top: 6px; font-family: var(--mono); }
+      .kpi-val {
+        font-family: var(--font-mono);
+        font-size: 28px;
+        font-weight: 600;
+        color: var(--fg);
+        letter-spacing: -0.02em;
+        margin: 8px 0 4px;
+        font-variant-numeric: tabular-nums;
+      }
+      .kpi-val.secondary {
+        font-size: 20px;
+        font-weight: 500;
+      }
+      .kpi-foot {
+        font-size: 11.5px;
+        color: var(--muted);
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .delta {
+        font-family: var(--font-mono);
+        font-size: 11px;
+        font-weight: 500;
+        padding: 2px 6px;
+        border-radius: var(--radius-tag);
+        font-variant-numeric: tabular-nums;
+      }
+      .delta.up { color: var(--good); background: var(--good-soft); }
+      .delta.down { color: var(--bad); background: var(--bad-soft); }
+
+      /* Main Stacked Chart */
+      .chart-wrap { position: relative; width: 100%; }
+      .chart-wrap svg { display: block; width: 100%; overflow: visible; }
+      .chart-meta-bar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-top: 12px;
+        font-size: 11px;
+        font-family: var(--font-mono);
+        color: var(--muted);
+      }
+      .chart-legend {
+        display: flex;
+        align-items: center;
+        gap: 20px;
+        font-size: 12px;
+        color: var(--fg-dim);
+      }
+      .legend-item { display: inline-flex; align-items: center; gap: 6px; }
+      .legend-swatch { width: 8px; height: 8px; border-radius: 2px; }
+
+      .tooltip {
+        position: absolute;
+        z-index: 40;
+        pointer-events: none;
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-control);
+        box-shadow: var(--shadow-pop);
+        padding: 10px 12px;
+        font-size: 12px;
+        white-space: nowrap;
+        opacity: 0;
+        transition: opacity 120ms var(--ease);
+      }
+      .tooltip.show { opacity: 1; }
+      .tooltip-title {
+        font-family: var(--font-mono);
+        font-size: 11px;
+        color: var(--muted);
+        margin-bottom: 6px;
+        padding-bottom: 4px;
+        border-bottom: 1px solid var(--border-subtle);
+      }
+      .tooltip-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+        margin: 2px 0;
+      }
+      .tooltip-row b {
+        font-family: var(--font-mono);
+        font-variant-numeric: tabular-nums;
+        font-weight: 500;
+      }
+
+      /* 2-Column Ops Grid */
+      .grid-split {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 16px;
+        margin-top: 16px;
+      }
+
+      /* Tables */
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 12.5px;
+      }
+      th {
+        text-align: left;
+        color: var(--fg-dim);
+        font-weight: 500;
+        font-size: 11.5px;
+        padding: 8px 12px;
+        border-bottom: 1px solid var(--border);
+      }
+      td {
+        padding: 8px 12px;
+        border-bottom: 1px solid var(--border-subtle);
+        vertical-align: middle;
+        color: var(--fg);
+      }
+      tr:last-child td { border-bottom: none; }
+      tbody tr:hover { background: var(--surface-raised); }
+      td.num, th.num {
+        text-align: right;
+        font-family: var(--font-mono);
+        font-variant-numeric: tabular-nums;
+        font-weight: 500;
+      }
+      .bar-cell { width: 130px; }
+      .progress-bar {
+        height: 4px;
+        background: var(--surface-raised);
+        border-radius: 2px;
+        overflow: hidden;
+      }
+      .progress-fill {
+        height: 100%;
+        background: var(--accent);
+        border-radius: 2px;
+      }
+      .progress-fill.warn { background: var(--warn); }
+      .progress-fill.bad { background: var(--bad); }
+
       .pill {
-        display: inline-block; font-family: var(--mono); font-size: 11px;
-        padding: 1px 8px; border-radius: 999px; border: 1px solid var(--border);
+        display: inline-block;
+        font-family: var(--font-mono);
+        font-size: 11px;
+        font-weight: 500;
+        padding: 2px 6px;
+        border-radius: var(--radius-tag);
+        font-variant-numeric: tabular-nums;
       }
-      .pill.ok { color: var(--good); border-color: var(--good); }
-      .pill.warn { color: var(--warn); border-color: var(--warn); }
-      .pill.bad { color: var(--bad); border-color: var(--bad); }
-      .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
-      .chip { font-family: var(--mono); font-size: 12px; border: 1px solid var(--border); border-radius: 999px; padding: 3px 9px; }
-      .mini-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-top: 12px; }
-      .mini h3 { font-size: 12px; color: var(--muted); margin: 0 0 4px; font-weight: 600; }
-      .error { color: var(--bad); padding: 12px; background: color-mix(in srgb, var(--bad) 7%, transparent); border: 1px solid color-mix(in srgb, var(--bad) 35%, transparent); border-radius: 6px; font-size: 13px; }
-      .empty { border: 1px dashed var(--border); border-radius: 8px; padding: 22px 18px; background: var(--card); }
-      .empty h2 { margin: 0 0 6px; font-size: 14px; }
-      .empty p { margin: 0 0 6px; color: var(--muted); font-size: 13px; }
-      .empty code { font-family: var(--mono); font-size: 12px; background: var(--bg); border: 1px solid var(--border); padding: 1px 6px; border-radius: 4px; }
-      .meta { color: var(--muted); font-size: 12px; margin-top: 4px; font-family: var(--mono); }
-      .cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
-      .sk { border: 1px solid var(--border); border-radius: 8px; min-height: 90px; margin-bottom: 12px;
-        background: linear-gradient(90deg, var(--card) 25%, var(--bg) 50%, var(--card) 75%); background-size: 200% 100%; animation: sh 1.2s infinite; }
-      @keyframes sh { to { background-position: -200% 0; } }
+      .pill.ok { color: var(--good); background: var(--good-soft); }
+      .pill.warn { color: var(--warn); background: var(--warn-soft); }
+      .pill.bad { color: var(--bad); background: var(--bad-soft); }
+
+      .method-tag {
+        font-family: var(--font-mono);
+        font-size: 9.5px;
+        font-weight: 600;
+        color: var(--fg-dim);
+        background: var(--surface-raised);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-tag);
+        padding: 1px 4px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 32px;
+        line-height: 1.2;
+        margin-right: 5px;
+        vertical-align: middle;
+      }
+      .tag-status {
+        font-family: var(--font-mono);
+        font-size: 11px;
+        border-radius: var(--radius-tag);
+        padding: 1px 5px;
+        display: inline-flex;
+        align-items: center;
+      }
+      .tag-status.ok { color: var(--fg-dim); }
+      .tag-status.warn { color: var(--warn); background: var(--warn-soft); }
+      .tag-status.bad { color: var(--bad); background: var(--bad-soft); font-weight: 500; }
+      .tag-status.muted { color: var(--muted); }
+
+      /* Geo Distribution Grid */
+      .geo-grid {
+        display: grid;
+        grid-template-columns: repeat(2, 1fr);
+        gap: 8px;
+      }
+      .geo-card {
+        background: var(--surface-raised);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-control);
+        padding: 6px 10px;
+        display: flex;
+        flex-direction: column;
+        gap: 5px;
+      }
+      .geo-card-top {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        font-size: 11.5px;
+      }
+      .geo-code {
+        font-family: var(--font-mono);
+        font-size: 10px;
+        font-weight: 600;
+        color: var(--muted);
+        background: var(--surface-subtle);
+        border: 1px solid var(--border-subtle);
+        border-radius: 3px;
+        padding: 0 4px;
+        margin-right: 5px;
+      }
+
+      /* Sub diagnostic counters */
+      .diag-grid {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 8px;
+        margin-top: 12px;
+      }
+      .diag-card {
+        background: var(--surface-subtle);
+        border: 1px solid var(--border-subtle);
+        border-radius: var(--radius-control);
+        padding: 10px 12px;
+      }
+      .diag-val {
+        font-family: var(--font-mono);
+        font-size: 16px;
+        font-weight: 600;
+        color: var(--fg);
+        font-variant-numeric: tabular-nums;
+      }
+      .diag-label {
+        font-size: 11px;
+        color: var(--muted);
+        margin-top: 2px;
+      }
+
+      /* Callout banner */
+      .callout {
+        display: flex;
+        align-items: flex-start;
+        gap: 12px;
+        border-radius: var(--radius-card);
+        padding: 12px 16px;
+        font-size: 12.5px;
+        margin-bottom: 16px;
+        border: 1px solid var(--border);
+      }
+      .callout.info { background: var(--surface-subtle); color: var(--fg-dim); }
+      .callout.red { background: var(--bad-soft); border-color: rgba(229, 72, 77, 0.3); color: #fca5a5; }
+
+      /* High-Contrast Cohort Matrix */
+      .heat-box {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 100%;
+        max-width: 110px;
+        height: 30px;
+        font-family: var(--font-mono);
+        font-size: 12px;
+        font-variant-numeric: tabular-nums;
+        border-radius: var(--radius-tag);
+        padding: 0 8px;
+        transition: background 140ms var(--ease);
+      }
+      .heat-box.empty { color: var(--muted); }
+      .heat-box.lvl-0 { background: rgba(255, 255, 255, 0.02); color: var(--muted); }
+      .heat-box.lvl-1 { background: rgba(56, 189, 248, 0.09); color: #cbd5e1; }
+      .heat-box.lvl-2 { background: rgba(56, 189, 248, 0.18); color: #e2e8f0; font-weight: 500; }
+      .heat-box.lvl-3 { background: rgba(56, 189, 248, 0.30); color: #ffffff; font-weight: 500; }
+      .heat-box.lvl-4 { background: rgba(56, 189, 248, 0.44); color: #ffffff; font-weight: 600; border: 1px solid rgba(56, 189, 248, 0.55); }
+
+      html[data-theme="light"] .heat-box.lvl-0 { background: rgba(0, 0, 0, 0.02); color: var(--muted); }
+      html[data-theme="light"] .heat-box.lvl-1 { background: rgba(2, 132, 199, 0.08); color: #0369a1; }
+      html[data-theme="light"] .heat-box.lvl-2 { background: rgba(2, 132, 199, 0.18); color: #0284c7; font-weight: 500; }
+      html[data-theme="light"] .heat-box.lvl-3 { background: rgba(2, 132, 199, 0.30); color: #0c4a6e; font-weight: 500; }
+      html[data-theme="light"] .heat-box.lvl-4 { background: rgba(2, 132, 199, 0.44); color: #082f49; font-weight: 600; border: 1px solid rgba(2, 132, 199, 0.6); }
+
+      /* Responsive */
+      @media (max-width: 1100px) {
+        .kpi-grid { grid-template-columns: repeat(2, 1fr); }
+        .grid-split { grid-template-columns: 1fr; }
+        .diag-grid { grid-template-columns: repeat(2, 1fr); }
+      }
+      @media (max-width: 680px) {
+        .topbar { position: sticky; height: auto; }
+        .topbar-inner { padding: 0 16px; height: auto; flex-wrap: wrap; padding-block: 10px; }
+        .container { padding: 16px; }
+        .kpi-grid { grid-template-columns: 1fr; }
+        .chart-legend { flex-wrap: wrap; gap: 12px; }
+      }
     </style>
   </head>
   <body>
-    <div class="wrap">
-      <div class="head">
-        <h1>Usage</h1>
-        <span id="status" class="status"><span class="dot"></span><span id="statusText">enter token to load</span></span>
+    <!-- Top Navigation Bar -->
+    <header class="topbar">
+      <div class="topbar-inner">
+        <div class="brand-box">
+          <div class="brand-title">
+            <span>Xtra Backend Ops</span>
+            <span class="brand-tag">v2</span>
+          </div>
+          <div class="status-pill" id="statusPill">
+            <span class="status-dot"></span>
+            <span id="statusLabel">Initializing</span>
+          </div>
+        </div>
+
+        <div class="top-actions">
+          <!-- Date Range -->
+          <select id="rangeSelect" aria-label="Time range">
+            <option value="7">Last 7 days</option>
+            <option value="30">Last 30 days</option>
+            <option value="60" selected>Last 60 days</option>
+            <option value="90">Last 90 days</option>
+          </select>
+
+          <!-- Auto Refresh -->
+          <button id="autoBtn" class="small" type="button" title="Toggle 60s auto refresh">
+            <span>Auto</span>
+            <span id="countdownLabel" style="font-family:var(--font-mono);font-size:11px;opacity:0.85"></span>
+          </button>
+
+          <button id="refreshBtn" class="small" type="button" title="Reload telemetry">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.5 2v6h-6M2.5 22v-6h6M2 11.5a10 10 0 0 1 18.8-4.3M22 12.5a10 10 0 0 1-18.8 4.2"/></svg>
+            <span>Refresh</span>
+          </button>
+
+          <button id="demoBtn" class="small" type="button" title="Toggle simulated demo telemetry">Demo</button>
+
+          <!-- Auth Token Trigger & Popover -->
+          <button id="tokenBtn" class="small" type="button" title="Configure admin token">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21 2-2 2m-6 6 7.5 7.5a2.12 2.12 0 0 1-3 3L10 13m0 0L3 20l-1-1 7-7m1-1 4-4"/></svg>
+            <span id="tokenBtnLabel">Token</span>
+          </button>
+
+          <div class="token-popover" id="tokenPopover">
+            <div class="token-popover-title">Telemetry Authorization</div>
+            <div class="token-popover-sub">Enter the <code>METRICS_ADMIN_TOKEN</code> configured on the server.</div>
+            <div style="display:flex;flex-direction:column;gap:10px;">
+              <input id="tokenInput" class="mono" type="password" placeholder="Bearer token" style="width:100%;" />
+              <div style="display:flex;align-items:center;justify-content:space-between;">
+                <label style="font-size:11.5px;color:var(--muted);display:inline-flex;align-items:center;gap:6px;cursor:pointer;">
+                  <input type="checkbox" id="rememberBox" checked />
+                  <span>Remember token</span>
+                </label>
+                <button id="toggleTokenBtn" class="small" type="button">Show</button>
+              </div>
+              <div style="display:flex;gap:8px;margin-top:4px;">
+                <button id="saveTokenBtn" class="primary small" type="button" style="flex:1;">Save &amp; Connect</button>
+                <button id="clearTokenBtn" class="small" type="button">Clear</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Theme Toggle -->
+          <button id="themeBtn" class="small" type="button" title="Toggle dark/light theme" aria-label="Toggle theme">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>
+          </button>
+        </div>
       </div>
-      <div class="toolbar">
-        <input id="token" type="password" placeholder="Admin token" autocomplete="off" spellcheck="false" aria-label="Admin token" />
-        <button id="showToken" class="ghost small" type="button">Show</button>
-        <label><input type="checkbox" id="remember" /> Remember on this device</label>
-        <select id="range" aria-label="Date range">
-          <option value="30">Last 30 days</option>
-          <option value="60" selected>Last 60 days</option>
-          <option value="90">Last 90 days</option>
-        </select>
-        <button id="refresh" type="button">Refresh</button>
-        <label><input type="checkbox" id="auto" /> Auto <span id="countdown" class="count"></span></label>
+    </header>
+
+    <!-- Content Root -->
+    <main class="container" id="mainContainer">
+      <div id="root">
+        <div style="padding:64px 0;text-align:center;color:var(--muted);font-family:var(--font-mono);font-size:12px;">
+          Connecting to backend telemetry…
+        </div>
       </div>
-      <div id="root"></div>
-    </div>
+    </main>
+
     <script>
-      const STORAGE_KEY = "metricsAdminToken";
-      const RANGE_KEY = "metricsRange";
-      const AUTO_KEY = "metricsAuto";
+      "use strict";
+
+      /* =====================================================================
+       * Xtra Backend Ops — Precision Operations Cockpit
+       * Consumes GET /v1/metrics/stats?days=N (Bearer token)
+       * Shortcuts: R (refresh) · D (demo) · T (theme) · / (token) · 1-4 (range)
+       * ===================================================================== */
+
+      const KV = {
+        token: "opsV2Token",
+        range: "opsV2Range",
+        auto: "opsV2Auto",
+        theme: "opsV2Theme",
+      };
       const AUTO_MS = 60_000;
+      const ROUTE_STATS = "/v1/metrics/stats";
+
       const root = document.getElementById("root");
-      const tokenInput = document.getElementById("token");
-      const rememberBox = document.getElementById("remember");
-      const rangeSelect = document.getElementById("range");
-      const autoBox = document.getElementById("auto");
-      const countdownEl = document.getElementById("countdown");
-      const statusEl = document.getElementById("status");
-      const statusText = document.getElementById("statusText");
-      let autoTimer = null;
-      let countdownTimer = null;
-      let nextRefreshAt = 0;
-      let lastData = null;
+      const tokenBtn = document.getElementById("tokenBtn");
+      const tokenBtnLabel = document.getElementById("tokenBtnLabel");
+      const tokenPopover = document.getElementById("tokenPopover");
+      const tokenInput = document.getElementById("tokenInput");
+      const saveTokenBtn = document.getElementById("saveTokenBtn");
+      const clearTokenBtn = document.getElementById("clearTokenBtn");
+      const rememberBox = document.getElementById("rememberBox");
+      const toggleTokenBtn = document.getElementById("toggleTokenBtn");
+      const rangeSelect = document.getElementById("rangeSelect");
+      const autoBtn = document.getElementById("autoBtn");
+      const countdownLabel = document.getElementById("countdownLabel");
+      const refreshBtn = document.getElementById("refreshBtn");
+      const demoBtn = document.getElementById("demoBtn");
+      const themeBtn = document.getElementById("themeBtn");
+      const statusPill = document.getElementById("statusPill");
+      const statusLabel = document.getElementById("statusLabel");
 
-      const persistent = {
+      const storage = {
         get(k) { try { return window.localStorage.getItem(k); } catch { return null; } },
-        set(k, v) { try { window.localStorage.setItem(k, v); } catch { /* private mode */ } },
-        del(k) { try { window.localStorage.removeItem(k); } catch { /* private mode */ } },
-      };
-      const ephemeral = {
-        get(k) { try { return window.sessionStorage.getItem(k); } catch { return null; } },
-        set(k, v) { try { window.sessionStorage.setItem(k, v); } catch { /* private mode */ } },
-        del(k) { try { window.sessionStorage.removeItem(k); } catch { /* private mode */ } },
+        set(k, v) { try { window.localStorage.setItem(k, v); } catch { } },
+        del(k) { try { window.localStorage.removeItem(k); } catch { } },
       };
 
-      function setStatus(mode, text) {
-        statusEl.classList.remove("ok", "err");
-        if (mode) statusEl.classList.add(mode);
-        statusText.textContent = text;
-      }
+      const state = {
+        token: storage.get(KV.token) || window.sessionStorage.getItem(KV.token) || "",
+        auto: storage.get(KV.auto) === "1",
+        demo: false,
+        lastData: null,
+        nextAutoAt: 0,
+        autoTimer: null,
+        countdownTimer: null,
+        chartSplit: true,
+        chartTrend: true,
+        healthRange: "week",
+        countryMode: "geo",
+        retExpanded: false,
+      };
 
-      const rememberedToken = persistent.get(STORAGE_KEY);
-      const savedToken = rememberedToken || ephemeral.get(STORAGE_KEY) || "";
-      if (savedToken) {
-        tokenInput.value = savedToken;
-        rememberBox.checked = Boolean(rememberedToken);
+      /* ================= Theme ================= */
+      function applyTheme(mode) {
+        const isDark = mode === "dark" || (mode === "auto" && window.matchMedia("(prefers-color-scheme: dark)").matches);
+        document.documentElement.dataset.theme = isDark ? "dark" : "light";
+        storage.set(KV.theme, mode);
       }
-      rangeSelect.value = persistent.get(RANGE_KEY) || ephemeral.get(RANGE_KEY) || "60";
-      if (!["30", "60", "90"].includes(rangeSelect.value)) rangeSelect.value = "60";
-      rangeSelect.addEventListener("change", () => {
-        persistent.set(RANGE_KEY, rangeSelect.value);
+      function toggleTheme() {
+        const cur = storage.get(KV.theme) || "dark";
+        applyTheme(cur === "dark" ? "light" : "dark");
+      }
+      themeBtn.addEventListener("click", toggleTheme);
+      applyTheme(storage.get(KV.theme) || "dark");
+
+      /* ================= Token Popover & Storage ================= */
+      rememberBox.checked = Boolean(storage.get(KV.token));
+      function updateTokenButton() {
+        if (state.token) {
+          const tail = state.token.length > 4 ? state.token.slice(-4) : "••••";
+          tokenBtnLabel.textContent = `Token: ••••${tail}`;
+          tokenBtn.classList.add("active");
+        } else {
+          tokenBtnLabel.textContent = "Token";
+          tokenBtn.classList.remove("active");
+        }
+      }
+      updateTokenButton();
+
+      tokenBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const isOpen = tokenPopover.classList.toggle("open");
+        if (isOpen) {
+          tokenInput.value = state.token;
+          tokenInput.focus();
+          tokenInput.select();
+        }
+      });
+
+      document.addEventListener("click", (e) => {
+        if (!tokenPopover.contains(e.target) && e.target !== tokenBtn) {
+          tokenPopover.classList.remove("open");
+        }
+      });
+
+      toggleTokenBtn.addEventListener("click", () => {
+        const isPw = tokenInput.type === "password";
+        tokenInput.type = isPw ? "text" : "password";
+        toggleTokenBtn.textContent = isPw ? "Hide" : "Show";
+      });
+
+      saveTokenBtn.addEventListener("click", () => {
+        state.token = tokenInput.value.trim();
+        if (rememberBox.checked) {
+          if (state.token) storage.set(KV.token, state.token);
+          else storage.del(KV.token);
+          window.sessionStorage.removeItem(KV.token);
+        } else {
+          storage.del(KV.token);
+          if (state.token) window.sessionStorage.setItem(KV.token, state.token);
+          else window.sessionStorage.removeItem(KV.token);
+        }
+        updateTokenButton();
+        tokenPopover.classList.remove("open");
         load();
       });
 
-      rememberBox.addEventListener("change", () => {
-        const t = tokenInput.value.trim();
-        if (rememberBox.checked) {
-          if (t) persistent.set(STORAGE_KEY, t);
-          ephemeral.del(STORAGE_KEY);
-        } else {
-          persistent.del(STORAGE_KEY);
-          if (t) ephemeral.set(STORAGE_KEY, t);
-        }
+      clearTokenBtn.addEventListener("click", () => {
+        state.token = "";
+        tokenInput.value = "";
+        storage.del(KV.token);
+        window.sessionStorage.removeItem(KV.token);
+        updateTokenButton();
+        tokenPopover.classList.remove("open");
+        renderWelcome();
       });
 
-      document.getElementById("refresh").addEventListener("click", load);
-      document.getElementById("showToken").addEventListener("click", (e) => {
-        const show = tokenInput.type === "password";
-        tokenInput.type = show ? "text" : "password";
-        e.target.textContent = show ? "Hide" : "Show";
+      tokenInput.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") saveTokenBtn.click();
       });
-      tokenInput.addEventListener("keydown", (e) => { if (e.key === "Enter") load(); });
+
+      const savedRange = storage.get(KV.range);
+      if (["7", "30", "60", "90"].includes(savedRange)) rangeSelect.value = savedRange;
+      rangeSelect.addEventListener("change", () => {
+        storage.set(KV.range, rangeSelect.value);
+        if (state.demo) renderDemo();
+        else load();
+      });
+
+      refreshBtn.addEventListener("click", () => {
+        if (state.demo) renderDemo();
+        else load();
+      });
+
+      demoBtn.addEventListener("click", () => {
+        state.demo = !state.demo;
+        demoBtn.classList.toggle("active", state.demo);
+        if (state.demo) renderDemo();
+        else if (state.token) load();
+        else renderWelcome();
+      });
+
+      /* ================= Status & Auto Refresh ================= */
+      function setStatus(type, msg) {
+        statusPill.className = "status-pill " + type;
+        statusLabel.textContent = msg;
+      }
+
+      function updateCountdown() {
+        if (!state.auto) {
+          countdownLabel.textContent = "";
+          return;
+        }
+        const remain = Math.max(0, Math.round((state.nextAutoAt - Date.now()) / 1000));
+        countdownLabel.textContent = remain > 0 ? `(${remain}s)` : "";
+      }
 
       function startAuto() {
         stopAuto();
-        nextRefreshAt = Date.now() + AUTO_MS;
-        autoTimer = setInterval(load, AUTO_MS);
-        countdownTimer = setInterval(() => {
-          const s = Math.max(0, Math.round((nextRefreshAt - Date.now()) / 1000));
-          countdownEl.textContent = autoBox.checked ? (s > 0 ? "(" + s + "s)" : "") : "";
-          if (s <= 0) nextRefreshAt = Date.now() + AUTO_MS;
-        }, 1000);
+        state.nextAutoAt = Date.now() + AUTO_MS;
+        autoBtn.classList.add("active");
+        state.autoTimer = setInterval(() => {
+          if (document.hidden) return;
+          if (state.demo) renderDemo();
+          else load();
+          state.nextAutoAt = Date.now() + AUTO_MS;
+        }, AUTO_MS);
+        state.countdownTimer = setInterval(updateCountdown, 1000);
+        updateCountdown();
       }
+
       function stopAuto() {
-        if (autoTimer) clearInterval(autoTimer);
-        if (countdownTimer) clearInterval(countdownTimer);
-        autoTimer = null; countdownTimer = null;
-        countdownEl.textContent = "";
+        if (state.autoTimer) clearInterval(state.autoTimer);
+        if (state.countdownTimer) clearInterval(state.countdownTimer);
+        state.autoTimer = null;
+        state.countdownTimer = null;
+        autoBtn.classList.remove("active");
+        countdownLabel.textContent = "";
       }
-      autoBox.addEventListener("change", () => {
-        if (autoBox.checked) persistent.set(AUTO_KEY, "1");
-        else persistent.del(AUTO_KEY);
-        ephemeral.del(AUTO_KEY);
-        if (autoBox.checked) { startAuto(); load(); }
+
+      autoBtn.addEventListener("click", () => {
+        state.auto = !state.auto;
+        storage.set(KV.auto, state.auto ? "1" : "0");
+        if (state.auto) startAuto();
         else stopAuto();
       });
-      if (persistent.get(AUTO_KEY) || ephemeral.get(AUTO_KEY)) {
-        autoBox.checked = true;
-        startAuto();
+
+      if (state.auto) startAuto();
+
+      /* ================= Formatting ================= */
+      function escapeHtml(s) {
+        return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
       }
+      function fmt(n) { return typeof n === "number" ? n.toLocaleString("en-US") : "—"; }
 
-      async function load() {
-        const token = tokenInput.value.trim();
-        if (!token) {
-          setStatus("", "enter token to load");
-          renderEmpty();
-          return;
-        }
-        if (rememberBox.checked) {
-          persistent.set(STORAGE_KEY, token);
-          ephemeral.del(STORAGE_KEY);
-        } else {
-          persistent.del(STORAGE_KEY);
-          ephemeral.set(STORAGE_KEY, token);
-        }
-        if (!lastData) root.innerHTML = '<div class="sk"></div><div class="sk"></div>';
-        setStatus("", "loading…");
-        try {
-          const res = await fetch("/v1/metrics/stats?days=" + encodeURIComponent(rangeSelect.value), {
-            headers: { Authorization: "Bearer " + token },
-          });
-          if (res.status === 401) throw new Error("Invalid admin token");
-          if (res.status === 404) throw new Error("Stats endpoint is not enabled on the server");
-          if (!res.ok) throw new Error("HTTP " + res.status);
-          const data = await res.json();
-          lastData = data;
-          if (autoBox.checked) nextRefreshAt = Date.now() + AUTO_MS;
-          render(data);
-        } catch (err) {
-          setStatus("err", "error");
-          renderError(err.message || String(err));
-        }
-      }
-
-      function renderEmpty() {
-        root.innerHTML =
-          '<div class="empty"><h2>Paste your admin token to view usage</h2>' +
-          "<p>Set <code>METRICS_ADMIN_TOKEN</code> on the backend, then paste it above and hit Refresh. " +
-          "Tick “Remember on this device” to persist via <code>localStorage</code>.</p></div>";
-      }
-
-      function renderError(message) {
-        root.innerHTML = '<div class="error">' + escapeHtml(message) + "</div>";
-      }
-
-      function delta(current, previous) {
-        if (!(previous > 0)) return "";
-        const pct = Math.round((current - previous) / previous * 100);
-        if (pct === 0) return "";
-        const cls = pct > 0 ? "up" : "down";
-        return ' <span class="' + cls + '">' + (pct > 0 ? "+" : "") + pct + "% vs yesterday</span>";
-      }
-
-      function render(d) {
-        setStatus("ok", "updated " + shortTime(d.generatedAt));
-        const series = Array.isArray(d.dauSeries) ? d.dauSeries : [];
-        const dauPrev = series.length >= 2 ? series[series.length - 2].dau : 0;
-        const last7 = series.slice(-7);
-        const avg7 = last7.length ? Math.round(last7.reduce((a, p) => a + (p.dau || 0), 0) / last7.length) : 0;
-        const peak = series.reduce((m, p) => ((p.dau || 0) > (m?.dau ?? -1) ? p : m), null);
-        const maxDau = Math.max(1, ...series.map((p) => p.dau || 0));
-        const first = series[0]?.date || "";
-        const last = series[series.length - 1]?.date || "";
-        const stick = typeof d.stickiness === "number" ? Math.round(d.stickiness * 100) : (d.mau > 0 ? Math.round(d.dauToday / d.mau * 100) : 0);
-
-        const html = [
-          '<div class="grid">',
-          card("Monthly active", fmt(d.mau), ""),
-          card("Weekly active", fmt(d.wau), ""),
-          card("Active today", fmt(d.dauToday), (d.mau > 0 ? Math.round(d.dauToday / d.mau * 100) + "% of MAU" : "") + delta(d.dauToday, dauPrev)),
-          card("New today", fmt(d.newToday), "installs today"),
-          card("Total installs", fmt(d.totalInstalls), "deduplicated"),
-          card("Accounts (MAU)", fmt(d.accountsMau), "from logins"),
-          card("Stickiness", stick + "%", "DAU ÷ MAU"),
-          card("Sessions today", fmt(d.sessionsToday ?? 0), avg7 ? "7d avg DAU " + fmt(avg7) : "reported today"),
-          "</div>",
-          d.baselineDate ? '<div class="meta" style="margin:-4px 0 12px">Installs around <b>' + escapeHtml(d.baselineDate) + "</b> include a one-time migration baseline: devices that already had the app were each counted once as a new install on their first report.</div>" : "",
-
-          '<div class="section">',
-          '<div class="section-head"><div><h2>Daily active — returning vs new (last ' + series.length + " days)</h2>",
-          '<div class="sub">' + (peak ? "peak " + escapeHtml(peak.date) + " (" + fmt(peak.dau) + ") • " : "") + "7d avg " + fmt(avg7) + "</div></div>",
-          '<div class="links"><button class="ghost small" id="csvBtn" type="button">CSV</button><button class="ghost small" id="jsonBtn" type="button">Copy JSON</button></div></div>',
-          '<div class="bar-chart">' + series.map((p) => stackBar(p, maxDau, peak)).join("") + "</div>",
-          '<div class="x-axis"><span>' + escapeHtml(first) + "</span><span>" + escapeHtml(last) + "</span></div>",
-          '<div class="legend"><span><i></i>Returning</span><span><i class="new"></i>New installs</span></div>',
-          "</div>",
-
-          '<div class="section">',
-          '<div class="section-head"><div><h2>Retention</h2><div class="sub">share of install-day cohort active N days later (last 30 days)</div></div></div>',
-          retentionTable(d.retention),
-          "</div>",
-
-          '<div class="cols">',
-          '<div class="section"><h2>Versions</h2><div class="sub">share of monthly devices</div>' + distTable((d.versions || []).map((r) => [r.version, r.count]), "versions") + "</div>",
-          '<div class="section"><h2>Android versions</h2><div class="sub">API level share</div>' + distTable((d.os || []).map((r) => [(r.label === "unknown" ? "unknown" : "API " + r.label), r.count]), "os") + "</div>",
-          '<div class="section"><h2>Device language region</h2><div class="sub">reported locale country, not geolocation</div>' + distTable((d.countries || []).map((r) => [countryLabel(r.label), r.count]), "countries") + "</div>",
-          '<div class="section"><h2>Country (approx.)</h2><div class="sub">from request IP; IP itself is never stored</div>' + distTable((d.geoCountries || []).map((r) => [countryLabel(r.label), r.count]), "geoCountries") + "</div>",
-          "</div>",
-          '<div class="section">',
-          '<div class="section-head"><div><h2>Backend health (7 days)</h2><div class="sub">per-endpoint outcomes</div></div><div>' + healthSummary(d.counters && d.counters.week) + "</div></div>",
-          healthTable(d.counters && d.counters.week),
-          "</div>",
-          '<div class="meta">Generated ' + escapeHtml(d.generatedAt) + " • month " + escapeHtml(d.currentMonth || "") + "</div>",
-        ].join("");
-        root.innerHTML = html;
-        document.getElementById("csvBtn").addEventListener("click", exportCsv);
-        document.getElementById("jsonBtn").addEventListener("click", copyJson);
-      }
-
-      function card(k, v, h) {
-        return '<div class="card"><div class="k">' + escapeHtml(k) + '</div><div class="v">' + escapeHtml(v) + "</div>" + (h ? '<div class="h">' + h + "</div>" : "") + "</div>";
-      }
-
-      function stackBar(p, maxDau, peak) {
-        const dau = p.dau || 0;
-        const total = Math.max(2, Math.round(dau / maxDau * 100));
-        const newPct = dau > 0 ? Math.min(100, Math.max(0, Math.round((p.new || 0) / dau * 100))) : 0;
-        const isPeak = peak && p.date === peak.date && dau > 0;
-        return '<div class="bar' + (isPeak ? " peak" : "") + '" title="' + escapeHtml(p.date) + ": " + dau + " active (" + (p.returning || 0) + " returning, " + (p.new || 0) + ' new)" style="height:' + total + '%">' +
-          (newPct > 0 ? '<div class="new-seg" style="height:' + newPct + '%"></div>' : "") +
-          "</div>";
-      }
-
-      const expandedSections = new Set();
-      const regionNames = typeof Intl !== "undefined" && Intl.DisplayNames
-        ? new Intl.DisplayNames(["en"], { type: "region" })
-        : null;
+      let regionNames = null;
+      try {
+        if (window.Intl && Intl.DisplayNames) regionNames = new Intl.DisplayNames(["en"], { type: "region" });
+      } catch { }
 
       function countryLabel(code) {
-        if (!code || code === "unknown") return "unknown";
+        if (!code || code === "unknown") return "Unknown";
         const upper = String(code).trim().toUpperCase();
         if (regionNames && /^[A-Z]{2}$/.test(upper)) {
           try {
             const name = regionNames.of(upper);
-            if (name && name.toUpperCase() !== upper) {
-              return name + " (" + upper + ")";
-            }
-          } catch {
-            // Fallback to code
-          }
+            if (name && name.toUpperCase() !== upper) return name + " (" + upper + ")";
+          } catch { }
         }
         return code;
       }
 
-      window.toggleDistRows = function(btn) {
-        const key = btn.getAttribute("data-key");
-        const section = btn.closest(".section");
-        if (!section) return;
-        const extraRows = section.querySelectorAll("tr.dist-extra");
-        if (!extraRows.length) return;
-        const isHidden = extraRows[0].style.display === "none";
-        extraRows.forEach((r) => { r.style.display = isHidden ? "" : "none"; });
-        if (key) {
-          if (isHidden) expandedSections.add(key);
-          else expandedSections.delete(key);
-        }
-        const count = btn.getAttribute("data-count");
-        btn.textContent = isHidden ? "Show less" : "+" + count + " more (show all)";
-      };
-
-      function distTable(rows, key = "", limit = 8) {
-        if (!rows || rows.length === 0) return '<p style="color:var(--muted)">No data yet.</p>';
-        const total = rows.reduce((a, r) => a + (r[1] || 0), 0) || 1;
-        const hasExtra = rows.length > limit;
-        const isExpanded = Boolean(key && expandedSections.has(key));
-        let out = '<table><thead><tr><th>Label</th><th class="num">Devices</th><th class="num">Share</th></tr></thead><tbody>' +
-          rows.map((r, i) => {
-            const pct = Math.round((r[1] || 0) / total * 100);
-            const isExtra = i >= limit;
-            const trAttrs = isExtra ? ' class="dist-extra"' + (isExpanded ? '' : ' style="display:none"') : '';
-            return '<tr' + trAttrs + '><td>' + escapeHtml(String(r[0])) + '<div class="share"><div style="width:' + pct + '%"></div></div></td><td class="num">' + fmt(r[1]) + '</td><td class="num">' + pct + "%</td></tr>";
-          }).join("") + "</tbody></table>";
-        if (hasExtra) {
-          const count = rows.length - limit;
-          out += '<div class="meta" style="margin-top:8px"><button class="ghost small" type="button" data-key="' + escapeHtml(key) + '" data-count="' + count + '" onclick="toggleDistRows(this)">' +
-            (isExpanded ? "Show less" : "+" + count + " more (show all)") +
-            '</button></div>';
-        }
-        return out;
+      function dayLabel(iso, full = false) {
+        try {
+          if (full) {
+            return new Date(iso + "T00:00:00Z").toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric", timeZone: "UTC" });
+          }
+          return new Date(iso + "T00:00:00Z").toLocaleDateString(undefined, { month: "short", day: "numeric", timeZone: "UTC" });
+        } catch { return iso; }
       }
 
-      function retentionTable(rows) {
-        if (!rows || rows.length === 0) return '<p style="color:var(--muted)">No install cohorts yet.</p>';
-        const avg = (key) => {
-          const vals = rows.map((r) => r[key]).filter((v) => typeof v === "number");
-          if (vals.length === 0) return "—";
-          return Math.round(vals.reduce((a, b) => a + b, 0) / vals.length * 10) / 10 + "%";
-        };
-        const body = rows.slice().reverse().map((r) => {
-          const cell = (v) => (typeof v === "number" ? v + "%" : "—");
-          return "<tr><td>" + escapeHtml(r.date) + '</td><td class="num">' + fmt(r.size) +
-            '</td><td class="num">' + cell(r.d1) + '</td><td class="num">' + cell(r.d7) +
-            '</td><td class="num">' + cell(r.d30) + "</td></tr>";
-        }).join("");
-        return '<table><thead><tr><th>Cohort</th><th class="num">Devices</th><th class="num">Day 1</th><th class="num">Day 7</th><th class="num">Day 30</th></tr></thead><tbody>' +
-          body + "</tbody></table>" +
-          '<div class="meta">Average: day 1 ' + avg("d1") + " • day 7 " + avg("d7") + " • day 30 " + avg("d30") + "</div>";
-      }
-
-      function healthSummary(week) {
-        const endpoints = (week && week.endpoints) || {};
-        let total = 0, bad = 0;
-        for (const e of Object.values(endpoints)) {
-          total += (e.ok || 0) + (e.r4 || 0) + (e.r5 || 0) + (e.limited || 0) + (e.hmac || 0);
-          bad += (e.r5 || 0);
+      /* ================= Data Loading ================= */
+      async function load() {
+        if (!state.token) {
+          setStatus("", "Enter token");
+          renderWelcome();
+          return;
         }
-        if (!total) return '<span class="pill">no traffic</span>';
-        if (bad > 0) return '<span class="pill bad">' + bad + " × 5xx</span>";
-        return '<span class="pill ok">' + fmt(total) + " req • ok</span>";
+        setStatus("busy", "Updating…");
+        try {
+          const res = await fetch(ROUTE_STATS + "?days=" + encodeURIComponent(rangeSelect.value), {
+            headers: { Authorization: "Bearer " + state.token },
+          });
+          if (res.status === 401) throw new Error("Invalid admin token (401)");
+          if (res.status === 404) throw new Error("Stats endpoint not active on server");
+          if (!res.ok) throw new Error("HTTP " + res.status);
+          const data = await res.json();
+          state.lastData = data;
+          state.nextAutoAt = Date.now() + AUTO_MS;
+          setStatus("ok", "Live · " + new Date(data.generatedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
+          render(data);
+        } catch (err) {
+          setStatus("err", "Error");
+          renderError(err.message || String(err));
+        }
       }
 
-      function healthTable(week) {
-        const endpoints = (week && week.endpoints) || {};
-        const names = Object.keys(endpoints).sort();
-        if (names.length === 0) return '<p style="color:var(--muted)">No request data yet.</p>';
-        const rows = names.map((name) => {
-          const e = endpoints[name] || {};
-          const ok = e.ok || 0;
-          const r4 = e.r4 || 0;
-          const r5 = e.r5 || 0;
-          const limited = e.limited || 0;
-          const hmac = e.hmac || 0;
-          const total = ok + r4 + r5 + limited + hmac;
-          const errRate = total > 0 ? Math.round((r4 + r5) / total * 100) : 0;
-          const pill = r5 > 0 ? "bad" : (errRate >= 10 || limited > 0 ? "warn" : "ok");
-          const parts = [];
-          if (r4) parts.push("4xx " + r4);
-          if (r5) parts.push("5xx " + r5);
-          if (limited) parts.push("limited " + limited);
-          if (hmac) parts.push("hmac " + hmac);
-          return "<tr><td>" + escapeHtml(name === "OTHER / 404" ? "Other (bots/scanners)" : name) + ' <span class="pill ' + pill + '">' + errRate + '%</span></td><td class="num">' + fmt(total) + '</td><td class="num">' + fmt(ok) + '</td><td class="num">' + errRate + '%</td><td>' + escapeHtml(parts.join(" • ") || "—") + "</td></tr>";
+      /* ================= Renderers ================= */
+      function renderWelcome() {
+        setStatus("", "Enter token");
+        root.innerHTML = `
+          <div style="max-width:520px;margin:80px auto;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-panel);padding:32px;text-align:center;">
+            <div style="font-size:16px;font-weight:600;margin-bottom:8px;">Xtra Backend Operations</div>
+            <p style="color:var(--muted);font-size:12.5px;margin:0 0 24px;line-height:1.6;">
+              Configure your <code>METRICS_ADMIN_TOKEN</code> to stream live fleet telemetry, or launch the demo cockpit with simulated metrics.
+            </p>
+            <div style="display:flex;gap:12px;justify-content:center;">
+              <button class="primary" type="button" onclick="tokenBtn.click()">Configure Token</button>
+              <button type="button" onclick="demoBtn.click()">Try Demo Mode</button>
+            </div>
+          </div>
+        `;
+      }
+
+      function renderError(msg) {
+        root.innerHTML = `
+          <div class="callout red" style="margin:40px auto;max-width:560px;">
+            <div style="font-weight:500;">Connection Failed</div>
+            <div style="margin-top:2px;">${escapeHtml(msg)}</div>
+          </div>
+        `;
+      }
+
+      function deltaBadge(pct, ref) {
+        if (pct === null || pct === undefined || isNaN(pct) || pct === 0) return "";
+        const up = pct > 0;
+        return `<span class="delta ${up ? 'up' : 'down'}">${up ? '+' : ''}${pct}% ${ref || 'vs yesterday'}</span>`;
+      }
+
+      function render(d) {
+        const series = Array.isArray(d.dauSeries) ? d.dauSeries : [];
+        const last = series[series.length - 1] || { dau: 0, new: 0 };
+        const prev = series.length >= 2 ? series[series.length - 2] : null;
+        const window7 = series.slice(-7);
+        const avg7 = window7.length ? Math.round(window7.reduce((a, p) => a + (p.dau || 0), 0) / window7.length) : 0;
+        const peak = series.reduce((m, p) => ((p.dau || 0) > (m?.dau ?? -1) ? p : m), null);
+        const stick = typeof d.stickiness === "number"
+          ? Math.round(d.stickiness * 100)
+          : (d.mau > 0 ? Math.round((d.dauToday / d.mau) * 100) : 0);
+
+        const dauDelta = prev && prev.dau > 0 ? Math.round(((d.dauToday - prev.dau) / prev.dau) * 100) : null;
+        const newDelta = prev && prev.new > 0 ? Math.round(((d.newToday - prev.new) / prev.new) * 100) : null;
+
+        const activeCounters = (d.counters && d.counters[state.healthRange] && d.counters[state.healthRange].endpoints) || {};
+        let totalReqs = 0, total5xx = 0;
+        for (const e of Object.values(activeCounters)) {
+          totalReqs += (e.ok || 0) + (e.r4 || 0) + (e.r5 || 0) + (e.limited || 0) + (e.hmac || 0);
+          total5xx += e.r5 || 0;
+        }
+
+        const baselineNotice = d.baselineDate ? `
+          <div class="callout info">
+            <span style="font-weight:500;color:var(--fg);">Migration Baseline:</span>
+            <span>Installs recorded around <b>${escapeHtml(d.baselineDate)}</b> include legacy clients grandfathered into telemetry on their first post-migration ping.</span>
+          </div>
+        ` : "";
+
+        const html = `
+          ${baselineNotice}
+
+          <!-- Row 1: Primary Activity KPIs (4 columns) -->
+          <div class="kpi-grid">
+            <div class="kpi-card">
+              <div class="kpi-label">
+                <span>Active today (DAU)</span>
+                ${deltaBadge(dauDelta)}
+              </div>
+              <div class="kpi-val">${fmt(d.dauToday)}</div>
+              <div class="kpi-foot">
+                <span>${d.mau > 0 ? Math.round((d.dauToday / d.mau) * 100) + '% of MAU' : 'Daily active'}</span>
+                <span>·</span>
+                <span>7d avg: <b>${fmt(avg7)}</b></span>
+              </div>
+            </div>
+
+            <div class="kpi-card">
+              <div class="kpi-label">
+                <span>New installs today</span>
+                ${deltaBadge(newDelta)}
+              </div>
+              <div class="kpi-val">${fmt(d.newToday)}</div>
+              <div class="kpi-foot">
+                <span>First telemetry pings today</span>
+              </div>
+            </div>
+
+            <div class="kpi-card">
+              <div class="kpi-label">
+                <span>Weekly active (WAU)</span>
+              </div>
+              <div class="kpi-val">${fmt(d.wau)}</div>
+              <div class="kpi-foot">
+                <span>Trailing 7 days deduplicated</span>
+              </div>
+            </div>
+
+            <div class="kpi-card">
+              <div class="kpi-label">
+                <span>Monthly active (MAU)</span>
+              </div>
+              <div class="kpi-val">${fmt(d.mau)}</div>
+              <div class="kpi-foot">
+                <span>Unique devices in ${escapeHtml(d.currentMonth || 'current period')}</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Row 2: Secondary Diagnostics KPIs (4 columns) -->
+          <div class="kpi-grid">
+            <div class="kpi-card">
+              <div class="kpi-label">Total installs</div>
+              <div class="kpi-val secondary">${fmt(d.totalInstalls)}</div>
+              <div class="kpi-foot">Deduplicated client devices</div>
+            </div>
+
+            <div class="kpi-card">
+              <div class="kpi-label">Active Kick accounts</div>
+              <div class="kpi-val secondary">${fmt(d.accountsMau)}</div>
+              <div class="kpi-foot">Authenticated logins MAU</div>
+            </div>
+
+            <div class="kpi-card">
+              <div class="kpi-label">Sessions today</div>
+              <div class="kpi-val secondary">${fmt(d.sessionsToday ?? 0)}</div>
+              <div class="kpi-foot">${d.dauToday > 0 && d.sessionsToday > 0 ? (d.sessionsToday / d.dauToday).toFixed(1) + ' sessions / active device' : 'Reported launches'}</div>
+            </div>
+
+            <div class="kpi-card">
+              <div class="kpi-label">Fleet stickiness</div>
+              <div class="kpi-val secondary">${stick}%</div>
+              <div class="kpi-foot">DAU to MAU ratio</div>
+            </div>
+          </div>
+
+          <!-- Hero Chart Panel -->
+          <div class="panel" style="margin-top:16px;">
+            <div class="panel-header">
+              <div>
+                <h2 class="panel-title">Daily Active Devices</h2>
+                <div class="panel-sub">
+                  Returning devices vs new installs
+                  ${peak ? ` · Peak: <b>${dayLabel(peak.date)} (${fmt(peak.dau)})</b>` : ''}
+                </div>
+              </div>
+              <div style="display:flex;align-items:center;gap:8px;">
+                <button class="small ${state.chartSplit ? 'active' : ''}" id="splitBtn" type="button">Stacked</button>
+                <button class="small ${state.chartTrend ? 'active' : ''}" id="trendBtn" type="button">7d Trend</button>
+                <button class="small" id="csvExportBtn" type="button">CSV</button>
+                <button class="small" id="jsonCopyBtn" type="button">JSON</button>
+              </div>
+            </div>
+            <div class="panel-body">
+              <div class="chart-wrap" id="chartWrap">
+                <svg id="mainChart" role="img" aria-label="Daily active devices"></svg>
+                <div class="tooltip" id="chartTip"></div>
+              </div>
+              <div class="chart-meta-bar" id="chartMetaBar"></div>
+              <div style="display:flex;justify-content:center;margin-top:16px;">
+                <div class="chart-legend">
+                  <span class="legend-item"><span class="legend-swatch" style="background:var(--bar-ret)"></span>Returning</span>
+                  <span class="legend-item"><span class="legend-swatch" style="background:var(--accent)"></span>New installs</span>
+                  <span class="legend-item"><span class="legend-swatch" style="background:var(--trend)"></span>7-day trend</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Dual Column Ops Matrix -->
+          <div class="grid-split">
+            <!-- Left: API & Backend Health -->
+            <div class="panel">
+              <div class="panel-header">
+                <div>
+                  <h2 class="panel-title">Backend API Health</h2>
+                  <div class="panel-sub">${state.healthRange === 'today' ? 'Today (UTC)' : 'Trailing 7 days'} endpoint telemetry</div>
+                </div>
+                <div style="display:flex;align-items:center;gap:8px;">
+                  <div style="display:inline-flex;border:1px solid var(--border);border-radius:var(--radius-control);overflow:hidden;">
+                    <button class="small ${state.healthRange === 'today' ? 'active' : ''}" id="healthTodayBtn" style="border:none;border-radius:0;">Today</button>
+                    <button class="small ${state.healthRange === 'week' ? 'active' : ''}" id="healthWeekBtn" style="border:none;border-radius:0;border-left:1px solid var(--border);">7 Days</button>
+                  </div>
+                  <div>
+                    ${total5xx > 0
+                      ? `<span class="pill bad">${total5xx} × 5xx</span>`
+                      : `<span class="pill ok">Zero 5xx</span>`}
+                  </div>
+                </div>
+              </div>
+              <div class="panel-body">
+                ${renderEndpointHealthTable(d)}
+                <div style="margin-top:20px;">
+                  <div style="font-size:12px;font-weight:500;color:var(--fg-dim);margin-bottom:8px;">Key telemetry counters</div>
+                  ${renderDiagCounters(d)}
+                </div>
+              </div>
+            </div>
+
+            <!-- Right: Client Demographics -->
+            <div class="panel">
+              <div class="panel-header">
+                <div>
+                  <h2 class="panel-title">Client Demographics</h2>
+                  <div class="panel-sub">App versions, Android levels, and geographic distribution</div>
+                </div>
+                <div style="display:inline-flex;border:1px solid var(--border);border-radius:var(--radius-control);overflow:hidden;">
+                  <button class="small ${state.countryMode === 'geo' ? 'active' : ''}" id="countryGeoBtn" style="border:none;border-radius:0;">Geo-IP</button>
+                  <button class="small ${state.countryMode === 'locale' ? 'active' : ''}" id="countryLocaleBtn" style="border:none;border-radius:0;border-left:1px solid var(--border);">Locale</button>
+                </div>
+              </div>
+              <div class="panel-body">
+                ${renderDistTabs(d)}
+              </div>
+            </div>
+          </div>
+
+          <!-- Cohort Retention Matrix (High Craft Grid) -->
+          <div class="panel" style="margin-top:16px;">
+            <div class="panel-header">
+              <div>
+                <h2 class="panel-title">Cohort Retention Matrix</h2>
+                <div class="panel-sub">Percentage of install cohort active 1, 7, and 30 days later</div>
+              </div>
+              <div style="display:flex;align-items:center;gap:12px;font-size:11px;font-family:var(--font-mono);color:var(--muted);">
+                <span>Scale:</span>
+                <span class="heat-box lvl-0" style="min-width:32px;height:20px;font-size:10px;">0%</span>
+                <span class="heat-box lvl-1" style="min-width:32px;height:20px;font-size:10px;">15%</span>
+                <span class="heat-box lvl-2" style="min-width:32px;height:20px;font-size:10px;">30%</span>
+                <span class="heat-box lvl-3" style="min-width:32px;height:20px;font-size:10px;">45%</span>
+                <span class="heat-box lvl-4" style="min-width:32px;height:20px;font-size:10px;">60%+</span>
+              </div>
+            </div>
+            <div class="panel-body" style="padding-top:12px;">
+              ${renderRetentionMatrix(d.retention)}
+            </div>
+          </div>
+
+          <!-- Cockpit Footer -->
+          <footer style="margin-top:32px;padding-top:16px;border-top:1px solid var(--border-subtle);display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;font-size:11.5px;color:var(--muted);font-family:var(--font-mono);">
+            <div>
+              <span>Generated: ${escapeHtml(d.generatedAt || '—')}</span>
+              <span style="margin:0 6px;">·</span>
+              <span>Telemetry period ${escapeHtml(d.currentMonth || '—')}</span>
+            </div>
+            <div>
+              <span><kbd>R</kbd> refresh · <kbd>D</kbd> demo · <kbd>T</kbd> theme · <kbd>/</kbd> token · <kbd>1-4</kbd> range</span>
+            </div>
+          </footer>
+        `;
+
+        root.innerHTML = html;
+        drawChart(d);
+
+        // Chart toggles
+        const splitBtn = document.getElementById("splitBtn");
+        splitBtn?.addEventListener("click", () => {
+          state.chartSplit = !state.chartSplit;
+          splitBtn.classList.toggle("active", state.chartSplit);
+          drawChart(d);
         });
-        const oauth = (week && week.oauth) || {};
-        const pingC = (week && week.ping) || {};
-        const accountC = (week && week.account) || {};
-        return (
-          '<table><thead><tr><th>Endpoint</th><th class="num">Requests</th><th class="num">OK</th><th class="num">Err%</th><th>Breakdown</th></tr></thead><tbody>' +
-          rows.join("") + "</tbody></table>" +
-          '<div class="mini-grid">' +
-          miniChips("OAuth outcomes", oauth) +
-          miniChips("Ping outcomes", pingC) +
-          miniChips("Account capture", accountC) +
-          "</div>"
-        );
+
+        const trendBtn = document.getElementById("trendBtn");
+        trendBtn?.addEventListener("click", () => {
+          state.chartTrend = !state.chartTrend;
+          trendBtn.classList.toggle("active", state.chartTrend);
+          drawChart(d);
+        });
+
+        document.getElementById("csvExportBtn")?.addEventListener("click", exportCsv);
+        document.getElementById("jsonCopyBtn")?.addEventListener("click", copyJson);
+
+        // Health & Demographics switches
+        document.getElementById("healthTodayBtn")?.addEventListener("click", () => {
+          state.healthRange = "today";
+          render(d);
+        });
+        document.getElementById("healthWeekBtn")?.addEventListener("click", () => {
+          state.healthRange = "week";
+          render(d);
+        });
+        document.getElementById("countryGeoBtn")?.addEventListener("click", () => {
+          state.countryMode = "geo";
+          render(d);
+        });
+        document.getElementById("countryLocaleBtn")?.addEventListener("click", () => {
+          state.countryMode = "locale";
+          render(d);
+        });
+        document.getElementById("retMoreBtn")?.addEventListener("click", () => {
+          state.retExpanded = !state.retExpanded;
+          render(d);
+        });
       }
 
-      function miniChips(title, map) {
-        const entries = Object.entries(map || {}).sort((a, b) => b[1] - a[1]).slice(0, 10);
-        if (!entries.length) return '<div class="mini"><h3>' + escapeHtml(title) + '</h3><p style="color:var(--muted)">—</p></div>';
-        return '<div class="mini"><h3>' + escapeHtml(title) + '</h3><div class="chips">' +
-          entries.map(([k, n]) => '<span class="chip">' + escapeHtml(k) + " " + fmt(n) + "</span>").join("") +
-          "</div></div>";
+      /* ================= Sub-Components ================= */
+
+      function renderEndpointHealthTable(d) {
+        const counters = (d.counters && d.counters[state.healthRange]) || {};
+        const endpoints = counters.endpoints || {};
+        const entries = Object.entries(endpoints).sort((a, b) => {
+          const totalA = (a[1].ok || 0) + (a[1].r4 || 0) + (a[1].r5 || 0);
+          const totalB = (b[1].ok || 0) + (b[1].r4 || 0) + (b[1].r5 || 0);
+          return totalB - totalA;
+        });
+
+        if (!entries.length) return `<div style="color:var(--muted);font-size:12px;padding:12px 0;">No endpoint telemetry available for this period.</div>`;
+
+        return `
+          <div style="overflow-x:auto;">
+            <table>
+              <thead>
+                <tr>
+                  <th style="width:38%;">Endpoint</th>
+                  <th class="num" style="width:14%;">Requests</th>
+                  <th class="bar-cell" style="width:20%;">Error rate</th>
+                  <th style="width:28%;">Status breakdown</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${entries.map(([name, e]) => {
+                  const total = (e.ok || 0) + (e.r4 || 0) + (e.r5 || 0) + (e.limited || 0) + (e.hmac || 0);
+                  const errors = (e.r4 || 0) + (e.r5 || 0);
+                  const rate = total > 0 ? Math.round((errors / total) * 100) : 0;
+                  const statusCls = e.r5 > 0 ? 'bad' : (rate > 10 ? 'warn' : 'ok');
+                  
+                  const [method, rawPath] = name.includes(" ") ? name.split(" ") : ["GET", name];
+                  const path = rawPath.replace("/v1/", "/");
+
+                  return `
+                    <tr>
+                      <td style="white-space:nowrap;">
+                        <span class="method-tag">${escapeHtml(method)}</span>
+                        <span style="font-weight:500;font-size:12px;vertical-align:middle;">${escapeHtml(path)}</span>
+                      </td>
+                      <td class="num">${fmt(total)}</td>
+                      <td class="bar-cell">
+                        <div class="progress-bar">
+                          <div class="progress-fill ${statusCls}" style="width:${rate > 0 ? Math.max(rate, 4) : 0}%"></div>
+                        </div>
+                        <div style="font-size:10.5px;font-family:var(--font-mono);color:var(--muted);margin-top:2px;">${rate}% failure</div>
+                      </td>
+                      <td style="font-size:11px;font-family:var(--font-mono);white-space:nowrap;">
+                        <span class="tag-status ok">${fmt(e.ok || 0)} OK</span>
+                        ${e.r4 ? `<span class="tag-status warn" style="margin-left:4px;">${fmt(e.r4)} 4xx</span>` : ''}
+                        ${e.r5 ? `<span class="tag-status bad" style="margin-left:4px;">${fmt(e.r5)} 5xx</span>` : ''}
+                        ${e.limited ? `<span class="tag-status muted" style="margin-left:4px;">${fmt(e.limited)} limit</span>` : ''}
+                      </td>
+                    </tr>
+                  `;
+                }).join("")}
+              </tbody>
+            </table>
+          </div>
+        `;
+      }
+
+      function renderDiagCounters(d) {
+        const active = (d.counters && d.counters[state.healthRange]) || {};
+        const oauth = active.oauth || {};
+        const ping = active.ping || {};
+        const account = active.account || {};
+
+        return `
+          <div class="diag-grid">
+            <div class="diag-card">
+              <div class="diag-val">${fmt(oauth.exchanged || 0)}</div>
+              <div class="diag-label">OAuth exchanged</div>
+            </div>
+            <div class="diag-card">
+              <div class="diag-val">${fmt(oauth.invalid_grant || 0)}</div>
+              <div class="diag-label">Invalid grants</div>
+            </div>
+            <div class="diag-card">
+              <div class="diag-val">${fmt(ping.ok || 0)}</div>
+              <div class="diag-label">Pings accepted</div>
+            </div>
+            <div class="diag-card">
+              <div class="diag-val">${fmt(account.recorded || 0)}</div>
+              <div class="diag-label">Accounts captured</div>
+            </div>
+          </div>
+        `;
+      }
+
+      function renderDistTable(title, colName, items, total, labelFn) {
+        if (!items.length) {
+          return `<div><div style="font-size:12px;font-weight:500;color:var(--fg-dim);margin-bottom:8px;">${title}</div><div style="color:var(--muted);font-size:12px;padding:6px 0;">No data.</div></div>`;
+        }
+        return `
+          <div>
+            <div style="font-size:12px;font-weight:500;color:var(--fg-dim);margin-bottom:8px;">${title}</div>
+            <table>
+              <thead>
+                <tr>
+                  <th style="padding:4px 6px;">${colName}</th>
+                  <th class="num" style="padding:4px 6px;">Devices</th>
+                  <th style="padding:4px 6px;width:64px;"></th>
+                  <th class="num" style="padding:4px 6px;width:30px;">Share</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${items.map((item, idx) => {
+                  const pct = Math.round((item.count / total) * 100);
+                  const barColor = idx === 0 ? 'var(--accent)' : 'var(--bar-ret)';
+                  return `
+                    <tr>
+                      <td style="font-family:var(--font-mono);font-size:12px;padding:4px 6px;">${escapeHtml(labelFn(item))}</td>
+                      <td class="num" style="padding:4px 6px;">${fmt(item.count)}</td>
+                      <td style="width:64px;padding:4px 6px;">
+                        <div class="progress-bar">
+                          <div class="progress-fill" style="width:${pct}%;background:${barColor}"></div>
+                        </div>
+                      </td>
+                      <td class="num" style="font-size:11px;color:var(--muted);width:30px;padding:4px 6px;">${pct}%</td>
+                    </tr>
+                  `;
+                }).join("")}
+              </tbody>
+            </table>
+          </div>
+        `;
+      }
+
+      function renderDistTabs(d) {
+        const versions = (d.versions || []).slice(0, 6);
+        const os = (d.os || []).slice(0, 6);
+        const countryList = state.countryMode === "locale" ? (d.countries || []) : (d.geoCountries || d.countries || []);
+        const countries = countryList.slice(0, 8);
+
+        const totalV = versions.reduce((a, b) => a + (b.count || 0), 0) || 1;
+        const totalO = os.reduce((a, b) => a + (b.count || 0), 0) || 1;
+        const totalC = countries.reduce((a, b) => a + (b.count || 0), 0) || 1;
+
+        return `
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
+            ${renderDistTable("App versions", "Version", versions, totalV, v => "v" + v.version)}
+            ${renderDistTable("Android versions", "API Level", os, totalO, o => o.label === "unknown" ? "unknown" : "API " + o.label)}
+          </div>
+
+          <div style="margin-top:16px;padding-top:12px;border-top:1px solid var(--border-subtle);">
+            <div style="font-size:12px;font-weight:500;color:var(--fg-dim);margin-bottom:8px;">
+              ${state.countryMode === 'locale' ? 'Device language locale' : 'Approximate geography (IP)'}
+            </div>
+            ${countries.length ? `
+              <div class="geo-grid">
+                ${countries.map((c, idx) => {
+                  const pct = Math.round((c.count / totalC) * 100);
+                  const barColor = idx === 0 ? 'var(--accent)' : 'var(--bar-ret)';
+                  const upper = String(c.label).trim().toUpperCase();
+                  const cleanName = countryLabel(c.label).replace(/\s*\([A-Z]{2}\)$/, "");
+                  return `
+                    <div class="geo-card">
+                      <div class="geo-card-top">
+                        <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:500;">
+                          <span class="geo-code">${escapeHtml(upper)}</span>
+                          <span>${escapeHtml(cleanName)}</span>
+                        </span>
+                        <span style="font-family:var(--font-mono);font-size:11px;color:var(--muted);white-space:nowrap;margin-left:6px;">
+                          ${fmt(c.count)} <b style="color:var(--fg-dim);font-weight:500;">${pct}%</b>
+                        </span>
+                      </div>
+                      <div class="progress-bar" style="height:3px;">
+                        <div class="progress-fill" style="width:${pct}%;background:${barColor}"></div>
+                      </div>
+                    </div>
+                  `;
+                }).join("")}
+              </div>
+            ` : `<div style="color:var(--muted);font-size:12px;padding:4px 0;">No geographic data.</div>`}
+          </div>
+        `;
+      }
+
+      function renderRetentionMatrix(retention) {
+        const all = Array.isArray(retention) ? retention : [];
+        if (!all.length) return `<div style="color:var(--muted);font-size:12px;padding:12px 0;">No cohort telemetry recorded yet.</div>`;
+        const rows = (state.retExpanded ? all.slice() : all.slice(-14)).reverse();
+
+        function heatClass(val) {
+          if (val === undefined || val === null) return "empty";
+          if (val === 0) return "lvl-0";
+          if (val <= 15) return "lvl-1";
+          if (val <= 30) return "lvl-2";
+          if (val <= 45) return "lvl-3";
+          return "lvl-4";
+        }
+
+        const cellTip = (val, size) => val !== undefined
+          ? `${Math.round(size * (val / 100))} of ${fmt(size)} devices (${val}%)`
+          : "Milestone not reached yet";
+
+        const heatCell = (val, size) => `
+          <td style="text-align:center;">
+            <span class="heat-box ${heatClass(val)}" title="${escapeHtml(cellTip(val, size))}">${val !== undefined ? val + '%' : '—'}</span>
+          </td>
+        `;
+
+        // Calculate weighted averages across displayed cohorts
+        let d1Total = 0, d1Count = 0;
+        let d7Total = 0, d7Count = 0;
+        let d30Total = 0, d30Count = 0;
+        let totalSize = 0;
+
+        rows.forEach(r => {
+          totalSize += r.size || 0;
+          if (typeof r.d1 === "number") { d1Total += r.d1 * r.size; d1Count += r.size; }
+          if (typeof r.d7 === "number") { d7Total += r.d7 * r.size; d7Count += r.size; }
+          if (typeof r.d30 === "number") { d30Total += r.d30 * r.size; d30Count += r.size; }
+        });
+
+        const avgD1 = d1Count > 0 ? Math.round(d1Total / d1Count) : null;
+        const avgD7 = d7Count > 0 ? Math.round(d7Total / d7Count) : null;
+        const avgD30 = d30Count > 0 ? Math.round(d30Total / d30Count) : null;
+
+        const showMoreBtn = retention.length > 14
+          ? `<div style="margin-top:16px;text-align:center;">
+              <button class="small" type="button" id="retMoreBtn">${state.retExpanded ? "Show recent 14 cohorts" : `+ ${retention.length - 14} older cohorts`}</button>
+            </div>`
+          : "";
+
+        return `
+          <div style="overflow-x:auto;">
+            <table>
+              <thead>
+                <tr>
+                  <th style="width:22%;">Cohort date</th>
+                  <th class="num" style="width:18%;">Installs</th>
+                  <th style="text-align:center;width:20%;">Day 1</th>
+                  <th style="text-align:center;width:20%;">Day 7</th>
+                  <th style="text-align:center;width:20%;">Day 30</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${rows.map(r => `
+                  <tr>
+                    <td style="font-family:var(--font-mono);font-size:12.5px;">${escapeHtml(r.date)}</td>
+                    <td class="num">${fmt(r.size)}</td>
+                    ${heatCell(r.d1, r.size)}
+                    ${heatCell(r.d7, r.size)}
+                    ${heatCell(r.d30, r.size)}
+                  </tr>
+                `).join("")}
+              </tbody>
+              <tfoot>
+                <tr style="border-top:1px solid var(--border);background:var(--surface-subtle);font-weight:500;">
+                  <td style="font-size:11.5px;color:var(--fg-dim);padding:10px 12px;">Weighted Average</td>
+                  <td class="num" style="padding:10px 12px;">${fmt(totalSize)}</td>
+                  <td style="text-align:center;padding:10px 12px;">
+                    <span class="heat-box ${heatClass(avgD1)}" title="${avgD1 !== null ? avgD1 + '% aggregate across ' + fmt(d1Count) + ' installs' : ''}">${avgD1 !== null ? avgD1 + '%' : '—'}</span>
+                  </td>
+                  <td style="text-align:center;padding:10px 12px;">
+                    <span class="heat-box ${heatClass(avgD7)}" title="${avgD7 !== null ? avgD7 + '% aggregate across ' + fmt(d7Count) + ' installs' : ''}">${avgD7 !== null ? avgD7 + '%' : '—'}</span>
+                  </td>
+                  <td style="text-align:center;padding:10px 12px;">
+                    <span class="heat-box ${heatClass(avgD30)}" title="${avgD30 !== null ? avgD30 + '% aggregate across ' + fmt(d30Count) + ' installs' : ''}">${avgD30 !== null ? avgD30 + '%' : '—'}</span>
+                  </td>
+                </tr>
+              </tfoot>
+            </table>
+          </div>
+          ${showMoreBtn}
+        `;
+      }
+
+      /* ================= Responsive SVG Chart ================= */
+      function drawChart(d) {
+        const svgEl = document.getElementById("mainChart");
+        const wrap = document.getElementById("chartWrap");
+        if (!svgEl || !wrap) return;
+
+        const series = Array.isArray(d.dauSeries) ? d.dauSeries : [];
+        if (!series.length) {
+          svgEl.innerHTML = "";
+          svgEl.style.height = "60px";
+          return;
+        }
+
+        const width = Math.max(320, wrap.clientWidth);
+        const height = 260;
+        const padL = 40, padR = 12, padT = 16, padB = 24;
+        const plotW = width - padL - padR;
+        const plotH = height - padT - padB;
+        const yBottom = padT + plotH;
+        const n = series.length;
+        const maxVal = Math.max(1, ...series.map(p => p.dau || 0));
+        
+        // Calculate clean rounded y-axis steps
+        function niceStep(val) {
+          if (val <= 0) return 100;
+          const raw = val / 4;
+          const p = Math.pow(10, Math.floor(Math.log10(raw)));
+          const f = raw / p;
+          let nf = 10;
+          if (f <= 1.25) nf = 1;
+          else if (f <= 2.5) nf = 2;
+          else if (f <= 5) nf = 5;
+          return nf * p;
+        }
+
+        const step = niceStep(maxVal);
+        const yMax = Math.max(step * 4, Math.ceil((maxVal * 1.05) / step) * step);
+        const slot = plotW / n;
+        const barW = Math.max(2, Math.min(22, slot * 0.65));
+        const y = v => padT + plotH - (v / yMax) * plotH;
+
+        let inner = "";
+
+        // Subtle background gridlines on clean round intervals
+        const tickCount = Math.round(yMax / step);
+        for (let i = 0; i <= tickCount; i++) {
+          const gv = step * i;
+          const gy = y(gv).toFixed(1);
+          inner += `
+            <line x1="${padL}" y1="${gy}" x2="${width - padR}" y2="${gy}" stroke="var(--border-subtle)" stroke-width="1"/>
+            <text x="${padL - 8}" y="${(Number(gy) + 3.5).toFixed(1)}" text-anchor="end" font-size="10" fill="var(--muted)" font-family="var(--font-mono)">${fmt(gv)}</text>
+          `;
+        }
+
+        // SVG Bars
+        series.forEach((p, i) => {
+          const dau = p.dau || 0;
+          if (dau <= 0) return;
+          const cx = padL + slot * i + slot / 2;
+          const x0 = cx - barW / 2;
+          const totalH = (dau / yMax) * plotH;
+          const newH = state.chartSplit ? ((p.new || 0) / yMax) * plotH : 0;
+          const retH = totalH - newH;
+          const yTop = yBottom - totalH;
+          const isPeak = dau === maxVal;
+
+          const retFill = state.chartSplit ? "var(--bar-ret)" : "var(--accent)";
+          inner += `<rect id="bar-ret-${i}" x="${x0.toFixed(1)}" y="${(yTop + newH).toFixed(1)}" width="${barW.toFixed(1)}" height="${Math.max(retH, 1.5).toFixed(1)}" fill="${retFill}" rx="1"${isPeak ? ' stroke="var(--trend)" stroke-width="1.2"' : ''}/>`;
+
+          if (state.chartSplit && newH > 0.5) {
+            inner += `<rect id="bar-new-${i}" x="${x0.toFixed(1)}" y="${yTop.toFixed(1)}" width="${barW.toFixed(1)}" height="${newH.toFixed(1)}" fill="var(--accent)" rx="1"/>`;
+          }
+        });
+
+        // 7-day Trend Line (O(N) sliding window running sum, zero per-tick array allocations)
+        const trendPts = [];
+        if (state.chartTrend && n >= 4) {
+          const pts = [];
+          let runningSum = 0;
+          for (let i = 0; i < n; i++) {
+            runningSum += series[i].dau || 0;
+            if (i >= 7) runningSum -= series[i - 7].dau || 0;
+            const winLen = Math.min(i + 1, 7);
+            const avg = runningSum / winLen;
+            if (avg > 0) {
+              pts.push(`${(padL + slot * i + slot / 2).toFixed(1)},${y(avg).toFixed(1)}`);
+              trendPts[i] = y(avg);
+            }
+          }
+          if (pts.length) {
+            inner += `<polyline points="${pts.join(' ')}" fill="none" stroke="var(--trend)" stroke-width="1.8" stroke-linejoin="round" opacity="0.9"/>`;
+          }
+        }
+
+        // Interactive hover hitboxes
+        series.forEach((p, i) => {
+          inner += `<rect x="${(padL + slot * i).toFixed(1)}" y="${padT}" width="${slot.toFixed(1)}" height="${plotH}" fill="transparent" data-i="${i}"/>`;
+        });
+
+        // Crosshair line & trend intercept dot
+        inner += `<line x1="0" y1="${padT}" x2="0" y2="${yBottom}" stroke="var(--muted)" stroke-width="1" stroke-dasharray="3 3" opacity="0" id="crosshair"/>`;
+        inner += `<circle cx="0" cy="0" r="3.5" fill="var(--trend)" stroke="var(--bg)" stroke-width="1.5" opacity="0" id="crossDot"/>`;
+
+        svgEl.innerHTML = inner;
+        svgEl.setAttribute("width", width);
+        svgEl.setAttribute("height", height);
+        svgEl.setAttribute("viewBox", `0 0 ${width} ${height}`);
+        svgEl.style.height = height + "px";
+
+        // Date tick marks
+        const metaBar = document.getElementById("chartMetaBar");
+        if (metaBar) {
+          const tickIndices = n <= 7
+            ? series.map((_, idx) => idx)
+            : [0, Math.floor(n * 0.25), Math.floor(n * 0.5), Math.floor(n * 0.75), n - 1];
+          const uniqueIndices = [...new Set(tickIndices)].filter(idx => idx >= 0 && idx < n);
+          metaBar.innerHTML = uniqueIndices.map(idx => `<span>${dayLabel(series[idx].date)}</span>`).join("");
+        }
+
+        // Tooltip logic
+        const tip = document.getElementById("chartTip");
+        const cross = document.getElementById("crosshair");
+        const crossDot = document.getElementById("crossDot");
+
+        svgEl.querySelectorAll("rect[data-i]").forEach(r => {
+          r.addEventListener("mouseenter", () => {
+            const idx = Number(r.dataset.i);
+            const p = series[idx];
+            const newPct = p.dau > 0 ? Math.round(((p.new || 0) / p.dau) * 100) : 0;
+
+            tip.innerHTML = `
+              <div class="tooltip-title">${dayLabel(p.date, true)} · ${p.date}</div>
+              <div class="tooltip-row"><span>Active devices</span><b>${fmt(p.dau || 0)}</b></div>
+              <div class="tooltip-row"><span><span style="display:inline-block;width:6px;height:6px;border-radius:1px;background:var(--bar-ret);margin-right:6px;"></span>Returning</span><b>${fmt(p.returning || 0)}</b></div>
+              <div class="tooltip-row"><span><span style="display:inline-block;width:6px;height:6px;border-radius:1px;background:var(--accent);margin-right:6px;"></span>New installs</span><b>${fmt(p.new || 0)} (${newPct}%)</b></div>
+            `;
+            tip.classList.add("show");
+
+            const xPos = padL + slot * idx + slot / 2;
+            cross.setAttribute("x1", xPos);
+            cross.setAttribute("x2", xPos);
+            cross.style.opacity = "0.4";
+
+            if (trendPts[idx] !== undefined && crossDot) {
+              crossDot.setAttribute("cx", xPos);
+              crossDot.setAttribute("cy", trendPts[idx]);
+              crossDot.style.opacity = "1";
+            }
+
+            const wrapBox = wrap.getBoundingClientRect();
+            const tipW = tip.offsetWidth || 170;
+            let tx = xPos + 12;
+            if (tx + tipW > wrapBox.width - 8) tx = xPos - tipW - 12;
+            tip.style.left = Math.max(4, tx) + "px";
+            tip.style.top = Math.max(4, padT) + "px";
+          });
+
+          r.addEventListener("mouseleave", () => {
+            tip.classList.remove("show");
+            cross.style.opacity = "0";
+            if (crossDot) crossDot.style.opacity = "0";
+          });
+        });
+      }
+
+      let resizeTimer = null;
+      window.addEventListener("resize", () => {
+        clearTimeout(resizeTimer);
+        resizeTimer = setTimeout(() => {
+          if (state.lastData) drawChart(state.lastData);
+        }, 100);
+      });
+
+      /* ================= CSV & JSON Exports ================= */
+      function downloadFile(name, type, content) {
+        const blob = new Blob([content], { type });
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = name;
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 400);
       }
 
       function exportCsv() {
-        if (!lastData || !Array.isArray(lastData.dauSeries)) return;
+        const d = state.lastData;
+        if (!d || !Array.isArray(d.dauSeries)) return;
         const lines = ["date,dau,new,returning"];
-        for (const p of lastData.dauSeries) lines.push([p.date, p.dau, p.new, p.returning].join(","));
-        const blob = new Blob([lines.join("\n")], { type: "text/csv" });
-        const a = document.createElement("a");
-        a.href = URL.createObjectURL(blob);
-        a.download = "usage-" + (lastData.currentMonth || "stats") + ".csv";
-        document.body.appendChild(a);
-        a.click();
-        setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 500);
+        for (const p of d.dauSeries) lines.push(`${p.date},${p.dau},${p.new},${p.returning}`);
+        downloadFile(`xtra-dau-${d.currentMonth || 'data'}.csv`, "text/csv", lines.join("\n"));
       }
 
       async function copyJson() {
-        if (!lastData) return;
+        if (!state.lastData) return;
         try {
-          await navigator.clipboard.writeText(JSON.stringify(lastData, null, 2));
-          setStatus("ok", "copied to clipboard");
+          await navigator.clipboard.writeText(JSON.stringify(state.lastData, null, 2));
+          setStatus("ok", "JSON copied");
         } catch {
-          renderError("Clipboard blocked — use CSV instead.");
+          exportCsv();
         }
       }
 
-      function shortTime(iso) {
-        try { return new Date(iso).toLocaleTimeString(); } catch { return ""; }
+      /* ================= Demo Generator ================= */
+      function mulberry32(seed) {
+        let a = seed >>> 0;
+        return () => {
+          a |= 0; a = (a + 0x6d2b79f5) | 0;
+          let t = Math.imul(a ^ (a >>> 15), 1 | a);
+          t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+          return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+        };
       }
 
-      function fmt(n) {
-        return typeof n === "number" ? n.toLocaleString() : String(n ?? "");
+      function renderDemo() {
+        const rnd = mulberry32(0x53fc18);
+        const days = Number(rangeSelect.value);
+        const now = new Date();
+        const series = [];
+
+        for (let i = days - 1; i >= 0; i--) {
+          const d = new Date(now.getTime() - i * 86400000);
+          const dow = d.getUTCDay();
+          const trend = 950 + (days - i) * 6.5;
+          const weekly = (dow === 0 || dow === 6) ? 1.2 : dow === 5 ? 1.14 : 1.0;
+          const dau = Math.round(trend * weekly * (0.94 + rnd() * 0.12));
+          const spike = rnd() > 0.92 ? Math.round(80 + rnd() * 150) : 0;
+          const nw = Math.min(dau, Math.round(50 + rnd() * 80) + spike);
+          series.push({ date: d.toISOString().slice(0, 10), dau, new: nw, returning: dau - nw });
+        }
+
+        const last = series[series.length - 1];
+        const avg7 = Math.round(series.slice(-7).reduce((a, p) => a + p.dau, 0) / 7);
+        const mau = Math.round(avg7 * 5.4);
+
+        const demoData = {
+          generatedAt: now.toISOString(),
+          currentMonth: now.toISOString().slice(0, 7),
+          totalInstalls: 14850,
+          mau,
+          wau: Math.round(avg7 * 1.38),
+          dauToday: last.dau,
+          newToday: last.new,
+          sessionsToday: Math.round(last.dau * 2.3),
+          stickiness: Math.round((last.dau / mau) * 1000) / 1000,
+          accountsMau: Math.round(avg7 * 2.35),
+          versions: [
+            { version: "1.4.3", count: 5210 },
+            { version: "1.4.2", count: 2840 },
+            { version: "1.3.9", count: 1890 },
+            { version: "1.3.8", count: 940 },
+            { version: "1.3.5", count: 420 },
+            { version: "1.2.0", count: 110 },
+          ],
+          os: [
+            { label: "36", count: 5430 },
+            { label: "35", count: 3980 },
+            { label: "34", count: 2120 },
+            { label: "33", count: 980 },
+            { label: "32", count: 390 },
+            { label: "31", count: 140 },
+          ],
+          geoCountries: [
+            { label: "US", count: 4620 },
+            { label: "DE", count: 2190 },
+            { label: "BR", count: 1740 },
+            { label: "GB", count: 1250 },
+            { label: "FR", count: 910 },
+            { label: "TR", count: 740 },
+          ],
+          dauSeries: series,
+          retention: [
+            { date: "2026-10-25", size: 140, d1: 48, d7: 29, d30: 12 },
+            { date: "2026-10-26", size: 165, d1: 51, d7: 31, d30: 14 },
+            { date: "2026-10-27", size: 155, d1: 47, d7: 28, d30: 11 },
+            { date: "2026-10-28", size: 180, d1: 52, d7: 32, d30: 15 },
+            { date: "2026-10-29", size: 190, d1: 49, d7: 30, d30: 13 },
+            { date: "2026-10-30", size: 145, d1: 46, d7: 27, d30: 12 },
+            { date: "2026-10-31", size: 210, d1: 54, d7: 34, d30: 16 },
+            { date: "2026-11-01", size: 195, d1: 50, d7: 31, d30: 14 },
+            { date: "2026-11-02", size: 160, d1: 48, d7: 29 },
+            { date: "2026-11-03", size: 175, d1: 52, d7: 32 },
+            { date: "2026-11-04", size: 185, d1: 51, d7: 30 },
+            { date: "2026-11-05", size: 170, d1: 49 },
+            { date: "2026-11-06", size: 190, d1: 53 },
+            { date: "2026-11-07", size: 142 },
+          ],
+          counters: {
+            week: {
+              endpoints: {
+                "POST /v1/kick/oauth/exchange": { ok: 2140, r4: 42, r5: 0, limited: 8 },
+                "POST /v1/kick/oauth/refresh": { ok: 1890, r4: 18, r5: 0, limited: 2 },
+                "POST /v1/metrics/ping": { ok: 6420, r4: 31, r5: 0, limited: 14 },
+                "GET /v1/metrics/stats": { ok: 180, r4: 2, r5: 0, limited: 0 },
+                "GET /healthz": { ok: 2450, r4: 0, r5: 0, limited: 0 },
+                "POST /v1/fcm/subscribe": { ok: 340, r4: 6, r5: 0, limited: 0 },
+              },
+              oauth: { exchanged: 2140, invalid_grant: 42 },
+              ping: { ok: 6420 },
+              account: { recorded: 420 },
+            }
+          }
+        };
+
+        state.lastData = demoData;
+        setStatus("ok", "Demo mode");
+        render(demoData);
       }
 
-      function escapeHtml(s) {
-        return String(s).replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-      }
+      /* ================= Shortcuts ================= */
+      document.addEventListener("keydown", (e) => {
+        if (e.metaKey || e.ctrlKey || e.altKey) return;
+        if (e.key === "Escape") {
+          tokenPopover.classList.remove("open");
+          return;
+        }
+        if (["INPUT", "SELECT", "TEXTAREA"].includes(e.target.tagName)) return;
+        switch (e.key) {
+          case "/": e.preventDefault(); tokenBtn.click(); break;
+          case "r": case "R": e.preventDefault(); if (state.demo) renderDemo(); else load(); break;
+          case "d": case "D": demoBtn.click(); break;
+          case "t": case "T": toggleTheme(); break;
+          case "1": rangeSelect.value = "7"; rangeSelect.dispatchEvent(new Event("change")); break;
+          case "2": rangeSelect.value = "30"; rangeSelect.dispatchEvent(new Event("change")); break;
+          case "3": rangeSelect.value = "60"; rangeSelect.dispatchEvent(new Event("change")); break;
+          case "4": rangeSelect.value = "90"; rangeSelect.dispatchEvent(new Event("change")); break;
+        }
+      });
 
-      if (tokenInput.value) load();
-      else renderEmpty();
+      /* ================= Initialization ================= */
+      if (new URLSearchParams(location.search).get("demo")) {
+        demoBtn.click();
+      } else if (state.token) {
+        load();
+      } else {
+        renderWelcome();
+      }
     </script>
   </body>
 </html>
