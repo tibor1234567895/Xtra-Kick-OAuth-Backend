@@ -2169,6 +2169,94 @@ test("syncKickEventSubscriptions retries on 429 rate limit and succeeds", async 
   assert.equal(postAttempts, 2);
 });
 
+test("ping accepts pe, c, wt and reflects player engines, watch time, and crashes in stats", async () => {
+  const store = createMetricsStore({ salt: "salt-test-fleet" });
+  const pid1 = "1111111111111111111111111111111111111111111111111111111111111111";
+  const pid2 = "2222222222222222222222222222222222222222222222222222222222222222";
+  const now = new Date();
+
+  store.recordPing({
+    pidHash: store.hashPid(pid1),
+    version: "2.55.0",
+    clientEpoch: `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}`,
+    pe: "ivs",
+    c: 2,
+    wt: "3",
+  }, now);
+
+  store.recordPing({
+    pidHash: store.hashPid(pid2),
+    version: "2.55.0",
+    clientEpoch: `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}`,
+    pe: "exo",
+    c: 0,
+    wt: "2",
+  }, now);
+
+  const stats = store.computeStats(now);
+  const ivs = stats.playerEngines.find((p) => p.code === "ivs");
+  const exo = stats.playerEngines.find((p) => p.code === "exo");
+  assert.equal(ivs.count, 1);
+  assert.equal(exo.count, 1);
+
+  const wt3 = stats.watchTime.find((w) => w.code === "3");
+  const wt2 = stats.watchTime.find((w) => w.code === "2");
+  assert.equal(wt3.count, 1);
+  assert.equal(wt2.count, 1);
+
+  assert.equal(stats.counters.today.crashes?.total, 2);
+});
+
+test("upstream latency percentiles compute correctly", () => {
+  const store = createMetricsStore({ salt: "salt-lat-test" });
+  for (let i = 1; i <= 100; i++) {
+    store.recordUpstreamLatency(i * 10);
+  }
+  const stats = store.computeStats(new Date());
+  assert.equal(stats.upstreamLatency.count, 100);
+  assert.equal(stats.upstreamLatency.p50, 510);
+  assert.equal(stats.upstreamLatency.p95, 960);
+  assert.equal(stats.upstreamLatency.max, 1000);
+});
+
+test("telemetry coverage calculates ratio of ping accounts vs oauth accounts", () => {
+  const store = createMetricsStore({ salt: "salt-cov-test" });
+  const now = new Date();
+  const epoch = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}`;
+
+  // 4 OAuth accounts
+  store.recordAccount({ sub: "user-1" }, now);
+  store.recordAccount({ sub: "user-2" }, now);
+  store.recordAccount({ sub: "user-3" }, now);
+  store.recordAccount({ sub: "user-4" }, now);
+
+  // 3 of them also ping
+  store.recordPing({
+    pidHash: store.hashPid("3333333333333333333333333333333333333333333333333333333333333333"),
+    version: "2.55.0",
+    clientEpoch: epoch,
+    accountAid: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  }, now);
+  store.recordPing({
+    pidHash: store.hashPid("4444444444444444444444444444444444444444444444444444444444444444"),
+    version: "2.55.0",
+    clientEpoch: epoch,
+    accountAid: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  }, now);
+  store.recordPing({
+    pidHash: store.hashPid("5555555555555555555555555555555555555555555555555555555555555555"),
+    version: "2.55.0",
+    clientEpoch: epoch,
+    accountAid: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  }, now);
+
+  const stats = store.computeStats(now);
+  assert.equal(stats.accountsMau, 4);
+  assert.equal(stats.pingAccountsMau, 3);
+  assert.equal(stats.telemetryCoverage, 0.75);
+});
+
+
 
 
 

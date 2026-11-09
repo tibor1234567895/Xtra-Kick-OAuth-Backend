@@ -38,7 +38,7 @@
 // ping counts once as an install (one-time baseline shift), then dedup applies.
 
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
 export const SCHEMA_VERSION = 2;
@@ -111,6 +111,7 @@ function emptyState() {
     totalInstalls: 0,
     devices: {},
     accounts: {},
+    pingAccounts: {},
     everSeen: "",
     accountsEverSeen: "",
     baselineDate: null,
@@ -144,7 +145,41 @@ export function createMetricsStore(options = {}) {
   let everSeenSet = new Set();
   let accountEverSeenSet = new Set();
   let pendingFlush = null;
-  const monthCounts = { devices: new Map(), accounts: new Map() };
+  const monthCounts = { devices: new Map(), accounts: new Map(), pingAccounts: new Map() };
+  const latencySamples = [];
+  let latencyIndex = 0;
+  const MAX_LATENCY_SAMPLES = 1000;
+
+  function recordUpstreamLatency(durationMs) {
+    if (typeof durationMs === "number" && durationMs >= 0) {
+      const rounded = Math.round(durationMs);
+      if (latencySamples.length < MAX_LATENCY_SAMPLES) {
+        latencySamples.push(rounded);
+      } else {
+        latencySamples[latencyIndex] = rounded;
+        latencyIndex = (latencyIndex + 1) % MAX_LATENCY_SAMPLES;
+      }
+    }
+  }
+
+  function computeLatencyPercentiles() {
+    if (latencySamples.length === 0) {
+      return { p50: null, p90: null, p95: null, p99: null, max: null, avg: null, count: 0 };
+    }
+    const sorted = [...latencySamples].sort((a, b) => a - b);
+    const count = sorted.length;
+    const pick = (pct) => sorted[Math.min(count - 1, Math.floor(count * pct))];
+    const sum = sorted.reduce((a, b) => a + b, 0);
+    return {
+      p50: pick(0.5),
+      p90: pick(0.9),
+      p95: pick(0.95),
+      p99: pick(0.99),
+      max: sorted[count - 1],
+      avg: Math.round(sum / count),
+      count,
+    };
+  }
 
   if (dataPath && existsSync(dataPath)) {
     try {
@@ -156,6 +191,7 @@ export function createMetricsStore(options = {}) {
           totalInstalls: Number(parsed.totalInstalls) || 0,
           devices: parsed.devices && typeof parsed.devices === "object" ? parsed.devices : {},
           accounts: parsed.accounts && typeof parsed.accounts === "object" ? parsed.accounts : {},
+          pingAccounts: parsed.pingAccounts && typeof parsed.pingAccounts === "object" ? parsed.pingAccounts : {},
           everSeen: typeof parsed.everSeen === "string" ? parsed.everSeen : "",
           accountsEverSeen: typeof parsed.accountsEverSeen === "string" ? parsed.accountsEverSeen : "",
           baselineDate: typeof parsed.baselineDate === "string" ? parsed.baselineDate : null,
@@ -220,6 +256,14 @@ export function createMetricsStore(options = {}) {
         monthCounts.accounts.delete(key);
       }
     }
+    if (state.pingAccounts) {
+      for (const key of Object.keys(state.pingAccounts)) {
+        if (key < cutoff) {
+          delete state.pingAccounts[key];
+          monthCounts.pingAccounts.delete(key);
+        }
+      }
+    }
     const counterCutoff = dayKey(new Date(today.getTime() - COUNTER_DAYS * 86_400_000));
     for (const key of Object.keys(state.counters)) {
       if (key < counterCutoff) delete state.counters[key];
@@ -227,7 +271,9 @@ export function createMetricsStore(options = {}) {
   }
 
   function ensureMonth(month, kind) {
+    if (!state[kind]) state[kind] = {};
     if (!state[kind][month]) state[kind][month] = {};
+    if (!monthCounts[kind]) monthCounts[kind] = new Map();
     if (!monthCounts[kind].has(month)) monthCounts[kind].set(month, Object.keys(state[kind][month]).length);
     return state[kind][month];
   }
@@ -240,10 +286,10 @@ export function createMetricsStore(options = {}) {
     const key = dayKey(now);
     noteTraffic(now);
     if (!state.counters[key]) {
-      state.counters[key] = { endpoints: {}, oauth: {}, ping: {}, account: {} };
+      state.counters[key] = { endpoints: {}, oauth: {}, ping: {}, account: {}, crashes: {} };
     }
     const bucket = state.counters[key];
-    for (const part of ["endpoints", "oauth", "ping", "account"]) {
+    for (const part of ["endpoints", "oauth", "ping", "account", "crashes"]) {
       if (!bucket[part] || typeof bucket[part] !== "object") bucket[part] = {};
     }
     return { key, bucket };
@@ -258,7 +304,7 @@ export function createMetricsStore(options = {}) {
     map[name] = (Number(map[name]) || 0) + amount;
   }
 
-  function countersEndpoint(endpoint, statusCode) {
+  function countersEndpoint(endpoint, statusCode, detailCode) {
     const { bucket } = counterBucket(new Date());
     const entry = bucket.endpoints;
     if (!entry[endpoint] || typeof entry[endpoint] !== "object") entry[endpoint] = {};
@@ -267,6 +313,9 @@ export function createMetricsStore(options = {}) {
     else if (status === 429) bump(entry, endpoint, "limited");
     else if (status >= 500) bump(entry, endpoint, "r5");
     else bump(entry, endpoint, "r4");
+    if (detailCode && typeof detailCode === "string") {
+      bumpPlain(entry[endpoint], detailCode, 1);
+    }
     scheduleFlush();
   }
 
@@ -314,7 +363,7 @@ export function createMetricsStore(options = {}) {
     return true;
   }
 
-  function recordPing({ pidHash, version, clientEpoch, os, cc, sessions, accountAid, geoCountry }, now = new Date()) {
+  function recordPing({ pidHash, version, clientEpoch, os, cc, sessions, accountAid, geoCountry, pe, c, wt }, now = new Date()) {
     if (typeof pidHash !== "string" || !/^[0-9a-f]{64}$/.test(pidHash)) {
       throw new Error("recordPing: invalid pidHash");
     }
@@ -333,12 +382,19 @@ export function createMetricsStore(options = {}) {
     const safeCc = typeof cc === "string" && /^[A-Za-z]{2}$/.test(cc) ? cc.toUpperCase() : null;
     const safeGeo = typeof geoCountry === "string" && /^[A-Za-z]{2}$/.test(geoCountry) ? geoCountry.toUpperCase() : null;
     const safeSessions = clampInt(sessions, 0, 100_000, null);
+    const safePe = (pe === "ivs" || pe === "exo") ? pe : null;
+    const safeWt = (wt === "0" || wt === "1" || wt === "2" || wt === "3") ? wt : null;
+    const safeCrashes = clampInt(c, 0, 10_000, 0);
     const aidHash = accountAid ? hashWithSalt(accSalt, accountAid) : null;
     const aidPrefix = aidHash ? aidHash.slice(0, EVERSEEN_PREFIX_CHARS) : null;
     const accountKnown = aidPrefix !== null && accountEverSeenSet.has(aidPrefix);
     prune();
     noteTraffic(now);
     const month = ensureMonth(serverEpoch, "devices");
+    if (aidPrefix) {
+      const pingMonth = ensureMonth(serverEpoch, "pingAccounts");
+      pingMonth[aidHash] = true;
+    }
     const existing = month[pidHash];
     const dayBit = 1 << (dayIndexUtc(now) - 1);
     if (existing) {
@@ -347,7 +403,13 @@ export function createMetricsStore(options = {}) {
       if (safeOs) existing.os = safeOs;
       if (safeCc) existing.cc = safeCc;
       if (safeGeo) existing.gc = safeGeo;
+      if (safePe) existing.pe = safePe;
+      if (safeWt) existing.wt = safeWt;
       if (safeSessions !== null) existing.s = safeSessions;
+      if (safeCrashes > 0) {
+        const { bucket } = counterBucket(now);
+        bumpPlain(bucket.crashes, "total", safeCrashes);
+      }
       // Reinstall revocation: a recently counted install whose account turns
       // out to be a pre-existing one (device was not logged in on first ping)
       // gives its install count back.
@@ -378,7 +440,13 @@ export function createMetricsStore(options = {}) {
     if (safeOs) entry.os = safeOs;
     if (safeCc) entry.cc = safeCc;
     if (safeGeo) entry.gc = safeGeo;
+    if (safePe) entry.pe = safePe;
+    if (safeWt) entry.wt = safeWt;
     if (safeSessions !== null) entry.s = safeSessions;
+    if (safeCrashes > 0) {
+      const { bucket } = counterBucket(now);
+      bumpPlain(bucket.crashes, "total", safeCrashes);
+    }
     if (accountKnown) {
       // A device whose account is already known is a reinstall or an
       // additional device of an existing user, not a new install.
@@ -495,7 +563,7 @@ export function createMetricsStore(options = {}) {
   }
 
   function rollupCounters(now, days) {
-    const rollup = { endpoints: {}, oauth: {}, ping: {}, account: {} };
+    const rollup = { endpoints: {}, oauth: {}, ping: {}, account: {}, crashes: {} };
     for (let offset = 0; offset < days; offset += 1) {
       const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
       d.setUTCDate(d.getUTCDate() - offset);
@@ -574,12 +642,13 @@ export function createMetricsStore(options = {}) {
     return series;
   }
 
-  function computeStats(now = new Date(), days = 60) {
+  function computeStats(now = new Date(), days = 60, { fcm, system } = {}) {
     prune();
     const seriesDays = clampInt(days, 1, 90, 60);
     const month = monthKey(now);
     const devicesBucket = state.devices[month] || {};
     const accountsBucket = state.accounts[month] || {};
+    const pingAccountsBucket = state.pingAccounts ? (state.pingAccounts[month] || {}) : {};
     const todayBit = 1 << (dayIndexUtc(now) - 1);
     let dauToday = 0;
     let newToday = 0;
@@ -588,6 +657,8 @@ export function createMetricsStore(options = {}) {
     const osCounts = {};
     const countryCounts = {};
     const geoCountryCounts = {};
+    const playerEngines = { ivs: 0, exo: 0 };
+    const watchTime = { "0": 0, "1": 0, "2": 0, "3": 0 };
     for (const entry of Object.values(devicesBucket)) {
       if (!entry) continue;
       if ((entry.d & todayBit) !== 0) {
@@ -603,14 +674,38 @@ export function createMetricsStore(options = {}) {
       countryCounts[ccKey] = (countryCounts[ccKey] || 0) + 1;
       const gcKey = entry.gc || "unknown";
       geoCountryCounts[gcKey] = (geoCountryCounts[gcKey] || 0) + 1;
+      if (entry.pe && playerEngines[entry.pe] !== undefined) {
+        playerEngines[entry.pe]++;
+      }
+      if (entry.wt && watchTime[entry.wt] !== undefined) {
+        watchTime[entry.wt]++;
+      }
     }
     const mau = Object.keys(devicesBucket).length;
     const accountsMau = Object.keys(accountsBucket).length;
+    const pingAccountsMau = Object.keys(pingAccountsBucket).length;
+    const telemetryCoverage = accountsMau > 0
+      ? Math.min(1, Math.round((pingAccountsMau / accountsMau) * 1000) / 1000)
+      : null;
     const dauSeries = buildDauSeries(state, now, seriesDays);
     const toRanked = (counts) =>
       Object.entries(counts)
         .map(([label, count]) => ({ label, count }))
         .sort((a, b) => b.count - a.count);
+
+    let dataFileSizeKb = null;
+    if (dataPath && existsSync(dataPath)) {
+      try {
+        dataFileSizeKb = Math.round(statSync(dataPath).size / 1024);
+      } catch {}
+    }
+    const storage = {
+      dataFileSizeKb,
+      totalDevicesEverSeen: everSeenSet.size,
+      maxEverSeen,
+      maxDevicesPerMonth,
+    };
+
     return {
       generatedAt: now.toISOString(),
       currentMonth: month,
@@ -623,12 +718,28 @@ export function createMetricsStore(options = {}) {
       sessionsToday,
       stickiness: mau > 0 ? Math.round((dauToday / mau) * 1000) / 1000 : 0,
       accountsMau,
+      pingAccountsMau,
+      telemetryCoverage,
       versions: Object.entries(versions)
         .map(([version, count]) => ({ version, count }))
         .sort((a, b) => b.count - a.count),
       os: toRanked(osCounts),
       countries: toRanked(countryCounts),
       geoCountries: toRanked(geoCountryCounts),
+      playerEngines: [
+        { label: "Amazon IVS", code: "ivs", count: playerEngines.ivs },
+        { label: "Media3 / ExoPlayer", code: "exo", count: playerEngines.exo },
+      ],
+      watchTime: [
+        { label: "None / No watch", code: "0", count: watchTime["0"] },
+        { label: "< 15 min", code: "1", count: watchTime["1"] },
+        { label: "15 min – 1 hr", code: "2", count: watchTime["2"] },
+        { label: "> 1 hour", code: "3", count: watchTime["3"] },
+      ],
+      upstreamLatency: computeLatencyPercentiles(),
+      storage,
+      fcm: fcm || null,
+      system: system || null,
       dauSeries,
       retention: computeRetention(now, 30),
       counters: {
@@ -653,6 +764,7 @@ export function createMetricsStore(options = {}) {
   return {
     recordPing,
     recordAccount,
+    recordUpstreamLatency,
     hashSub,
     hashPid,
     computeStats,

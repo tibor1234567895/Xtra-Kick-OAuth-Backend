@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="dark light" />
-    <title>Xtra Backend Ops</title>
+    <title>Xtra Ops Cockpit</title>
     <style>
       :root {
         --font-ui: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
@@ -18,15 +18,15 @@
 
       html[data-theme="dark"] {
         color-scheme: dark;
-        --bg: #141415;
-        --surface: #19191b;
-        --surface-raised: #232325;
-        --surface-subtle: #0f0f10;
+        --bg: #121315;
+        --surface: #18191c;
+        --surface-raised: #212327;
+        --surface-subtle: #0d0e10;
         --border: rgba(255, 255, 255, 0.08);
         --border-subtle: rgba(255, 255, 255, 0.04);
         --fg: #ededed;
-        --fg-dim: #a1a1a6;
-        --muted: #85858b;
+        --fg-dim: #9da0a8;
+        --muted: #737680;
         --accent: #38bdf8;
         --accent-soft: rgba(56, 189, 248, 0.12);
         --bar-ret: #334155;
@@ -42,15 +42,15 @@
 
       html[data-theme="light"] {
         color-scheme: light;
-        --bg: #fafafa;
+        --bg: #f8fafc;
         --surface: #ffffff;
-        --surface-raised: #f4f4f5;
-        --surface-subtle: #f0f0f2;
+        --surface-raised: #f1f5f9;
+        --surface-subtle: #f8fafc;
         --border: rgba(0, 0, 0, 0.08);
         --border-subtle: rgba(0, 0, 0, 0.04);
-        --fg: #171717;
-        --fg-dim: #525252;
-        --muted: #737373;
+        --fg: #0f172a;
+        --fg-dim: #475569;
+        --muted: #64748b;
         --accent: #0284c7;
         --accent-soft: rgba(2, 132, 199, 0.10);
         --bar-ret: #cbd5e1;
@@ -153,7 +153,7 @@
         font-size: 12px;
       }
 
-      /* Top Navigation Bar — Fixed Viewport Plane */
+      /* Top Navigation Bar */
       .topbar {
         position: fixed;
         top: 0;
@@ -194,9 +194,9 @@
         font-family: var(--font-mono);
         font-size: 10px;
         font-weight: 500;
-        color: var(--muted);
-        background: var(--surface-raised);
-        border: 1px solid var(--border);
+        color: var(--accent);
+        background: var(--accent-soft);
+        border: 1px solid rgba(56, 189, 248, 0.2);
         border-radius: var(--radius-tag);
         padding: 1px 5px;
       }
@@ -219,6 +219,39 @@
       .status-pill.ok .status-dot { background: var(--good); }
       .status-pill.err .status-dot { background: var(--bad); }
       .status-pill.busy .status-dot { background: var(--warn); }
+
+      /* Ops Navigation Tabs */
+      .nav-tabs {
+        display: flex;
+        align-items: center;
+        gap: 2px;
+        background: var(--surface-raised);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-control);
+        padding: 2px;
+      }
+      .tab-btn {
+        background: transparent;
+        border: 1px solid transparent;
+        border-radius: 6px;
+        padding: 4px 10px;
+        font-size: 12px;
+        font-weight: 500;
+        color: var(--muted);
+        cursor: pointer;
+        transition: all 140ms var(--ease);
+      }
+      .tab-btn:hover {
+        color: var(--fg);
+        background: var(--surface-subtle);
+      }
+      .tab-btn.active {
+        color: var(--fg);
+        background: var(--surface);
+        border-color: var(--border);
+        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
+        font-weight: 600;
+      }
 
       .top-actions {
         display: flex;
@@ -344,7 +377,7 @@
       .delta.up { color: var(--good); background: var(--good-soft); }
       .delta.down { color: var(--bad); background: var(--bad-soft); }
 
-      /* Main Stacked Chart */
+      /* Charts */
       .chart-wrap { position: relative; width: 100%; }
       .chart-wrap svg { display: block; width: 100%; overflow: visible; }
       .chart-meta-bar {
@@ -402,7 +435,7 @@
         font-weight: 500;
       }
 
-      /* 2-Column Ops Grid */
+      /* 2-Column Split Grids */
       .grid-split {
         display: grid;
         grid-template-columns: 1fr 1fr;
@@ -440,18 +473,19 @@
       }
       .bar-cell { width: 130px; }
       .progress-bar {
-        height: 4px;
+        height: 5px;
         background: var(--surface-raised);
-        border-radius: 2px;
+        border-radius: 3px;
         overflow: hidden;
       }
       .progress-fill {
         height: 100%;
         background: var(--accent);
-        border-radius: 2px;
+        border-radius: 3px;
       }
       .progress-fill.warn { background: var(--warn); }
       .progress-fill.bad { background: var(--bad); }
+      .progress-fill.good { background: var(--good); }
 
       .pill {
         display: inline-block;
@@ -529,7 +563,7 @@
         margin-right: 5px;
       }
 
-      /* Sub diagnostic counters */
+      /* Diagnostic counters */
       .diag-grid {
         display: grid;
         grid-template-columns: repeat(4, 1fr);
@@ -569,7 +603,7 @@
       .callout.info { background: var(--surface-subtle); color: var(--fg-dim); }
       .callout.red { background: var(--bad-soft); border-color: rgba(229, 72, 77, 0.3); color: #fca5a5; }
 
-      /* High-Contrast Cohort Matrix */
+      /* Cohort Matrix */
       .heat-box {
         display: inline-flex;
         align-items: center;
@@ -603,12 +637,13 @@
         .grid-split { grid-template-columns: 1fr; }
         .diag-grid { grid-template-columns: repeat(2, 1fr); }
       }
-      @media (max-width: 680px) {
+      @media (max-width: 768px) {
         .topbar { position: sticky; height: auto; }
-        .topbar-inner { padding: 0 16px; height: auto; flex-wrap: wrap; padding-block: 10px; }
+        .topbar-inner { padding: 0 16px; height: auto; flex-wrap: wrap; padding-block: 10px; gap: 10px; }
         .container { padding: 16px; }
         .kpi-grid { grid-template-columns: 1fr; }
         .chart-legend { flex-wrap: wrap; gap: 12px; }
+        .nav-tabs { width: 100%; overflow-x: auto; }
       }
     </style>
   </head>
@@ -619,13 +654,21 @@
         <div class="brand-box">
           <div class="brand-title">
             <span>Xtra Backend Ops</span>
-            <span class="brand-tag">v2</span>
+            <span class="brand-tag">v3</span>
           </div>
           <div class="status-pill" id="statusPill">
             <span class="status-dot"></span>
             <span id="statusLabel">Initializing</span>
           </div>
         </div>
+
+        <!-- Navigation Tabs -->
+        <nav class="nav-tabs" id="navTabs" aria-label="Operations views">
+          <button class="tab-btn active" data-tab="overview" type="button">Fleet &amp; Growth</button>
+          <button class="tab-btn" data-tab="fcm" type="button">Push Pipeline</button>
+          <button class="tab-btn" data-tab="ops" type="button">API &amp; Upstream</button>
+          <button class="tab-btn" data-tab="system" type="button">System Health</button>
+        </nav>
 
         <div class="top-actions">
           <!-- Date Range -->
@@ -695,9 +738,9 @@
       "use strict";
 
       /* =====================================================================
-       * Xtra Backend Ops — Precision Operations Cockpit
+       * Xtra Ops Cockpit v3 — Unified Enterprise Operations Center
        * Consumes GET /v1/metrics/stats?days=N (Bearer token)
-       * Shortcuts: R (refresh) · D (demo) · T (theme) · / (token) · 1-4 (range)
+       * Shortcuts: 1-4 (tabs) · R (refresh) · D (demo) · T (theme) · / (token)
        * ===================================================================== */
 
       const KV = {
@@ -705,11 +748,13 @@
         range: "opsV2Range",
         auto: "opsV2Auto",
         theme: "opsV2Theme",
+        tab: "opsV3Tab",
       };
       const AUTO_MS = 60_000;
       const ROUTE_STATS = "/v1/metrics/stats";
 
       const root = document.getElementById("root");
+      const navTabs = document.getElementById("navTabs");
       const tokenBtn = document.getElementById("tokenBtn");
       const tokenBtnLabel = document.getElementById("tokenBtnLabel");
       const tokenPopover = document.getElementById("tokenPopover");
@@ -741,6 +786,7 @@
         nextAutoAt: 0,
         autoTimer: null,
         countdownTimer: null,
+        activeTab: storage.get(KV.tab) || "overview",
         chartSplit: true,
         chartTrend: true,
         healthRange: "week",
@@ -760,6 +806,22 @@
       }
       themeBtn.addEventListener("click", toggleTheme);
       applyTheme(storage.get(KV.theme) || "dark");
+
+      /* ================= Tab Switching ================= */
+      function switchTab(tabId) {
+        if (!["overview", "fcm", "ops", "system"].includes(tabId)) tabId = "overview";
+        state.activeTab = tabId;
+        storage.set(KV.tab, tabId);
+        document.querySelectorAll(".tab-btn").forEach(btn => {
+          btn.classList.toggle("active", btn.dataset.tab === tabId);
+        });
+        if (state.lastData) render(state.lastData);
+      }
+
+      navTabs.addEventListener("click", (e) => {
+        const btn = e.target.closest(".tab-btn");
+        if (btn && btn.dataset.tab) switchTab(btn.dataset.tab);
+      });
 
       /* ================= Token Popover & Storage ================= */
       rememberBox.checked = Boolean(storage.get(KV.token));
@@ -897,9 +959,9 @@
 
       /* ================= Formatting ================= */
       function escapeHtml(s) {
-        return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+        return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
       }
-      function fmt(n) { return typeof n === "number" ? n.toLocaleString("en-US") : "—"; }
+      function fmt(n) { return typeof n === "number" && !isNaN(n) ? n.toLocaleString("en-US") : "—"; }
 
       let regionNames = null;
       try {
@@ -925,6 +987,16 @@
           }
           return new Date(iso + "T00:00:00Z").toLocaleDateString(undefined, { month: "short", day: "numeric", timeZone: "UTC" });
         } catch { return iso; }
+      }
+
+      function formatUptime(seconds) {
+        if (!seconds || seconds <= 0) return "—";
+        const d = Math.floor(seconds / 86400);
+        const h = Math.floor((seconds % 86400) / 3600);
+        const m = Math.floor((seconds % 3600) / 60);
+        if (d > 0) return `${d}d ${h}h ${m}m`;
+        if (h > 0) return `${h}h ${m}m`;
+        return `${m}m`;
       }
 
       /* ================= Data Loading ================= */
@@ -958,7 +1030,7 @@
         setStatus("", "Enter token");
         root.innerHTML = `
           <div style="max-width:520px;margin:80px auto;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-panel);padding:32px;text-align:center;">
-            <div style="font-size:16px;font-weight:600;margin-bottom:8px;">Xtra Backend Operations</div>
+            <div style="font-size:16px;font-weight:600;margin-bottom:8px;">Xtra Backend Operations Cockpit</div>
             <p style="color:var(--muted);font-size:12.5px;margin:0 0 24px;line-height:1.6;">
               Configure your <code>METRICS_ADMIN_TOKEN</code> to stream live fleet telemetry, or launch the demo cockpit with simulated metrics.
             </p>
@@ -986,8 +1058,42 @@
       }
 
       function render(d) {
+        // Ensure active tab button is selected
+        document.querySelectorAll(".tab-btn").forEach(btn => {
+          btn.classList.toggle("active", btn.dataset.tab === state.activeTab);
+        });
+
+        let viewHtml = "";
+        if (state.activeTab === "overview") viewHtml = renderOverviewTab(d);
+        else if (state.activeTab === "fcm") viewHtml = renderFcmTab(d);
+        else if (state.activeTab === "ops") viewHtml = renderOpsTab(d);
+        else if (state.activeTab === "system") viewHtml = renderSystemTab(d);
+
+        root.innerHTML = `
+          ${viewHtml}
+          <footer style="margin-top:32px;padding-top:16px;border-top:1px solid var(--border-subtle);display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;font-size:11.5px;color:var(--muted);font-family:var(--font-mono);">
+            <div>
+              <span>Generated: ${escapeHtml(d.generatedAt || '—')}</span>
+              <span style="margin:0 6px;">·</span>
+              <span>Telemetry period ${escapeHtml(d.currentMonth || '—')}</span>
+            </div>
+            <div>
+              <span><kbd>1-4</kbd> views · <kbd>R</kbd> refresh · <kbd>D</kbd> demo · <kbd>T</kbd> theme · <kbd>/</kbd> token</span>
+            </div>
+          </footer>
+        `;
+
+        if (state.activeTab === "overview") {
+          drawChart(d);
+          bindOverviewControls(d);
+        } else if (state.activeTab === "ops") {
+          bindOpsControls(d);
+        }
+      }
+
+      /* ================= TAB 1: FLEET & GROWTH ================= */
+      function renderOverviewTab(d) {
         const series = Array.isArray(d.dauSeries) ? d.dauSeries : [];
-        const last = series[series.length - 1] || { dau: 0, new: 0 };
         const prev = series.length >= 2 ? series[series.length - 2] : null;
         const window7 = series.slice(-7);
         const avg7 = window7.length ? Math.round(window7.reduce((a, p) => a + (p.dau || 0), 0) / window7.length) : 0;
@@ -999,13 +1105,6 @@
         const dauDelta = prev && prev.dau > 0 ? Math.round(((d.dauToday - prev.dau) / prev.dau) * 100) : null;
         const newDelta = prev && prev.new > 0 ? Math.round(((d.newToday - prev.new) / prev.new) * 100) : null;
 
-        const activeCounters = (d.counters && d.counters[state.healthRange] && d.counters[state.healthRange].endpoints) || {};
-        let totalReqs = 0, total5xx = 0;
-        for (const e of Object.values(activeCounters)) {
-          totalReqs += (e.ok || 0) + (e.r4 || 0) + (e.r5 || 0) + (e.limited || 0) + (e.hmac || 0);
-          total5xx += e.r5 || 0;
-        }
-
         const baselineNotice = d.baselineDate ? `
           <div class="callout info">
             <span style="font-weight:500;color:var(--fg);">Migration Baseline:</span>
@@ -1013,10 +1112,10 @@
           </div>
         ` : "";
 
-        const html = `
+        return `
           ${baselineNotice}
 
-          <!-- Row 1: Primary Activity KPIs (4 columns) -->
+          <!-- Row 1: Primary Activity KPIs -->
           <div class="kpi-grid">
             <div class="kpi-card">
               <div class="kpi-label">
@@ -1037,33 +1136,23 @@
                 ${deltaBadge(newDelta)}
               </div>
               <div class="kpi-val">${fmt(d.newToday)}</div>
-              <div class="kpi-foot">
-                <span>First telemetry pings today</span>
-              </div>
+              <div class="kpi-foot"><span>First telemetry pings today</span></div>
             </div>
 
             <div class="kpi-card">
-              <div class="kpi-label">
-                <span>Weekly active (WAU)</span>
-              </div>
+              <div class="kpi-label"><span>Weekly active (WAU)</span></div>
               <div class="kpi-val">${fmt(d.wau)}</div>
-              <div class="kpi-foot">
-                <span>Trailing 7 days deduplicated</span>
-              </div>
+              <div class="kpi-foot"><span>Trailing 7 days deduplicated</span></div>
             </div>
 
             <div class="kpi-card">
-              <div class="kpi-label">
-                <span>Monthly active (MAU)</span>
-              </div>
+              <div class="kpi-label"><span>Monthly active (MAU)</span></div>
               <div class="kpi-val">${fmt(d.mau)}</div>
-              <div class="kpi-foot">
-                <span>Unique devices in ${escapeHtml(d.currentMonth || 'current period')}</span>
-              </div>
+              <div class="kpi-foot"><span>Unique devices in ${escapeHtml(d.currentMonth || 'current period')}</span></div>
             </div>
           </div>
 
-          <!-- Row 2: Secondary Diagnostics KPIs (4 columns) -->
+          <!-- Row 2: Secondary Diagnostics KPIs -->
           <div class="kpi-grid">
             <div class="kpi-card">
               <div class="kpi-label">Total installs</div>
@@ -1123,42 +1212,14 @@
             </div>
           </div>
 
-          <!-- Dual Column Ops Matrix -->
+          <!-- Dual Column: Demographics & Playback Diagnostics -->
           <div class="grid-split">
-            <!-- Left: API & Backend Health -->
+            <!-- Left: Platforms & Demographics -->
             <div class="panel">
               <div class="panel-header">
                 <div>
-                  <h2 class="panel-title">Backend API Health</h2>
-                  <div class="panel-sub">${state.healthRange === 'today' ? 'Today (UTC)' : 'Trailing 7 days'} endpoint telemetry</div>
-                </div>
-                <div style="display:flex;align-items:center;gap:8px;">
-                  <div style="display:inline-flex;border:1px solid var(--border);border-radius:var(--radius-control);overflow:hidden;">
-                    <button class="small ${state.healthRange === 'today' ? 'active' : ''}" id="healthTodayBtn" style="border:none;border-radius:0;">Today</button>
-                    <button class="small ${state.healthRange === 'week' ? 'active' : ''}" id="healthWeekBtn" style="border:none;border-radius:0;border-left:1px solid var(--border);">7 Days</button>
-                  </div>
-                  <div>
-                    ${total5xx > 0
-                      ? `<span class="pill bad">${total5xx} × 5xx</span>`
-                      : `<span class="pill ok">Zero 5xx</span>`}
-                  </div>
-                </div>
-              </div>
-              <div class="panel-body">
-                ${renderEndpointHealthTable(d)}
-                <div style="margin-top:20px;">
-                  <div style="font-size:12px;font-weight:500;color:var(--fg-dim);margin-bottom:8px;">Key telemetry counters</div>
-                  ${renderDiagCounters(d)}
-                </div>
-              </div>
-            </div>
-
-            <!-- Right: Client Demographics -->
-            <div class="panel">
-              <div class="panel-header">
-                <div>
-                  <h2 class="panel-title">Client Demographics</h2>
-                  <div class="panel-sub">App versions, Android levels, and geographic distribution</div>
+                  <h2 class="panel-title">Platform &amp; Demographics</h2>
+                  <div class="panel-sub">Client builds, Android OS, and geography</div>
                 </div>
                 <div style="display:inline-flex;border:1px solid var(--border);border-radius:var(--radius-control);overflow:hidden;">
                   <button class="small ${state.countryMode === 'geo' ? 'active' : ''}" id="countryGeoBtn" style="border:none;border-radius:0;">Geo-IP</button>
@@ -1169,9 +1230,22 @@
                 ${renderDistTabs(d)}
               </div>
             </div>
+
+            <!-- Right: Playback Engine & Watch Engagement -->
+            <div class="panel">
+              <div class="panel-header">
+                <div>
+                  <h2 class="panel-title">Playback &amp; Fleet Diagnostics</h2>
+                  <div class="panel-sub">Video engines, watch duration, and crash stability</div>
+                </div>
+              </div>
+              <div class="panel-body">
+                ${renderPlaybackDiagnostics(d)}
+              </div>
+            </div>
           </div>
 
-          <!-- Cohort Retention Matrix (High Craft Grid) -->
+          <!-- Cohort Retention Matrix -->
           <div class="panel" style="margin-top:16px;">
             <div class="panel-header">
               <div>
@@ -1191,50 +1265,22 @@
               ${renderRetentionMatrix(d.retention)}
             </div>
           </div>
-
-          <!-- Cockpit Footer -->
-          <footer style="margin-top:32px;padding-top:16px;border-top:1px solid var(--border-subtle);display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;font-size:11.5px;color:var(--muted);font-family:var(--font-mono);">
-            <div>
-              <span>Generated: ${escapeHtml(d.generatedAt || '—')}</span>
-              <span style="margin:0 6px;">·</span>
-              <span>Telemetry period ${escapeHtml(d.currentMonth || '—')}</span>
-            </div>
-            <div>
-              <span><kbd>R</kbd> refresh · <kbd>D</kbd> demo · <kbd>T</kbd> theme · <kbd>/</kbd> token · <kbd>1-4</kbd> range</span>
-            </div>
-          </footer>
         `;
+      }
 
-        root.innerHTML = html;
-        drawChart(d);
-
-        // Chart toggles
-        const splitBtn = document.getElementById("splitBtn");
-        splitBtn?.addEventListener("click", () => {
+      function bindOverviewControls(d) {
+        document.getElementById("splitBtn")?.addEventListener("click", () => {
           state.chartSplit = !state.chartSplit;
-          splitBtn.classList.toggle("active", state.chartSplit);
+          document.getElementById("splitBtn")?.classList.toggle("active", state.chartSplit);
           drawChart(d);
         });
-
-        const trendBtn = document.getElementById("trendBtn");
-        trendBtn?.addEventListener("click", () => {
+        document.getElementById("trendBtn")?.addEventListener("click", () => {
           state.chartTrend = !state.chartTrend;
-          trendBtn.classList.toggle("active", state.chartTrend);
+          document.getElementById("trendBtn")?.classList.toggle("active", state.chartTrend);
           drawChart(d);
         });
-
         document.getElementById("csvExportBtn")?.addEventListener("click", exportCsv);
         document.getElementById("jsonCopyBtn")?.addEventListener("click", copyJson);
-
-        // Health & Demographics switches
-        document.getElementById("healthTodayBtn")?.addEventListener("click", () => {
-          state.healthRange = "today";
-          render(d);
-        });
-        document.getElementById("healthWeekBtn")?.addEventListener("click", () => {
-          state.healthRange = "week";
-          render(d);
-        });
         document.getElementById("countryGeoBtn")?.addEventListener("click", () => {
           state.countryMode = "geo";
           render(d);
@@ -1249,7 +1295,405 @@
         });
       }
 
-      /* ================= Sub-Components ================= */
+      /* ================= TAB 2: PUSH NOTIFICATIONS ================= */
+      function renderFcmTab(d) {
+        const fcm = d.fcm || {};
+        const delivery = fcm.delivery || {};
+        const sources = delivery.sources || { webhook: 0, pusher: 0, poller: 0 };
+        const pusher = fcm.pusher || {};
+        const totalDelivered = (delivery.multicastSuccess || 0) + (delivery.multicastFailure || 0);
+        const successRate = totalDelivered > 0 ? Math.round((delivery.multicastSuccess / totalDelivered) * 100) : 100;
+        const isConnected = pusher.state === "connected";
+
+        const sourceTotal = (sources.webhook || 0) + (sources.pusher || 0) + (sources.poller || 0) || 1;
+        const webhookPct = Math.round(((sources.webhook || 0) / sourceTotal) * 100);
+        const pusherPct = Math.round(((sources.pusher || 0) / sourceTotal) * 100);
+        const pollerPct = Math.round(((sources.poller || 0) / sourceTotal) * 100);
+
+        const recent = Array.isArray(delivery.recentAlerts) ? delivery.recentAlerts : [];
+
+        return `
+          <!-- Row 1: Push KPIs -->
+          <div class="kpi-grid">
+            <div class="kpi-card">
+              <div class="kpi-label">Registered push devices</div>
+              <div class="kpi-val">${fmt(fcm.totalTokens || 0)}</div>
+              <div class="kpi-foot">Active device FCM tokens in store</div>
+            </div>
+
+            <div class="kpi-card">
+              <div class="kpi-label">Monitored streamers</div>
+              <div class="kpi-val">${fmt(fcm.activeChannels || 0)}</div>
+              <div class="kpi-foot">Unique channel IDs tracked</div>
+            </div>
+
+            <div class="kpi-card">
+              <div class="kpi-label">Stream alerts sent</div>
+              <div class="kpi-val">${fmt(delivery.alertsDispatched || 0)}</div>
+              <div class="kpi-foot">${fmt(delivery.notificationsSent || 0)} device notifications targeted</div>
+            </div>
+
+            <div class="kpi-card">
+              <div class="kpi-label">Multicast success rate</div>
+              <div class="kpi-val secondary" style="color:${successRate >= 95 ? 'var(--good)' : 'var(--warn)'}">${successRate}%</div>
+              <div class="kpi-foot">${fmt(delivery.tokensPruned || 0)} dead tokens pruned</div>
+            </div>
+          </div>
+
+          <!-- Split: Ingestion Architecture vs Recent Alerts -->
+          <div class="grid-split">
+            <!-- Left: Pusher & Event Ingestion -->
+            <div class="panel">
+              <div class="panel-header">
+                <div>
+                  <h2 class="panel-title">Ingestion Architecture &amp; Health</h2>
+                  <div class="panel-sub">Pusher WebSocket, Kick Webhooks, and Poller fallback</div>
+                </div>
+                <div>
+                  <span class="pill ${isConnected ? 'ok' : 'bad'}">${isConnected ? 'Pusher Connected' : 'Pusher ' + (pusher.state || 'Offline')}</span>
+                </div>
+              </div>
+              <div class="panel-body">
+                <div style="background:var(--surface-raised);border:1px solid var(--border);border-radius:var(--radius-control);padding:14px;margin-bottom:16px;">
+                  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
+                    <div style="font-weight:600;font-size:13px;">Pusher WebSocket Relay</div>
+                    <span class="tag-status ${isConnected ? 'ok' : 'bad'}">${isConnected ? 'Online' : 'Offline'}</span>
+                  </div>
+                  <div style="font-size:12px;color:var(--muted);display:flex;flex-direction:column;gap:4px;">
+                    <div>Subscribed channels on relay: <b>${fmt(pusher.subscribedChannels ?? fcm.activeChannels ?? 0)}</b></div>
+                    <div>Last socket message/heartbeat: <b>${pusher.lastHeartbeat ? new Date(pusher.lastHeartbeat).toLocaleTimeString() : '—'}</b></div>
+                  </div>
+                </div>
+
+                <div style="font-size:12.5px;font-weight:500;color:var(--fg-dim);margin-bottom:10px;">Alert Ingestion Source Breakdown</div>
+                
+                <div style="display:flex;flex-direction:column;gap:12px;">
+                  <div>
+                    <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:4px;">
+                      <span>Kick Official Webhook</span>
+                      <span><b>${fmt(sources.webhook || 0)}</b> (${webhookPct}%)</span>
+                    </div>
+                    <div class="progress-bar"><div class="progress-fill good" style="width:${webhookPct}%"></div></div>
+                  </div>
+
+                  <div>
+                    <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:4px;">
+                      <span>Pusher WebSocket Relay</span>
+                      <span><b>${fmt(sources.pusher || 0)}</b> (${pusherPct}%)</span>
+                    </div>
+                    <div class="progress-bar"><div class="progress-fill" style="width:${pusherPct}%"></div></div>
+                  </div>
+
+                  <div>
+                    <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:4px;">
+                      <span>Live Stream Poller Fallback</span>
+                      <span><b>${fmt(sources.poller || 0)}</b> (${pollerPct}%)</span>
+                    </div>
+                    <div class="progress-bar"><div class="progress-fill warn" style="width:${pollerPct}%"></div></div>
+                  </div>
+                </div>
+
+                <div style="margin-top:20px;padding-top:16px;border-top:1px solid var(--border-subtle);display:flex;justify-content:space-between;font-size:12px;color:var(--muted);">
+                  <span>Unregistered / dead tokens pruned:</span>
+                  <span style="font-family:var(--font-mono);font-weight:600;color:var(--fg);">${fmt(delivery.tokensPruned || 0)}</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- Right: Recent Alerts Dispatched -->
+            <div class="panel">
+              <div class="panel-header">
+                <div>
+                  <h2 class="panel-title">Recent Stream Live Alerts</h2>
+                  <div class="panel-sub">Last live notifications dispatched to devices</div>
+                </div>
+              </div>
+              <div class="panel-body">
+                ${recent.length ? `
+                  <div style="overflow-x:auto;">
+                    <table>
+                      <thead>
+                        <tr>
+                          <th>Streamer</th>
+                          <th>Title</th>
+                          <th class="num">Recipients</th>
+                          <th>Source</th>
+                          <th style="text-align:right;">Sent</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        ${recent.map(a => `
+                          <tr>
+                            <td style="font-family:var(--font-mono);font-weight:600;white-space:nowrap;">${escapeHtml(a.slug)}</td>
+                            <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(a.title)}">${escapeHtml(a.title || 'Live!')}</td>
+                            <td class="num">${fmt(a.recipients)}</td>
+                            <td><span class="method-tag">${escapeHtml(a.source)}</span></td>
+                            <td style="font-family:var(--font-mono);font-size:11px;color:var(--muted);text-align:right;white-space:nowrap;">
+                              ${a.sentAt ? new Date(a.sentAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '—'}
+                            </td>
+                          </tr>
+                        `).join("")}
+                      </tbody>
+                    </table>
+                  </div>
+                ` : `<div style="color:var(--muted);font-size:12px;padding:24px 0;text-align:center;">No recent stream alerts recorded since backend start.</div>`}
+              </div>
+            </div>
+          </div>
+        `;
+      }
+
+      /* ================= TAB 3: API & UPSTREAM OPS ================= */
+      function renderOpsTab(d) {
+        const latency = d.upstreamLatency || {};
+        const coverage = typeof d.telemetryCoverage === "number" ? Math.round(d.telemetryCoverage * 1000) / 10 : null;
+        const optOutRate = coverage !== null ? Math.max(0, Math.round((100 - coverage) * 10) / 10) : null;
+        const activeCounters = (d.counters && d.counters[state.healthRange] && d.counters[state.healthRange].endpoints) || {};
+        let totalReqs = 0, total5xx = 0;
+        for (const e of Object.values(activeCounters)) {
+          totalReqs += (e.ok || 0) + (e.r4 || 0) + (e.r5 || 0) + (e.limited || 0) + (e.hmac || 0);
+          total5xx += e.r5 || 0;
+        }
+
+        const p95Cls = latency.p95 > 3000 ? 'bad' : (latency.p95 > 1500 ? 'warn' : 'ok');
+
+        return `
+          <!-- Row 1: Upstream Latency & Coverage -->
+          <div class="kpi-grid">
+            <div class="kpi-card">
+              <div class="kpi-label">Kick Upstream P50 Latency</div>
+              <div class="kpi-val">${latency.p50 !== null && latency.p50 !== undefined ? fmt(latency.p50) + ' ms' : '—'}</div>
+              <div class="kpi-foot">Median OAuth token exchange time</div>
+            </div>
+
+            <div class="kpi-card">
+              <div class="kpi-label">Kick Upstream P95 Latency</div>
+              <div class="kpi-val ${p95Cls}">${latency.p95 !== null && latency.p95 !== undefined ? fmt(latency.p95) + ' ms' : '—'}</div>
+              <div class="kpi-foot">${latency.p95 > 2000 ? 'Degraded upstream latency' : '95% requests completed under this'}</div>
+            </div>
+
+            <div class="kpi-card">
+              <div class="kpi-label">Slowest Upstream Response</div>
+              <div class="kpi-val secondary">${latency.max !== null && latency.max !== undefined ? fmt(latency.max) + ' ms' : '—'}</div>
+              <div class="kpi-foot">${fmt(latency.count || 0)} upstream samples tracked</div>
+            </div>
+
+            <div class="kpi-card">
+              <div class="kpi-label">Fleet Telemetry Coverage</div>
+              <div class="kpi-val secondary" style="color:var(--accent);">${coverage !== null ? coverage + '%' : '—'}</div>
+              <div class="kpi-foot">${optOutRate !== null ? `Est. ~${optOutRate}% opt-out / adblock rate` : 'Passive OAuth reconciliation'}</div>
+            </div>
+          </div>
+
+          <!-- Main API Health Panel -->
+          <div class="panel" style="margin-top:16px;">
+            <div class="panel-header">
+              <div>
+                <h2 class="panel-title">Backend API Health</h2>
+                <div class="panel-sub">${state.healthRange === 'today' ? 'Today (UTC)' : 'Trailing 7 days'} endpoint telemetry</div>
+              </div>
+              <div style="display:flex;align-items:center;gap:8px;">
+                <div style="display:inline-flex;border:1px solid var(--border);border-radius:var(--radius-control);overflow:hidden;">
+                  <button class="small ${state.healthRange === 'today' ? 'active' : ''}" id="healthTodayBtn" style="border:none;border-radius:0;">Today</button>
+                  <button class="small ${state.healthRange === 'week' ? 'active' : ''}" id="healthWeekBtn" style="border:none;border-radius:0;border-left:1px solid var(--border);">7 Days</button>
+                </div>
+                <div>
+                  ${total5xx > 0
+                    ? `<span class="pill bad">${total5xx} × 5xx</span>`
+                    : `<span class="pill ok">Zero 5xx</span>`}
+                </div>
+              </div>
+            </div>
+            <div class="panel-body">
+              ${renderEndpointHealthTable(d)}
+              <div style="margin-top:20px;">
+                <div style="font-size:12px;font-weight:500;color:var(--fg-dim);margin-bottom:8px;">Detailed operational counters</div>
+                ${renderDiagCounters(d)}
+              </div>
+            </div>
+          </div>
+        `;
+      }
+
+      function bindOpsControls(d) {
+        document.getElementById("healthTodayBtn")?.addEventListener("click", () => {
+          state.healthRange = "today";
+          render(d);
+        });
+        document.getElementById("healthWeekBtn")?.addEventListener("click", () => {
+          state.healthRange = "week";
+          render(d);
+        });
+      }
+
+      /* ================= TAB 4: SYSTEM HEALTH ================= */
+      function renderSystemTab(d) {
+        const sys = d.system || {};
+        const mem = sys.memory || {};
+        const storage = d.storage || {};
+        const fcmSize = d.fcm?.dataFileSizeKb || 0;
+        const totalStorageKb = (storage.dataFileSizeKb || 0) + fcmSize;
+
+        const maxDevs = storage.maxDevicesPerMonth || 100000;
+        const devPct = Math.min(100, Math.round(((d.mau || 0) / maxDevs) * 100));
+
+        const maxEver = storage.maxEverSeen || 250000;
+        const everCount = storage.totalDevicesEverSeen || d.totalInstalls || 0;
+        const everPct = Math.min(100, Math.round((everCount / maxEver) * 100));
+
+        return `
+          <!-- Row 1: Host & Node KPIs -->
+          <div class="kpi-grid">
+            <div class="kpi-card">
+              <div class="kpi-label">Process RSS Memory</div>
+              <div class="kpi-val">${mem.rssMb !== undefined ? mem.rssMb + ' MB' : '—'}</div>
+              <div class="kpi-foot">Resident set memory size</div>
+            </div>
+
+            <div class="kpi-card">
+              <div class="kpi-label">Node.js Heap Used</div>
+              <div class="kpi-val">${mem.heapUsedMb !== undefined ? mem.heapUsedMb + ' MB' : '—'}</div>
+              <div class="kpi-foot">${mem.heapTotalMb ? `of ${mem.heapTotalMb} MB allocated heap` : 'Active V8 objects'}</div>
+            </div>
+
+            <div class="kpi-card">
+              <div class="kpi-label">Service Uptime</div>
+              <div class="kpi-val secondary">${formatUptime(sys.uptimeSeconds)}</div>
+              <div class="kpi-foot">Continuous systemd process lifetime</div>
+            </div>
+
+            <div class="kpi-card">
+              <div class="kpi-label">Disk Storage Footprint</div>
+              <div class="kpi-val secondary">${fmt(totalStorageKb)} KB</div>
+              <div class="kpi-foot">metrics.json (${fmt(storage.dataFileSizeKb)} KB) + fcm.json (${fmt(fcmSize)} KB)</div>
+            </div>
+          </div>
+
+          <!-- Split: Capacity Limits vs Runtime Environment -->
+          <div class="grid-split">
+            <!-- Left: Capacity Thresholds -->
+            <div class="panel">
+              <div class="panel-header">
+                <div>
+                  <h2 class="panel-title">Capacity &amp; Guardrail Headroom</h2>
+                  <div class="panel-sub">Device and token thresholds preventing disk / memory bloat</div>
+                </div>
+              </div>
+              <div class="panel-body">
+                <div style="display:flex;flex-direction:column;gap:16px;">
+                  <div>
+                    <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:6px;">
+                      <span>Monthly Active Devices Quota</span>
+                      <span><b>${fmt(d.mau || 0)}</b> / ${fmt(maxDevs)} (${devPct}%)</span>
+                    </div>
+                    <div class="progress-bar"><div class="progress-fill ${devPct > 80 ? 'warn' : ''}" style="width:${devPct}%"></div></div>
+                    <div style="font-size:11px;color:var(--muted);margin-top:4px;">Configured via <code>METRICS_MAX_DEVICES_PER_MONTH</code></div>
+                  </div>
+
+                  <div>
+                    <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:6px;">
+                      <span>Install Deduplication Cache</span>
+                      <span><b>${fmt(everCount)}</b> / ${fmt(maxEver)} (${everPct}%)</span>
+                    </div>
+                    <div class="progress-bar"><div class="progress-fill ${everPct > 80 ? 'warn' : ''}" style="width:${everPct}%"></div></div>
+                    <div style="font-size:11px;color:var(--muted);margin-top:4px;">Configured via <code>METRICS_MAX_EVERSEEN</code></div>
+                  </div>
+
+                  <div style="padding-top:12px;border-top:1px solid var(--border-subtle);font-size:12px;color:var(--fg-dim);">
+                    <div>Monthly data retention: <b>3 months</b> (older monthly device sets pruned automatically)</div>
+                    <div style="margin-top:4px;">Daily outcome counter window: <b>35 days</b> rolling</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- Right: Runtime Environment -->
+            <div class="panel">
+              <div class="panel-header">
+                <div>
+                  <h2 class="panel-title">Runtime Environment</h2>
+                  <div class="panel-sub">Host and engine configuration</div>
+                </div>
+              </div>
+              <div class="panel-body">
+                <table style="font-size:12px;">
+                  <tbody>
+                    <tr><td style="color:var(--muted);width:40%;">Node.js Engine</td><td style="font-family:var(--font-mono);font-weight:600;">${escapeHtml(sys.nodeVersion || 'v22')}</td></tr>
+                    <tr><td style="color:var(--muted);">Service Name</td><td style="font-family:var(--font-mono);">KickOauthBackend.service</td></tr>
+                    <tr><td style="color:var(--muted);">HMAC Authentication</td><td><span class="pill ok">Active (SHA-256)</span></td></tr>
+                    <tr><td style="color:var(--muted);">Geo-IP Database</td><td><span class="pill ok">GeoLite2 Country (Offline)</span></td></tr>
+                    <tr><td style="color:var(--muted);">Firebase Admin SDK</td><td><span class="pill ok">Initialized</span></td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        `;
+      }
+
+      /* ================= SUB-COMPONENTS ================= */
+
+      function renderPlaybackDiagnostics(d) {
+        const engines = Array.isArray(d.playerEngines) ? d.playerEngines : [];
+        const watch = Array.isArray(d.watchTime) ? d.watchTime : [];
+        const totalEng = engines.reduce((a, b) => a + (b.count || 0), 0) || 1;
+        const totalWatch = watch.reduce((a, b) => a + (b.count || 0), 0) || 1;
+        const crashesToday = d.counters?.today?.crashes?.total || 0;
+        const crashesWeek = d.counters?.week?.crashes?.total || 0;
+
+        return `
+          <div>
+            <div style="font-size:12px;font-weight:500;color:var(--fg-dim);margin-bottom:8px;">Video Player Engine Adoption</div>
+            ${engines.length ? `
+              <div style="display:flex;flex-direction:column;gap:10px;">
+                ${engines.map(e => {
+                  const pct = Math.round((e.count / totalEng) * 100);
+                  return `
+                    <div>
+                      <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:4px;">
+                        <span>${escapeHtml(e.label)}</span>
+                        <span><b>${fmt(e.count)}</b> (${pct}%)</span>
+                      </div>
+                      <div class="progress-bar"><div class="progress-fill" style="width:${pct}%"></div></div>
+                    </div>
+                  `;
+                }).join("")}
+              </div>
+            ` : `<div style="color:var(--muted);font-size:12px;padding:6px 0;">No player engine telemetry yet.</div>`}
+          </div>
+
+          <div style="margin-top:20px;padding-top:16px;border-top:1px solid var(--border-subtle);">
+            <div style="font-size:12px;font-weight:500;color:var(--fg-dim);margin-bottom:8px;">Watch Time Distribution</div>
+            ${watch.length ? `
+              <div style="display:flex;flex-direction:column;gap:8px;">
+                ${watch.map(w => {
+                  const pct = Math.round((w.count / totalWatch) * 100);
+                  return `
+                    <div>
+                      <div style="display:flex;justify-content:space-between;font-size:11.5px;margin-bottom:3px;">
+                        <span>${escapeHtml(w.label)}</span>
+                        <span>${fmt(w.count)} (${pct}%)</span>
+                      </div>
+                      <div class="progress-bar" style="height:4px;"><div class="progress-fill" style="width:${pct}%;background:var(--bar-ret)"></div></div>
+                    </div>
+                  `;
+                }).join("")}
+              </div>
+            ` : `<div style="color:var(--muted);font-size:12px;padding:6px 0;">No watch time telemetry yet.</div>`}
+          </div>
+
+          <div style="margin-top:20px;padding-top:16px;border-top:1px solid var(--border-subtle);display:flex;justify-content:space-between;align-items:center;">
+            <div>
+              <div style="font-size:12px;font-weight:500;color:var(--fg);">Reported Uncaught Crashes</div>
+              <div style="font-size:11px;color:var(--muted);">App crashes captured via daily pings</div>
+            </div>
+            <div style="text-align:right;">
+              <span class="pill ${crashesToday > 0 ? 'bad' : 'ok'}">${crashesToday} today</span>
+              <span class="pill ok" style="margin-left:4px;">${crashesWeek} in 7d</span>
+            </div>
+          </div>
+        `;
+      }
 
       function renderEndpointHealthTable(d) {
         const counters = (d.counters && d.counters[state.healthRange]) || {};
@@ -1301,6 +1745,7 @@
                         ${e.r4 ? `<span class="tag-status warn" style="margin-left:4px;">${fmt(e.r4)} 4xx</span>` : ''}
                         ${e.r5 ? `<span class="tag-status bad" style="margin-left:4px;">${fmt(e.r5)} 5xx</span>` : ''}
                         ${e.limited ? `<span class="tag-status muted" style="margin-left:4px;">${fmt(e.limited)} limit</span>` : ''}
+                        ${e.hmac ? `<span class="tag-status bad" style="margin-left:4px;">${fmt(e.hmac)} hmac</span>` : ''}
                       </td>
                     </tr>
                   `;
@@ -1320,16 +1765,16 @@
         return `
           <div class="diag-grid">
             <div class="diag-card">
-              <div class="diag-val">${fmt(oauth.exchanged || 0)}</div>
-              <div class="diag-label">OAuth exchanged</div>
+              <div class="diag-val">${fmt(oauth.exchange_ok || oauth.exchanged || 0)}</div>
+              <div class="diag-label">OAuth exchanges OK</div>
+            </div>
+            <div class="diag-card">
+              <div class="diag-val">${fmt(oauth.refresh_ok || 0)}</div>
+              <div class="diag-label">Tokens refreshed OK</div>
             </div>
             <div class="diag-card">
               <div class="diag-val">${fmt(oauth.invalid_grant || 0)}</div>
-              <div class="diag-label">Invalid grants</div>
-            </div>
-            <div class="diag-card">
-              <div class="diag-val">${fmt(ping.ok || 0)}</div>
-              <div class="diag-label">Pings accepted</div>
+              <div class="diag-label">Invalid grant errors</div>
             </div>
             <div class="diag-card">
               <div class="diag-val">${fmt(account.recorded || 0)}</div>
@@ -1452,7 +1897,6 @@
           </td>
         `;
 
-        // Calculate weighted averages across displayed cohorts
         let d1Total = 0, d1Count = 0;
         let d7Total = 0, d7Count = 0;
         let d30Total = 0, d30Count = 0;
@@ -1519,7 +1963,7 @@
         `;
       }
 
-      /* ================= Responsive SVG Chart ================= */
+      /* ================= RESPONSIVE SVG CHART ================= */
       function drawChart(d) {
         const svgEl = document.getElementById("mainChart");
         const wrap = document.getElementById("chartWrap");
@@ -1541,7 +1985,6 @@
         const n = series.length;
         const maxVal = Math.max(1, ...series.map(p => p.dau || 0));
         
-        // Calculate clean rounded y-axis steps
         function niceStep(val) {
           if (val <= 0) return 100;
           const raw = val / 4;
@@ -1562,7 +2005,6 @@
 
         let inner = "";
 
-        // Subtle background gridlines on clean round intervals
         const tickCount = Math.round(yMax / step);
         for (let i = 0; i <= tickCount; i++) {
           const gv = step * i;
@@ -1573,7 +2015,6 @@
           `;
         }
 
-        // SVG Bars
         series.forEach((p, i) => {
           const dau = p.dau || 0;
           if (dau <= 0) return;
@@ -1593,7 +2034,6 @@
           }
         });
 
-        // 7-day Trend Line (O(N) sliding window running sum, zero per-tick array allocations)
         const trendPts = [];
         if (state.chartTrend && n >= 4) {
           const pts = [];
@@ -1613,12 +2053,10 @@
           }
         }
 
-        // Interactive hover hitboxes
         series.forEach((p, i) => {
           inner += `<rect x="${(padL + slot * i).toFixed(1)}" y="${padT}" width="${slot.toFixed(1)}" height="${plotH}" fill="transparent" data-i="${i}"/>`;
         });
 
-        // Crosshair line & trend intercept dot
         inner += `<line x1="0" y1="${padT}" x2="0" y2="${yBottom}" stroke="var(--muted)" stroke-width="1" stroke-dasharray="3 3" opacity="0" id="crosshair"/>`;
         inner += `<circle cx="0" cy="0" r="3.5" fill="var(--trend)" stroke="var(--bg)" stroke-width="1.5" opacity="0" id="crossDot"/>`;
 
@@ -1628,7 +2066,6 @@
         svgEl.setAttribute("viewBox", `0 0 ${width} ${height}`);
         svgEl.style.height = height + "px";
 
-        // Date tick marks
         const metaBar = document.getElementById("chartMetaBar");
         if (metaBar) {
           const tickIndices = n <= 7
@@ -1638,7 +2075,6 @@
           metaBar.innerHTML = uniqueIndices.map(idx => `<span>${dayLabel(series[idx].date)}</span>`).join("");
         }
 
-        // Tooltip logic
         const tip = document.getElementById("chartTip");
         const cross = document.getElementById("crosshair");
         const crossDot = document.getElementById("crossDot");
@@ -1688,7 +2124,7 @@
       window.addEventListener("resize", () => {
         clearTimeout(resizeTimer);
         resizeTimer = setTimeout(() => {
-          if (state.lastData) drawChart(state.lastData);
+          if (state.lastData && state.activeTab === "overview") drawChart(state.lastData);
         }, 100);
       });
 
@@ -1721,7 +2157,7 @@
         }
       }
 
-      /* ================= Demo Generator ================= */
+      /* ================= DEMO GENERATOR ================= */
       function mulberry32(seed) {
         let a = seed >>> 0;
         return () => {
@@ -1741,7 +2177,7 @@
         for (let i = days - 1; i >= 0; i--) {
           const d = new Date(now.getTime() - i * 86400000);
           const dow = d.getUTCDay();
-          const trend = 950 + (days - i) * 6.5;
+          const trend = 1050 + (days - i) * 6.5;
           const weekly = (dow === 0 || dow === 6) ? 1.2 : dow === 5 ? 1.14 : 1.0;
           const dau = Math.round(trend * weekly * (0.94 + rnd() * 0.12));
           const spike = rnd() > 0.92 ? Math.round(80 + rnd() * 150) : 0;
@@ -1752,82 +2188,156 @@
         const last = series[series.length - 1];
         const avg7 = Math.round(series.slice(-7).reduce((a, p) => a + p.dau, 0) / 7);
         const mau = Math.round(avg7 * 5.4);
+        const accountsMau = Math.round(avg7 * 2.35);
+
+        // Dynamic retention cohort matrix relative to today
+        const retention = [];
+        for (let r = 13; r >= 0; r--) {
+          const d = new Date(now.getTime() - r * 86400000);
+          const size = Math.round(140 + rnd() * 65);
+          const row = { date: d.toISOString().slice(0, 10), size };
+          if (r >= 1) row.d1 = Math.round(48 + rnd() * 6);
+          if (r >= 7) row.d7 = Math.round(29 + rnd() * 5);
+          if (r >= 30) row.d30 = Math.round(13 + rnd() * 4);
+          retention.push(row);
+        }
 
         const demoData = {
           generatedAt: now.toISOString(),
           currentMonth: now.toISOString().slice(0, 7),
-          totalInstalls: 14850,
+          totalInstalls: 15420,
           mau,
           wau: Math.round(avg7 * 1.38),
           dauToday: last.dau,
           newToday: last.new,
-          sessionsToday: Math.round(last.dau * 2.3),
+          sessionsToday: Math.round(last.dau * 2.4),
           stickiness: Math.round((last.dau / mau) * 1000) / 1000,
-          accountsMau: Math.round(avg7 * 2.35),
+          accountsMau,
+          pingAccountsMau: Math.round(accountsMau * 0.942),
+          telemetryCoverage: 0.942,
           versions: [
-            { version: "1.4.3", count: 5210 },
-            { version: "1.4.2", count: 2840 },
-            { version: "1.3.9", count: 1890 },
-            { version: "1.3.8", count: 940 },
-            { version: "1.3.5", count: 420 },
-            { version: "1.2.0", count: 110 },
+            { version: "2.54.0", count: 7120 },
+            { version: "2.53.1", count: 3450 },
+            { version: "2.52.0", count: 1280 },
+            { version: "2.51.0", count: 540 },
+            { version: "2.50.0", count: 180 },
           ],
           os: [
-            { label: "36", count: 5430 },
-            { label: "35", count: 3980 },
-            { label: "34", count: 2120 },
-            { label: "33", count: 980 },
+            { label: "36", count: 6120 },
+            { label: "35", count: 4280 },
+            { label: "34", count: 2310 },
+            { label: "33", count: 1040 },
             { label: "32", count: 390 },
-            { label: "31", count: 140 },
           ],
           geoCountries: [
-            { label: "US", count: 4620 },
-            { label: "DE", count: 2190 },
-            { label: "BR", count: 1740 },
-            { label: "GB", count: 1250 },
-            { label: "FR", count: 910 },
-            { label: "TR", count: 740 },
+            { label: "US", count: 5240 },
+            { label: "DE", count: 2510 },
+            { label: "BR", count: 2020 },
+            { label: "GB", count: 1440 },
+            { label: "FR", count: 990 },
+            { label: "TR", count: 830 },
           ],
+          playerEngines: [
+            { label: "Amazon IVS", code: "ivs", count: Math.round(last.dau * 0.64) },
+            { label: "Media3 / ExoPlayer", code: "exo", count: Math.round(last.dau * 0.36) },
+          ],
+          watchTime: [
+            { label: "< 15m", code: "0", count: Math.round(last.dau * 0.22) },
+            { label: "15m – 1h", code: "1", count: Math.round(last.dau * 0.38) },
+            { label: "1h – 3h", code: "2", count: Math.round(last.dau * 0.26) },
+            { label: "3h+", code: "3", count: Math.round(last.dau * 0.14) },
+          ],
+          upstreamLatency: {
+            p50: 198,
+            p90: 440,
+            p95: 680,
+            p99: 1240,
+            max: 2150,
+            avg: 265,
+            count: 5820,
+          },
+          storage: {
+            dataFileSizeKb: 1480,
+            totalDevicesEverSeen: 15420,
+            maxEverSeen: 250000,
+            maxDevicesPerMonth: 100000,
+          },
+          fcm: {
+            totalTokens: 4120,
+            activeChannels: 638,
+            dataFileSizeKb: 384,
+            pusher: {
+              state: "connected",
+              subscribedChannels: 638,
+              lastHeartbeat: new Date(Date.now() - 12000).toISOString(),
+            },
+            delivery: {
+              alertsDispatched: 182,
+              notificationsSent: 31250,
+              multicastSuccess: 31010,
+              multicastFailure: 240,
+              tokensPruned: 84,
+              sources: { webhook: 108, pusher: 62, poller: 12 },
+              recentAlerts: [
+                { slug: "xqc", title: "🔴 GAMING WARLORD TIKTOK PODCAST", recipients: 485, successCount: 482, failureCount: 3, source: "webhook", sentAt: new Date(Date.now() - 12 * 60000).toISOString() },
+                { slug: "adinross", title: "🔴 BIG STREAM TODAY WITH SPECIAL GUESTS", recipients: 440, successCount: 437, failureCount: 3, source: "pusher", sentAt: new Date(Date.now() - 38 * 60000).toISOString() },
+                { slug: "westcol", title: "🔴 HABLANDO CLARO Y JUGANDO", recipients: 395, successCount: 392, failureCount: 3, source: "webhook", sentAt: new Date(Date.now() - 74 * 60000).toISOString() },
+                { slug: "trainwreckstv", title: "🔴 LATE NIGHT SLOTS & SQUAD", recipients: 310, successCount: 309, failureCount: 1, source: "pusher", sentAt: new Date(Date.now() - 110 * 60000).toISOString() },
+                { slug: "roshtein", title: "🔴 PHILOSOPHER OF CASINO", recipients: 240, successCount: 238, failureCount: 2, source: "poller", sentAt: new Date(Date.now() - 165 * 60000).toISOString() },
+                { slug: "shroud", title: "🔴 NO SLEEP VALORANT / CS2 GRIND", recipients: 380, successCount: 378, failureCount: 2, source: "webhook", sentAt: new Date(Date.now() - 220 * 60000).toISOString() },
+                { slug: "hikaru", title: "🔴 Titled Tuesday Blitz Championship", recipients: 290, successCount: 289, failureCount: 1, source: "pusher", sentAt: new Date(Date.now() - 290 * 60000).toISOString() },
+              ],
+            },
+          },
+          system: {
+            uptimeSeconds: 1984200,
+            memory: {
+              rssMb: 72.6,
+              heapUsedMb: 38.4,
+              heapTotalMb: 52.1,
+            },
+            nodeVersion: "v22.11.0",
+          },
           dauSeries: series,
-          retention: [
-            { date: "2026-10-25", size: 140, d1: 48, d7: 29, d30: 12 },
-            { date: "2026-10-26", size: 165, d1: 51, d7: 31, d30: 14 },
-            { date: "2026-10-27", size: 155, d1: 47, d7: 28, d30: 11 },
-            { date: "2026-10-28", size: 180, d1: 52, d7: 32, d30: 15 },
-            { date: "2026-10-29", size: 190, d1: 49, d7: 30, d30: 13 },
-            { date: "2026-10-30", size: 145, d1: 46, d7: 27, d30: 12 },
-            { date: "2026-10-31", size: 210, d1: 54, d7: 34, d30: 16 },
-            { date: "2026-11-01", size: 195, d1: 50, d7: 31, d30: 14 },
-            { date: "2026-11-02", size: 160, d1: 48, d7: 29 },
-            { date: "2026-11-03", size: 175, d1: 52, d7: 32 },
-            { date: "2026-11-04", size: 185, d1: 51, d7: 30 },
-            { date: "2026-11-05", size: 170, d1: 49 },
-            { date: "2026-11-06", size: 190, d1: 53 },
-            { date: "2026-11-07", size: 142 },
-          ],
+          retention: retention,
           counters: {
-            week: {
+            today: {
+              crashes: { total: 0 },
               endpoints: {
-                "POST /v1/kick/oauth/exchange": { ok: 2140, r4: 42, r5: 0, limited: 8 },
-                "POST /v1/kick/oauth/refresh": { ok: 1890, r4: 18, r5: 0, limited: 2 },
-                "POST /v1/metrics/ping": { ok: 6420, r4: 31, r5: 0, limited: 14 },
-                "GET /v1/metrics/stats": { ok: 180, r4: 2, r5: 0, limited: 0 },
-                "GET /healthz": { ok: 2450, r4: 0, r5: 0, limited: 0 },
-                "POST /v1/fcm/subscribe": { ok: 340, r4: 6, r5: 0, limited: 0 },
+                "POST /v1/kick/oauth/exchange": { ok: 382, r4: 3, r5: 0, limited: 1 },
+                "POST /v1/kick/oauth/refresh": { ok: 964, r4: 2, r5: 0, limited: 0 },
+                "POST /v1/metrics/ping": { ok: 1540, r4: 2, r5: 0, limited: 1 },
+                "GET /v1/metrics/stats": { ok: 64, r4: 0, r5: 0, limited: 0 },
+                "POST /v1/fcm/subscribe": { ok: 118, r4: 0, r5: 0, limited: 0 },
+                "GET /healthz": { ok: 520, r4: 0, r5: 0, limited: 0 },
               },
-              oauth: { exchanged: 2140, invalid_grant: 42 },
-              ping: { ok: 6420 },
-              account: { recorded: 420 },
+              oauth: { exchange_ok: 382, refresh_ok: 964, invalid_grant: 3 },
+              ping: { ok: 1540 },
+              account: { recorded: 92 },
+            },
+            week: {
+              crashes: { total: 2 },
+              endpoints: {
+                "POST /v1/kick/oauth/exchange": { ok: 2680, r4: 36, r5: 0, limited: 6 },
+                "POST /v1/kick/oauth/refresh": { ok: 6840, r4: 15, r5: 0, limited: 2 },
+                "POST /v1/metrics/ping": { ok: 10420, r4: 24, r5: 0, limited: 9 },
+                "GET /v1/metrics/stats": { ok: 340, r4: 2, r5: 0, limited: 0 },
+                "POST /v1/fcm/subscribe": { ok: 620, r4: 4, r5: 0, limited: 0 },
+                "GET /healthz": { ok: 3850, r4: 0, r5: 0, limited: 0 },
+              },
+              oauth: { exchange_ok: 2680, refresh_ok: 6840, invalid_grant: 36 },
+              ping: { ok: 10420 },
+              account: { recorded: 540 },
             }
           }
         };
 
         state.lastData = demoData;
-        setStatus("ok", "Demo mode");
+        setStatus("ok", "Demo Mode");
         render(demoData);
       }
 
-      /* ================= Shortcuts ================= */
+      /* ================= KEYBOARD SHORTCUTS ================= */
       document.addEventListener("keydown", (e) => {
         if (e.metaKey || e.ctrlKey || e.altKey) return;
         if (e.key === "Escape") {
@@ -1836,18 +2346,18 @@
         }
         if (["INPUT", "SELECT", "TEXTAREA"].includes(e.target.tagName)) return;
         switch (e.key) {
+          case "1": switchTab("overview"); break;
+          case "2": switchTab("fcm"); break;
+          case "3": switchTab("ops"); break;
+          case "4": switchTab("system"); break;
           case "/": e.preventDefault(); tokenBtn.click(); break;
           case "r": case "R": e.preventDefault(); if (state.demo) renderDemo(); else load(); break;
           case "d": case "D": demoBtn.click(); break;
           case "t": case "T": toggleTheme(); break;
-          case "1": rangeSelect.value = "7"; rangeSelect.dispatchEvent(new Event("change")); break;
-          case "2": rangeSelect.value = "30"; rangeSelect.dispatchEvent(new Event("change")); break;
-          case "3": rangeSelect.value = "60"; rangeSelect.dispatchEvent(new Event("change")); break;
-          case "4": rangeSelect.value = "90"; rangeSelect.dispatchEvent(new Event("change")); break;
         }
       });
 
-      /* ================= Initialization ================= */
+      /* ================= INITIALIZATION ================= */
       if (new URLSearchParams(location.search).get("demo")) {
         demoBtn.click();
       } else if (state.token) {

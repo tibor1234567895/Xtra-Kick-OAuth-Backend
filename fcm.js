@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import WebSocket from "ws";
 import admin from "firebase-admin";
@@ -211,6 +211,15 @@ export function createFcmStore({ dataFile, logger, maxTokens = 100000 } = {}) {
   const channelIndex = new Map(); // channelId -> Set<token>
   let saveTimer = null;
   let nextRevision = 0;
+  const deliveryStats = {
+    alertsDispatched: 0,
+    notificationsSent: 0,
+    multicastSuccess: 0,
+    multicastFailure: 0,
+    tokensPruned: 0,
+    sources: { webhook: 0, pusher: 0, poller: 0 },
+    recentAlerts: [],
+  };
 
   function load() {
     if (!dataFile || !existsSync(dataFile)) return;
@@ -376,13 +385,48 @@ export function createFcmStore({ dataFile, logger, maxTokens = 100000 } = {}) {
       for (const tok of invalidTokens) {
         if (this.unsubscribe({ token: tok })) count++;
       }
+      deliveryStats.tokensPruned += count;
       return count;
     },
 
+    recordDelivery({ source, channelSlug, title, recipients, successCount, failureCount }) {
+      deliveryStats.alertsDispatched++;
+      deliveryStats.notificationsSent += (Number(recipients) || 0);
+      deliveryStats.multicastSuccess += (Number(successCount) || 0);
+      deliveryStats.multicastFailure += (Number(failureCount) || 0);
+      if (source && deliveryStats.sources[source] !== undefined) {
+        deliveryStats.sources[source]++;
+      }
+      deliveryStats.recentAlerts.unshift({
+        source: source || "unknown",
+        slug: channelSlug || "unknown",
+        title: title || "",
+        recipients: Number(recipients) || 0,
+        successCount: Number(successCount) || 0,
+        failureCount: Number(failureCount) || 0,
+        sentAt: new Date().toISOString(),
+      });
+      if (deliveryStats.recentAlerts.length > 10) {
+        deliveryStats.recentAlerts.pop();
+      }
+    },
+
     stats() {
+      let dataFileSizeKb = null;
+      if (dataFile && existsSync(dataFile)) {
+        try {
+          dataFileSizeKb = Math.round(statSync(dataFile).size / 1024);
+        } catch {}
+      }
       return {
         totalTokens: tokens.size,
         activeChannels: channelIndex.size,
+        dataFileSizeKb,
+        delivery: {
+          ...deliveryStats,
+          sources: { ...deliveryStats.sources },
+          recentAlerts: [...deliveryStats.recentAlerts],
+        },
       };
     },
 
@@ -431,6 +475,7 @@ export async function sendLivePushNotification({
   startTime,
   logger,
   fcmStore,
+  source = "unknown",
 }) {
   if (!messaging || !tokens || tokens.length === 0) return { successCount: 0, failureCount: 0 };
   if (tokens.length > 500) {
@@ -438,7 +483,7 @@ export async function sendLivePushNotification({
     for (let offset = 0; offset < tokens.length; offset += 500) {
       const result = await sendLivePushNotification({
         messaging, tokens: tokens.slice(offset, offset + 500), channelId, userId,
-        channelSlug, title, description, profilePicture, startTime, logger, fcmStore,
+        channelSlug, title, description, profilePicture, startTime, logger, fcmStore, source,
       });
       total.successCount += result.successCount;
       total.failureCount += result.failureCount;
@@ -485,6 +530,17 @@ export async function sendLivePushNotification({
       fcmStore.pruneInvalidTokens(invalidTokens);
     }
 
+    if (fcmStore?.recordDelivery) {
+      fcmStore.recordDelivery({
+        source,
+        channelSlug: cleanSlug,
+        title,
+        recipients: tokens.length,
+        successCount: response.successCount,
+        failureCount: response.failureCount,
+      });
+    }
+
     logger?.info(
       {
         channel: cleanSlug,
@@ -493,7 +549,7 @@ export async function sendLivePushNotification({
         pruned: invalidTokens.length,
       },
       "fcm_live_notification_dispatched"
-  );
+    );
 
     return {
       successCount: response.successCount,
@@ -501,6 +557,16 @@ export async function sendLivePushNotification({
       invalidTokens,
     };
   } catch (err) {
+    if (fcmStore?.recordDelivery) {
+      fcmStore.recordDelivery({
+        source,
+        channelSlug: cleanSlug,
+        title,
+        recipients: tokens.length,
+        successCount: 0,
+        failureCount: tokens.length,
+      });
+    }
     logger?.error({ err: err.message, channel: cleanSlug }, "fcm_live_notification_failed");
     return { successCount: 0, failureCount: tokens.length, error: err.message };
   }
@@ -539,6 +605,7 @@ export function createPusherRelay({ fcmStore, messaging, logger, seenStreams = n
   let pingInterval = null;
   let pongTimeout = null;
   let subscribedChannels = new Set();
+  let lastHeartbeatAt = null;
 
   function startHeartbeat(activityTimeoutSec = 120) {
     stopHeartbeat();
@@ -580,12 +647,14 @@ export function createPusherRelay({ fcmStore, messaging, logger, seenStreams = n
 
       ws.on("open", () => {
         logger?.info("pusher_relay_connected");
+        lastHeartbeatAt = Date.now();
         subscribedChannels.clear();
         startHeartbeat(120);
         syncSubscriptions();
       });
 
       ws.on("message", (raw) => {
+        lastHeartbeatAt = Date.now();
         try {
           const msg = JSON.parse(raw.toString());
           if (msg.event === "pusher:ping") {
@@ -725,6 +794,7 @@ export function createPusherRelay({ fcmStore, messaging, logger, seenStreams = n
         startTime,
         logger,
         fcmStore,
+        source: "pusher",
       });
       if (delivery.successCount === 0 && delivery.failureCount > 0) {
         clearFailedStream(seenStreams, candidateKeys, startTime);
@@ -739,6 +809,18 @@ export function createPusherRelay({ fcmStore, messaging, logger, seenStreams = n
   return {
     syncSubscriptions,
     handleLiveEvent,
+    getStatus() {
+      let state = "offline";
+      if (ws) {
+        if (ws.readyState === WebSocket.OPEN) state = "connected";
+        else if (ws.readyState === WebSocket.CONNECTING) state = "reconnecting";
+      }
+      return {
+        state,
+        subscribedChannels: subscribedChannels.size,
+        lastHeartbeat: lastHeartbeatAt ? new Date(lastHeartbeatAt).toISOString() : null,
+      };
+    },
     close() {
       isClosed = true;
       stopHeartbeat();
@@ -924,6 +1006,7 @@ export function createLiveStreamPoller({
                 startTime,
                 logger,
                 fcmStore,
+                source: "poller",
               });
               if (delivery.successCount === 0 && delivery.failureCount > 0) {
                 clearFailedStream(seenStreams, seenKeys, startTime);
@@ -1169,6 +1252,7 @@ export async function handleWebhookLiveEvent({
     startTime,
     logger,
     fcmStore,
+    source: "webhook",
   });
   if (delivery.successCount === 0 && delivery.failureCount > 0) {
     clearFailedStream(seenStreams, candidateKeys, startTime);

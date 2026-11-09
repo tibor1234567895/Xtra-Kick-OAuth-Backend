@@ -244,7 +244,7 @@ export function createApp(config, deps = {}) {
   if (metrics) {
     app.use("/v1/metrics", createLimiter(120));
     registerPost("/v1/metrics/ping", createLimiter(10), pingHandler(metrics, createCountryLookup(config.metrics)));
-    app.get("/v1/metrics/stats", requireAdminToken(config.metrics), statsHandler(metrics));
+    app.get("/v1/metrics/stats", requireAdminToken(config.metrics), statsHandler(metrics, fcmStore, pusherRelay));
     if (config.metrics.dashPath) {
       // The page is only a login shell; its data request remains token-protected.
       const dash = dashboardHandler(config.metrics);
@@ -323,6 +323,9 @@ const pingSchema = z.object({
   cc: z.string().regex(/^[A-Za-z]{2}$/).optional(),
   s: z.number().int().min(0).max(100_000).optional(),
   ah: z.string().regex(/^[0-9a-f]{64}$/).optional(),
+  pe: z.enum(["ivs", "exo"]).optional(),
+  c: z.number().int().min(0).max(10_000).optional(),
+  wt: z.enum(["0", "1", "2", "3"]).optional(),
 });
 
 function createLimiter(max) {
@@ -604,6 +607,7 @@ function exchangeHandler(config, upstreamFetch, metrics) {
       return res.status(400).json({ code: "invalid_redirect_uri", message: "Redirect URI is not allowed" });
     }
 
+    const start = Date.now();
     try {
       const data = await postKickForm(config, upstreamFetch, KICK_TOKEN_URL, {
         grant_type: "authorization_code",
@@ -613,6 +617,7 @@ function exchangeHandler(config, upstreamFetch, metrics) {
         client_id: config.kickClientId,
         client_secret: config.kickClientSecret,
       });
+      metrics?.recordUpstreamLatency(Date.now() - start);
 
       const responseBody = tokenResponse(data);
       if (metrics) {
@@ -628,6 +633,7 @@ function exchangeHandler(config, upstreamFetch, metrics) {
       }
       return res.status(200).json(responseBody);
     } catch (error) {
+      metrics?.recordUpstreamLatency(Date.now() - start);
       metrics?.countersOauth(error.code || "exchange_error");
       return sendOAuthError(req, res, error, "OAuth exchange failed", "exchange failed");
     }
@@ -639,6 +645,7 @@ function refreshHandler(config, upstreamFetch, metrics) {
     const parsed = refreshSchema.safeParse(req.body);
     if (!parsed.success) return validationError(res, parsed);
 
+    const start = Date.now();
     try {
       const data = await postKickForm(config, upstreamFetch, KICK_TOKEN_URL, {
         grant_type: "refresh_token",
@@ -646,6 +653,7 @@ function refreshHandler(config, upstreamFetch, metrics) {
         client_id: config.kickClientId,
         client_secret: config.kickClientSecret,
       });
+      metrics?.recordUpstreamLatency(Date.now() - start);
 
       const responseBody = tokenResponse(data);
       if (metrics) {
@@ -661,6 +669,7 @@ function refreshHandler(config, upstreamFetch, metrics) {
       }
       return res.status(200).json(responseBody);
     } catch (error) {
+      metrics?.recordUpstreamLatency(Date.now() - start);
       metrics?.countersOauth(error.code || "refresh_error");
       return sendOAuthError(req, res, error, "OAuth refresh failed", "refresh failed");
     }
@@ -1051,6 +1060,9 @@ function pingHandler(metrics, lookupCountry) {
           sessions: parsed.data.s,
           accountAid: parsed.data.ah,
           geoCountry: lookupCountry(req.ip),
+          pe: parsed.data.pe,
+          c: parsed.data.c,
+          wt: parsed.data.wt,
         },
         now
       );
@@ -1067,11 +1079,25 @@ function pingHandler(metrics, lookupCountry) {
   };
 }
 
-function statsHandler(metrics) {
+function statsHandler(metrics, fcmStore, pusherRelay) {
   return async (req, res) => {
     const daysParam = req.query.days;
     const days = typeof daysParam === "string" && /^\d{1,3}$/.test(daysParam) ? Number(daysParam) : 60;
-    const payload = metrics.computeStats(new Date(), days);
+    const mem = process.memoryUsage();
+    const system = {
+      uptimeSeconds: Math.round(process.uptime()),
+      memory: {
+        rssMb: Math.round((mem.rss / (1024 * 1024)) * 10) / 10,
+        heapUsedMb: Math.round((mem.heapUsed / (1024 * 1024)) * 10) / 10,
+        heapTotalMb: Math.round((mem.heapTotal / (1024 * 1024)) * 10) / 10,
+      },
+      nodeVersion: process.version,
+    };
+    const fcm = fcmStore ? {
+      ...fcmStore.stats(),
+      pusher: pusherRelay?.getStatus ? pusherRelay.getStatus() : null,
+    } : null;
+    const payload = metrics.computeStats(new Date(), days, { fcm, system });
     return res.status(200).json(payload);
   };
 }
