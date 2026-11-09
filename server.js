@@ -244,7 +244,7 @@ export function createApp(config, deps = {}) {
   if (metrics) {
     app.use("/v1/metrics", createLimiter(120));
     registerPost("/v1/metrics/ping", createLimiter(10), pingHandler(metrics, createCountryLookup(config.metrics)));
-    app.get("/v1/metrics/stats", requireAdminToken(config.metrics), statsHandler(metrics, fcmStore, pusherRelay));
+    app.get("/v1/metrics/stats", requireAdminToken(config.metrics), statsHandler(metrics, fcmStore, pusherRelay, liveStreamPoller));
     if (config.metrics.dashPath) {
       // The page is only a login shell; its data request remains token-protected.
       const dash = dashboardHandler(config.metrics);
@@ -1079,7 +1079,7 @@ function pingHandler(metrics, lookupCountry) {
   };
 }
 
-function statsHandler(metrics, fcmStore, pusherRelay) {
+function statsHandler(metrics, fcmStore, pusherRelay, liveStreamPoller) {
   return async (req, res) => {
     const daysParam = req.query.days;
     const days = typeof daysParam === "string" && /^\d{1,3}$/.test(daysParam) ? Number(daysParam) : 60;
@@ -1096,6 +1096,8 @@ function statsHandler(metrics, fcmStore, pusherRelay) {
     const fcm = fcmStore ? {
       ...fcmStore.stats(),
       pusher: pusherRelay?.getStatus ? pusherRelay.getStatus() : null,
+      poller: liveStreamPoller ? { active: true, intervalSeconds: 60 } : { active: false },
+      webhook: { active: true, path: "/api/events/webhook" },
     } : null;
     const payload = metrics.computeStats(new Date(), days, { fcm, system });
     return res.status(200).json(payload);

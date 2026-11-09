@@ -499,6 +499,7 @@
       .pill.ok { color: var(--good); background: var(--good-soft); }
       .pill.warn { color: var(--warn); background: var(--warn-soft); }
       .pill.bad { color: var(--bad); background: var(--bad-soft); }
+      .pill.neutral { color: var(--muted); background: var(--surface-raised); border: 1px solid var(--border); }
 
       .method-tag {
         font-family: var(--font-mono);
@@ -1300,10 +1301,11 @@
         const fcm = d.fcm || {};
         const delivery = fcm.delivery || {};
         const sources = delivery.sources || { webhook: 0, pusher: 0, poller: 0 };
-        const pusher = fcm.pusher || {};
+        const pusher = fcm.pusher;
         const totalDelivered = (delivery.multicastSuccess || 0) + (delivery.multicastFailure || 0);
         const successRate = totalDelivered > 0 ? Math.round((delivery.multicastSuccess / totalDelivered) * 100) : 100;
-        const isConnected = pusher.state === "connected";
+        const isPusherConfigured = pusher !== null && pusher !== undefined;
+        const isPusherConnected = isPusherConfigured && pusher.state === "connected";
 
         const sourceTotal = (sources.webhook || 0) + (sources.pusher || 0) + (sources.poller || 0) || 1;
         const webhookPct = Math.round(((sources.webhook || 0) / sourceTotal) * 100);
@@ -1311,6 +1313,10 @@
         const pollerPct = Math.round(((sources.poller || 0) / sourceTotal) * 100);
 
         const recent = Array.isArray(delivery.recentAlerts) ? delivery.recentAlerts : [];
+
+        const headerPill = isPusherConnected
+          ? `<span class="pill ok">Pusher &amp; Webhooks Active</span>`
+          : `<span class="pill ok">Webhooks &amp; Poller Active</span>`;
 
         return `
           <!-- Row 1: Push KPIs -->
@@ -1342,30 +1348,58 @@
 
           <!-- Split: Ingestion Architecture vs Recent Alerts -->
           <div class="grid-split">
-            <!-- Left: Pusher & Event Ingestion -->
+            <!-- Left: Ingestion Transports & Health -->
             <div class="panel">
               <div class="panel-header">
                 <div>
                   <h2 class="panel-title">Ingestion Architecture &amp; Health</h2>
-                  <div class="panel-sub">Pusher WebSocket, Kick Webhooks, and Poller fallback</div>
+                  <div class="panel-sub">Official Kick Webhooks, Poller fallback, and Pusher relay</div>
                 </div>
                 <div>
-                  <span class="pill ${isConnected ? 'ok' : 'bad'}">${isConnected ? 'Pusher Connected' : 'Pusher ' + (pusher.state || 'Offline')}</span>
+                  ${headerPill}
                 </div>
               </div>
               <div class="panel-body">
-                <div style="background:var(--surface-raised);border:1px solid var(--border);border-radius:var(--radius-control);padding:14px;margin-bottom:16px;">
-                  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
-                    <div style="font-weight:600;font-size:13px;">Pusher WebSocket Relay</div>
-                    <span class="tag-status ${isConnected ? 'ok' : 'bad'}">${isConnected ? 'Online' : 'Offline'}</span>
+                <!-- Transport 1: Official Webhooks (Primary) -->
+                <div style="background:var(--surface-raised);border:1px solid var(--border);border-radius:var(--radius-control);padding:12px 14px;margin-bottom:10px;">
+                  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;">
+                    <div style="font-weight:600;font-size:13px;">Kick Official Webhooks</div>
+                    <span class="pill ok">Active (Primary)</span>
                   </div>
-                  <div style="font-size:12px;color:var(--muted);display:flex;flex-direction:column;gap:4px;">
-                    <div>Subscribed channels on relay: <b>${fmt(pusher.subscribedChannels ?? fcm.activeChannels ?? 0)}</b></div>
-                    <div>Last socket message/heartbeat: <b>${pusher.lastHeartbeat ? new Date(pusher.lastHeartbeat).toLocaleTimeString() : '—'}</b></div>
+                  <div style="font-size:11.5px;color:var(--muted);line-height:1.45;">
+                    Real-time <code>livestream.status.updated</code> events with RSA-SHA256 signature verification.
                   </div>
                 </div>
 
-                <div style="font-size:12.5px;font-weight:500;color:var(--fg-dim);margin-bottom:10px;">Alert Ingestion Source Breakdown</div>
+                <!-- Transport 2: Live Stream Poller (Active Backup) -->
+                <div style="background:var(--surface-raised);border:1px solid var(--border);border-radius:var(--radius-control);padding:12px 14px;margin-bottom:10px;">
+                  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;">
+                    <div style="font-weight:600;font-size:13px;">Live Stream Poller Fallback</div>
+                    <span class="pill ok">Active (60s)</span>
+                  </div>
+                  <div style="font-size:11.5px;color:var(--muted);line-height:1.45;">
+                    Background REST polling across <b>${fmt(fcm.activeChannels || 0)}</b> monitored streamers via <code>api.kick.com</code>.
+                  </div>
+                </div>
+
+                <!-- Transport 3: Pusher WebSocket Relay (Legacy) -->
+                <div style="background:var(--surface-raised);border:1px solid var(--border);border-radius:var(--radius-control);padding:12px 14px;margin-bottom:16px;">
+                  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;">
+                    <div style="font-weight:600;font-size:13px;">Pusher WebSocket Relay</div>
+                    ${isPusherConnected
+                      ? `<span class="pill ok">Online</span>`
+                      : (isPusherConfigured
+                          ? `<span class="pill warn">${pusher.state || 'Reconnecting'}</span>`
+                          : `<span class="pill neutral">Disabled (Legacy)</span>`)}
+                  </div>
+                  <div style="font-size:11.5px;color:var(--muted);line-height:1.45;">
+                    ${isPusherConnected
+                      ? `Subscribed to <b>${fmt(pusher.subscribedChannels ?? fcm.activeChannels ?? 0)}</b> channels.`
+                      : `Kick migrated from Pusher to Centrifugo &amp; Developer Webhooks. Kept as optional legacy fallback.`}
+                  </div>
+                </div>
+
+                <div style="font-size:12px;font-weight:600;color:var(--fg-dim);margin-bottom:10px;">Alert Ingestion Source Breakdown</div>
                 
                 <div style="display:flex;flex-direction:column;gap:12px;">
                   <div>
@@ -1378,18 +1412,18 @@
 
                   <div>
                     <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:4px;">
-                      <span>Pusher WebSocket Relay</span>
-                      <span><b>${fmt(sources.pusher || 0)}</b> (${pusherPct}%)</span>
-                    </div>
-                    <div class="progress-bar"><div class="progress-fill" style="width:${pusherPct}%"></div></div>
-                  </div>
-
-                  <div>
-                    <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:4px;">
                       <span>Live Stream Poller Fallback</span>
                       <span><b>${fmt(sources.poller || 0)}</b> (${pollerPct}%)</span>
                     </div>
                     <div class="progress-bar"><div class="progress-fill warn" style="width:${pollerPct}%"></div></div>
+                  </div>
+
+                  <div>
+                    <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:4px;">
+                      <span>Pusher WebSocket Relay (Legacy)</span>
+                      <span><b>${fmt(sources.pusher || 0)}</b> (${pusherPct}%)</span>
+                    </div>
+                    <div class="progress-bar"><div class="progress-fill" style="width:${pusherPct}%"></div></div>
                   </div>
                 </div>
 
