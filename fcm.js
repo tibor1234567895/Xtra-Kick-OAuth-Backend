@@ -924,7 +924,7 @@ export function createLiveStreamPoller({
       for (const slug of remainingSlugs) {
         if (isClosed) break;
         try {
-          const res = await fetchJsonWithTimeout(fetchFn, `https://api.kick.com/public/v1/channels?broadcaster_user_id=${encodeURIComponent(slug)}`, {
+          const res = await fetchJsonWithTimeout(fetchFn, `https://api.kick.com/public/v1/channels?slug=${encodeURIComponent(slug)}`, {
             headers: {
               "Authorization": `Bearer ${token}`,
               "Accept": "application/json",
@@ -1355,9 +1355,13 @@ export async function syncKickEventSubscriptions({
           },
           body: JSON.stringify({
             broadcaster_user_id: Number(userId),
-            event: "livestream.status.updated",
             method: "webhook",
-            version: 1,
+            events: [
+              {
+                name: "livestream.status.updated",
+                version: 1,
+              },
+            ],
           }),
         };
 

@@ -2111,7 +2111,8 @@ test("syncKickEventSubscriptions creates missing webhook subscriptions on Kick",
   assert.equal(result.added, 1);
   assert.equal(createdSubs.length, 1);
   assert.equal(createdSubs[0].broadcaster_user_id, 333444);
-  assert.equal(createdSubs[0].event, "livestream.status.updated");
+  assert.equal(createdSubs[0].method, "webhook");
+  assert.deepEqual(createdSubs[0].events, [{ name: "livestream.status.updated", version: 1 }]);
 });
 
 test("syncKickEventSubscriptions retries on 429 rate limit and succeeds", async () => {
