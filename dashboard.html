@@ -1059,6 +1059,8 @@
       }
 
       function render(d) {
+        rangeSelect.disabled = state.activeTab === "fcm";
+        rangeSelect.title = state.activeTab === "fcm" ? "Push delivery counters cover the current backend session" : "";
         // Ensure active tab button is selected
         document.querySelectorAll(".tab-btn").forEach(btn => {
           btn.classList.toggle("active", btn.dataset.tab === state.activeTab);
@@ -1076,7 +1078,7 @@
             <div>
               <span>Generated: ${escapeHtml(d.generatedAt || '—')}</span>
               <span style="margin:0 6px;">·</span>
-              <span>Telemetry period ${escapeHtml(d.currentMonth || '—')}</span>
+              <span>${state.activeTab === "fcm" ? 'Push counters: since backend restart' : `Telemetry period ${escapeHtml(d.currentMonth || '—')}`}</span>
             </div>
             <div>
               <span><kbd>1-4</kbd> views · <kbd>R</kbd> refresh · <kbd>D</kbd> demo · <kbd>T</kbd> theme · <kbd>/</kbd> token</span>
@@ -1303,8 +1305,8 @@
         const delivery = fcm.delivery || {};
         const sources = delivery.sources || { webhook: 0, pusher: 0, poller: 0 };
         const pusher = fcm.pusher;
-        const totalDelivered = (delivery.multicastSuccess || 0) + (delivery.multicastFailure || 0);
-        const successRate = totalDelivered > 0 ? Math.round((delivery.multicastSuccess / totalDelivered) * 100) : 100;
+        const totalAttempts = (delivery.multicastSuccess || 0) + (delivery.multicastFailure || 0);
+        const successRate = totalAttempts > 0 ? Math.round((delivery.multicastSuccess / totalAttempts) * 100) : null;
         const isPusherConfigured = pusher !== null && pusher !== undefined;
         const isPusherConnected = isPusherConfigured && pusher.state === "connected";
 
@@ -1314,36 +1316,46 @@
         const pollerPct = Math.round(((sources.poller || 0) / sourceTotal) * 100);
 
         const recent = Array.isArray(delivery.recentAlerts) ? delivery.recentAlerts : [];
-
-        const headerPill = isPusherConnected
-          ? `<span class="pill ok">Pusher &amp; Webhooks Active</span>`
-          : `<span class="pill ok">Webhooks &amp; Poller Active</span>`;
+        const webhook = fcm.webhook || {};
+        const poller = fcm.poller || {};
+        const timestampLabel = value => value ? escapeHtml(new Date(value).toLocaleString()) : 'Not observed';
+        const pollStale = poller.lastSuccessAt && Date.now() - Date.parse(poller.lastSuccessAt) >
+          Math.max(180000, (poller.intervalSeconds || 60) * 3000);
+        const pollStatus = !poller.active ? 'Disabled' : poller.running ? 'Polling' : poller.lastCycleSucceeded === false
+          ? 'Last poll failed' : pollStale ? 'No recent successful poll' : poller.lastSuccessAt
+          ? 'Last poll succeeded' : 'Awaiting first poll';
+        const webhookStatus = webhook.configured === undefined ? 'Status unavailable' : !webhook.configured
+          ? 'Not configured' : webhook.lastReceivedAt ? 'Verified traffic received' : 'Awaiting verified traffic';
 
         return `
+          <div class="panel" style="padding:12px 16px;margin-bottom:16px;font-size:12px;color:var(--muted);">
+            Current stored registrations and resolved streamers. Push counters below cover <b>Since backend restart</b>
+            (${timestampLabel(delivery.since)}); the date-range selector does not apply.
+          </div>
           <!-- Row 1: Push KPIs -->
           <div class="kpi-grid">
             <div class="kpi-card">
-              <div class="kpi-label">Registered push devices</div>
+              <div class="kpi-label">Stored push registrations</div>
               <div class="kpi-val">${fmt(fcm.totalTokens || 0)}</div>
-              <div class="kpi-foot">Active device FCM tokens in store</div>
+              <div class="kpi-foot">Stored Firebase tokens; not an active-user count</div>
             </div>
 
             <div class="kpi-card">
               <div class="kpi-label">Monitored streamers</div>
-              <div class="kpi-val">${fmt(fcm.activeChannels || 0)}</div>
-              <div class="kpi-foot">Unique channel IDs tracked</div>
+              <div class="kpi-val">${fcm.monitoredStreamers === undefined ? '—' : fmt(fcm.monitoredStreamers)}</div>
+              <div class="kpi-foot">Distinct resolved streamers · ${fmt(fcm.unresolvedChannelKeys || 0)} unresolved lookup keys</div>
             </div>
 
             <div class="kpi-card">
-              <div class="kpi-label">Stream alerts sent</div>
+              <div class="kpi-label">Stream alert attempts</div>
               <div class="kpi-val">${fmt(delivery.alertsDispatched || 0)}</div>
-              <div class="kpi-foot">${fmt(delivery.notificationsSent || 0)} device notifications targeted</div>
+              <div class="kpi-foot">${fmt(delivery.notificationsSent || 0)} recipient push attempts</div>
             </div>
 
             <div class="kpi-card">
-              <div class="kpi-label">Multicast success rate</div>
-              <div class="kpi-val secondary" style="color:${successRate >= 95 ? 'var(--good)' : 'var(--warn)'}">${successRate}%</div>
-              <div class="kpi-foot">${fmt(delivery.tokensPruned || 0)} dead tokens pruned</div>
+              <div class="kpi-label">Firebase acceptance rate</div>
+              <div class="kpi-val secondary" style="color:${successRate === null ? 'var(--muted)' : successRate >= 95 ? 'var(--good)' : 'var(--warn)'}">${successRate === null ? '—' : successRate + '%'}</div>
+              <div class="kpi-foot">${fmt(delivery.multicastSuccess || 0)} accepted · ${fmt(delivery.multicastFailure || 0)} rejected; phone display is not confirmed</div>
             </div>
           </div>
 
@@ -1357,7 +1369,7 @@
                   <div class="panel-sub">Official Kick Webhooks, Poller fallback, and Pusher relay</div>
                 </div>
                 <div>
-                  ${headerPill}
+                  <span class="pill neutral">Observed activity</span>
                 </div>
               </div>
               <div class="panel-body">
@@ -1365,10 +1377,14 @@
                 <div style="background:var(--surface-raised);border:1px solid var(--border);border-radius:var(--radius-control);padding:12px 14px;margin-bottom:10px;">
                   <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;">
                     <div style="font-weight:600;font-size:13px;">Kick Official Webhooks</div>
-                    <span class="pill ok">Active (Primary)</span>
+                    <span class="pill ${webhook.lastReceivedAt && webhook.configured ? 'ok' : 'neutral'}">${webhookStatus}</span>
                   </div>
                   <div style="font-size:11.5px;color:var(--muted);line-height:1.45;">
                     Real-time <code>livestream.status.updated</code> events with RSA-SHA256 signature verification.
+                    <br>Last verified event: ${timestampLabel(webhook.lastReceivedAt)}.
+                    <br>${fmt(webhook.errors || 0)} rejected requests or processing errors; last error:
+                    ${webhook.lastErrorCode ? escapeHtml(webhook.lastErrorCode) : 'None observed'}
+                    ${webhook.lastErrorAt ? '(' + timestampLabel(webhook.lastErrorAt) + ')' : ''}.
                   </div>
                 </div>
 
@@ -1376,10 +1392,14 @@
                 <div style="background:var(--surface-raised);border:1px solid var(--border);border-radius:var(--radius-control);padding:12px 14px;margin-bottom:10px;">
                   <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;">
                     <div style="font-weight:600;font-size:13px;">Live Stream Poller Fallback</div>
-                    <span class="pill ok">Active (60s)</span>
+                    <span class="pill ${poller.lastCycleSucceeded === false || pollStale ? 'warn' : poller.lastSuccessAt ? 'ok' : 'neutral'}">${pollStatus}</span>
                   </div>
                   <div style="font-size:11.5px;color:var(--muted);line-height:1.45;">
-                    Background REST polling across <b>${fmt(fcm.activeChannels || 0)}</b> monitored streamers via <code>api.kick.com</code>.
+                    REST checks via <code>api.kick.com</code>; ${fmt(poller.intervalSeconds || 60)}s between cycles.
+                    <br>Last successful cycle: ${timestampLabel(poller.lastSuccessAt)}.
+                    <br>${fmt(poller.failedCycles || 0)} failed cycles; last error:
+                    ${poller.lastErrorCode ? escapeHtml(poller.lastErrorCode) : 'None observed'}
+                    ${poller.lastErrorAt ? '(' + timestampLabel(poller.lastErrorAt) + ')' : ''}.
                   </div>
                 </div>
 
@@ -1395,12 +1415,12 @@
                   </div>
                   <div style="font-size:11.5px;color:var(--muted);line-height:1.45;">
                     ${isPusherConnected
-                      ? `Subscribed to <b>${fmt(pusher.subscribedChannels ?? fcm.activeChannels ?? 0)}</b> channels.`
+                      ? `Subscribed to <b>${fmt(pusher.subscribedChannels ?? fcm.activeChannels ?? 0)}</b> lookup keys.`
                       : `Kick migrated from Pusher to Centrifugo &amp; Developer Webhooks. Kept as optional legacy fallback.`}
                   </div>
                 </div>
 
-                <div style="font-size:12px;font-weight:600;color:var(--fg-dim);margin-bottom:10px;">Alert Ingestion Source Breakdown</div>
+                <div style="font-size:12px;font-weight:600;color:var(--fg-dim);margin-bottom:10px;">Alert attempt sources · since backend restart</div>
                 
                 <div style="display:flex;flex-direction:column;gap:12px;">
                   <div>
@@ -1440,7 +1460,7 @@
               <div class="panel-header">
                 <div>
                   <h2 class="panel-title">Recent Stream Live Alerts</h2>
-                  <div class="panel-sub">Last live notifications dispatched to devices</div>
+                  <div class="panel-sub">Last 10 alert attempts since backend restart; recipients were targeted, not confirmed delivered</div>
                 </div>
               </div>
               <div class="panel-body">
@@ -1453,7 +1473,7 @@
                           <th>Title</th>
                           <th class="num">Recipients</th>
                           <th>Source</th>
-                          <th style="text-align:right;">Sent</th>
+                          <th style="text-align:right;">Attempted</th>
                         </tr>
                       </thead>
                       <tbody>
@@ -1484,9 +1504,8 @@
         const coverage = typeof d.telemetryCoverage === "number" ? Math.round(d.telemetryCoverage * 1000) / 10 : null;
         const optOutRate = coverage !== null ? Math.max(0, Math.round((100 - coverage) * 10) / 10) : null;
         const activeCounters = (d.counters && d.counters[state.healthRange] && d.counters[state.healthRange].endpoints) || {};
-        let totalReqs = 0, total5xx = 0;
+        let total5xx = 0;
         for (const e of Object.values(activeCounters)) {
-          totalReqs += (e.ok || 0) + (e.r4 || 0) + (e.r5 || 0) + (e.limited || 0) + (e.hmac || 0);
           total5xx += e.r5 || 0;
         }
 
@@ -1772,8 +1791,8 @@
         const counters = (d.counters && d.counters[state.healthRange]) || {};
         const endpoints = counters.endpoints || {};
         const entries = Object.entries(endpoints).sort((a, b) => {
-          const totalA = (a[1].ok || 0) + (a[1].r4 || 0) + (a[1].r5 || 0);
-          const totalB = (b[1].ok || 0) + (b[1].r4 || 0) + (b[1].r5 || 0);
+          const totalA = (a[1].ok || 0) + (a[1].r4 || 0) + (a[1].r5 || 0) + (a[1].limited || 0);
+          const totalB = (b[1].ok || 0) + (b[1].r4 || 0) + (b[1].r5 || 0) + (b[1].limited || 0);
           return totalB - totalA;
         });
 
@@ -1792,8 +1811,8 @@
               </thead>
               <tbody>
                 ${entries.map(([name, e]) => {
-                  const total = (e.ok || 0) + (e.r4 || 0) + (e.r5 || 0) + (e.limited || 0) + (e.hmac || 0);
-                  const errors = (e.r4 || 0) + (e.r5 || 0);
+                  const total = (e.ok || 0) + (e.r4 || 0) + (e.r5 || 0) + (e.limited || 0);
+                  const errors = (e.r4 || 0) + (e.r5 || 0) + (e.limited || 0);
                   const rate = total > 0 ? Math.round((errors / total) * 100) : 0;
                   const statusCls = e.r5 > 0 ? 'bad' : (rate > 10 ? 'warn' : 'ok');
                   
@@ -1818,7 +1837,7 @@
                         ${e.r4 ? `<span class="tag-status warn" style="margin-left:4px;">${fmt(e.r4)} 4xx</span>` : ''}
                         ${e.r5 ? `<span class="tag-status bad" style="margin-left:4px;">${fmt(e.r5)} 5xx</span>` : ''}
                         ${e.limited ? `<span class="tag-status muted" style="margin-left:4px;">${fmt(e.limited)} limit</span>` : ''}
-                        ${e.hmac ? `<span class="tag-status bad" style="margin-left:4px;">${fmt(e.hmac)} hmac</span>` : ''}
+                        ${e.hmac ? `<span class="tag-status bad" style="margin-left:4px;" title="HMAC rejections are included in 4xx">${fmt(e.hmac)} hmac (4xx)</span>` : ''}
                       </td>
                     </tr>
                   `;
@@ -2338,13 +2357,28 @@
           fcm: {
             totalTokens: 4120,
             activeChannels: 638,
+            monitoredStreamers: 211,
+            unresolvedChannelKeys: 5,
             dataFileSizeKb: 384,
+            webhook: {
+              configured: true,
+              lastReceivedAt: new Date(Date.now() - 120000).toISOString(),
+              errors: 0,
+            },
+            poller: {
+              active: true,
+              intervalSeconds: 60,
+              lastCycleSucceeded: true,
+              lastSuccessAt: new Date(Date.now() - 20000).toISOString(),
+              failedCycles: 0,
+            },
             pusher: {
               state: "connected",
               subscribedChannels: 638,
               lastHeartbeat: new Date(Date.now() - 12000).toISOString(),
             },
             delivery: {
+              since: new Date(Date.now() - 1984200000).toISOString(),
               alertsDispatched: 182,
               notificationsSent: 31250,
               multicastSuccess: 31010,

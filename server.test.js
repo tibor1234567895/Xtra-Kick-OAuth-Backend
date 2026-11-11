@@ -13,6 +13,7 @@ import { CRASH_RETENTION_MS, MAX_CRASH_GROUPS, MAX_CRASH_EVENTS, crashReportSche
 import {
   clearChannelResolutionCache,
   clearKickPublicKeyCache,
+  channelResolutionCache,
   createFcmStore,
   createLiveStreamPoller,
   createPusherRelay,
@@ -583,6 +584,11 @@ test("stats endpoint requires admin token", async () => {
   );
   assert.equal(ok.status, 200);
   assert.equal(typeof ok.body.mau, "number");
+  assert.equal(ok.body.fcm.monitoredStreamers, 0);
+  assert.ok(Number.isFinite(Date.parse(ok.body.fcm.delivery.since)));
+  assert.equal(ok.body.fcm.poller.active, false);
+  assert.equal(ok.body.fcm.webhook.configured, false);
+  assert.equal(ok.body.fcm.webhook.lastReceivedAt, null);
   store.close();
 });
 
@@ -1159,6 +1165,27 @@ test("fcm store subscribes and creates reverse index", () => {
   assert.equal(store.stats().activeChannels, 2);
 });
 
+test("push stats count resolved streamers once across aliases and expose unresolved keys", () => {
+  clearChannelResolutionCache();
+  const store = createFcmStore();
+  const resolved = { userId: "42", channelId: "44", slug: "alias-streamer", expiresAt: Date.now() + 60000 };
+  for (const key of ["42", "44", "alias-streamer"]) channelResolutionCache.set(key, resolved);
+  channelResolutionCache.set("expired", { userId: "99", expiresAt: 0 });
+  store.subscribe({ token: "one", channelIds: ["42", "44", "alias-streamer", "unknown", "expired"] });
+  store.subscribe({ token: "two", channelIds: ["alias-streamer"] });
+  const stats = store.stats();
+  assert.equal(stats.totalTokens, 2);
+  assert.equal(stats.activeChannels, 5);
+  assert.equal(stats.monitoredStreamers, 1);
+  assert.equal(stats.unresolvedChannelKeys, 2);
+  assert.ok(Number.isFinite(Date.parse(stats.delivery.since)));
+  assert.equal(store.stats().delivery.since, stats.delivery.since);
+  store.unsubscribe({ token: "one" });
+  assert.equal(store.stats().monitoredStreamers, 1);
+  assert.equal(store.stats().unresolvedChannelKeys, 0);
+  clearChannelResolutionCache();
+});
+
 test("fcm store persists across instances", () => {
   const dir = mkdtempSync(join(tmpdir(), "fcm-"));
   const file = join(dir, "fcm.json");
@@ -1673,16 +1700,22 @@ test("failed webhook delivery can retry the same stream without duplicating a su
   fcmStore.subscribe({ token: "retry-token", channelIds: ["42", "retry-streamer"] });
   const seenStreams = new Map();
   let calls = 0;
+  let failFirst;
   const messaging = {
     async sendEachForMulticast(payload) {
-      if (++calls === 1) throw new Error("temporary FCM outage");
+      if (++calls === 1) return await new Promise((_, reject) => { failFirst = reject; });
       return { successCount: payload.tokens.length, failureCount: 0, responses: payload.tokens.map(() => ({ success: true })) };
     },
   };
   const options = { eventType: "livestream.status.updated", fcmStore, messaging, seenStreams,
     payload: { broadcaster: { user_id: 42, channel_slug: "retry-streamer" }, is_live: true, started_at: "2026-11-05T12:00:00Z" } };
 
-  const failed = await handleWebhookLiveEvent(options);
+  const firstDelivery = handleWebhookLiveEvent(options);
+  await handleWebhookLiveEvent({ ...options, payload: { ...options.payload, is_live: false } });
+  assert.equal((await handleWebhookLiveEvent(options)).duplicate, true);
+  assert.equal(calls, 1);
+  failFirst(new Error("temporary FCM outage"));
+  const failed = await firstDelivery;
   assert.equal(failed.delivery.failureCount, 1);
   assert.equal(seenStreams.has("42"), false);
   const retried = await handleWebhookLiveEvent(options);
@@ -1742,10 +1775,67 @@ test("poller and webhook deduplicate equivalent UTC start-time formats after war
     live = true;
     await handleWebhookLiveEvent({ eventType: "livestream.status.updated", fcmStore, messaging, seenStreams,
       payload: { broadcaster: { user_id: 42, channel_slug: "format-streamer" }, is_live: true, started_at: "2026-11-05T12:00:00.000Z" } });
+    live = false;
+    await poller.checkLiveStreams();
+    live = true;
     await poller.checkLiveStreams();
     assert.equal(calls, 1);
+    const options = { eventType: "livestream.status.updated", fcmStore, messaging, seenStreams };
+    const broadcast = { broadcaster: { user_id: 42, channel_slug: "format-streamer" }, is_live: true,
+      started_at: "2026-11-05T12:00:00.000Z" };
+    await handleWebhookLiveEvent({ ...options, payload: { ...broadcast, is_live: false } });
+    await handleWebhookLiveEvent({ ...options, payload: broadcast });
+    assert.equal(calls, 1);
+    await handleWebhookLiveEvent({ ...options, payload: { ...broadcast, started_at: "2026-11-05T12:30:00Z" } });
+    assert.equal(calls, 2);
+    await handleWebhookLiveEvent({ ...options, payload: broadcast });
+    assert.equal(calls, 2);
   } finally {
     poller.close();
+  }
+});
+
+test("poller health records token failures, partial upstream failures, and recovery", async () => {
+  clearChannelResolutionCache();
+  const store = createFcmStore();
+  store.subscribe({ token: "health-token", channelIds: ["42", "unresolved"] });
+  let failToken = true;
+  let failSlug = false;
+  let throwRequest = false;
+  const poller = createLiveStreamPoller({
+    fcmStore: store, messaging: {}, config: { kickClientId: "test", kickClientSecret: "test" },
+    fetchFn: async url => {
+      if (url.includes("/oauth/token")) return failToken ? jsonResponse(503, {})
+        : jsonResponse(200, { access_token: "health-token", expires_in: 3600 });
+      if (throwRequest) throw new Error("upstream unavailable");
+      return failSlug && url.includes("slug=") ? jsonResponse(503, {}) : jsonResponse(200, { data: [] });
+    },
+  });
+  try {
+    assert.equal(poller.getStatus().lastSuccessAt, null);
+    await poller.checkLiveStreams();
+    assert.equal(poller.getStatus().lastErrorCode, "app_token_unavailable");
+    assert.equal(poller.getStatus().lastSuccessAt, null);
+    failToken = false;
+    await poller.checkLiveStreams();
+    assert.ok(poller.getStatus().lastSuccessAt);
+    assert.equal(poller.getStatus().lastCycleSucceeded, true);
+    const lastSuccess = poller.getStatus().lastSuccessAt;
+    failSlug = true;
+    await poller.checkLiveStreams();
+    assert.equal(poller.getStatus().lastErrorCode, "upstream_http_503");
+    assert.equal(poller.getStatus().lastSuccessAt, lastSuccess);
+    assert.equal(poller.getStatus().failedCycles, 2);
+    failSlug = false;
+    await poller.checkLiveStreams();
+    assert.equal(poller.getStatus().lastCycleSucceeded, true);
+    assert.equal(poller.getStatus().lastErrorCode, "upstream_http_503");
+    throwRequest = true;
+    await poller.checkLiveStreams();
+    assert.equal(poller.getStatus().lastErrorCode, "upstream_request_failed");
+  } finally {
+    poller.close();
+    assert.equal(poller.getStatus().active, false);
   }
 });
 
@@ -1996,11 +2086,12 @@ test("POST /api/events/webhook and /v1/events/webhook validate signatures and ha
     return { ok: false, status: 404 };
   };
 
-  const server = http.createServer(createApp(config(), {
+  const app = createApp(config(), {
     fetch: mockFetch,
     fcmStore,
     messaging: mockMessaging,
-  }));
+  });
+  const server = http.createServer(app);
   await new Promise((resolve) => server.listen(0, resolve));
   const port = server.address().port;
 
@@ -2012,6 +2103,8 @@ test("POST /api/events/webhook and /v1/events/webhook validate signatures and ha
       body: JSON.stringify({}),
     });
     assert.equal(res1.status, 400);
+    assert.equal(app.locals.kickWebhookHandler.getStatus().lastReceivedAt, null);
+    assert.equal(app.locals.kickWebhookHandler.getStatus().lastErrorCode, "missing_signature_headers");
 
     // 2. Invalid signature -> 401
     const res2 = await fetch(`http://127.0.0.1:${port}/api/events/webhook`, {
@@ -2099,6 +2192,12 @@ test("POST /api/events/webhook and /v1/events/webhook validate signatures and ha
       body: eventBody,
     });
     assert.equal(res5.status, 200);
+    const status = app.locals.kickWebhookHandler.getStatus();
+    assert.equal(status.configured, true);
+    assert.equal(status.verifiedEvents, 2);
+    assert.equal(status.errors, 2);
+    assert.equal(status.lastErrorCode, "invalid_signature");
+    assert.ok(status.lastReceivedAt);
   } finally {
     server.close();
     clearKickPublicKeyCache();
@@ -2442,6 +2541,7 @@ test("crash endpoint requires HMAC, rejects private fields, deduplicates, and pr
     assert.equal(stats.body.crashReports[0].count, 1);
     assert.equal(stats.body.crashReports[0].exceptions[0].frames[0].line, 42);
     assert.equal(stats.body.crashReports[0].id, undefined);
+    assert.deepEqual(stats.body.counters.today.endpoints[`POST ${path}`], { hmac: 1, r4: 2, ok: 2 });
   });
   store.close();
   app.locals.crashReports.close();
@@ -2679,6 +2779,106 @@ test("dashboard crash details render untrusted strings only as text", () => {
   assert.match(details.children[2].textContent, /Example\.kt:42/);
   render([]);
   assert.match(container.children.at(-1).textContent, /No crash details received/);
+});
+
+test("push dashboard reports observed health, session scope, and Firebase acceptance", () => {
+  const html = readFileSync(new URL("./dashboard.html", import.meta.url), "utf8");
+  const helpers = html.slice(html.indexOf("function escapeHtml("), html.indexOf("let regionNames"));
+  const start = html.indexOf("function renderFcmTab(");
+  const end = html.indexOf("function renderOpsTab(", start);
+  const render = runInNewContext(helpers + html.slice(start, end) + ";renderFcmTab");
+  const empty = render({});
+  assert.match(empty, /Since backend restart/);
+  assert.match(empty, /Status unavailable/);
+  assert.doesNotMatch(empty, /100%|Active \(Primary\)|Webhooks &amp; Poller Active/);
+
+  const fcm = {
+    totalTokens: 322, activeChannels: 1737, monitoredStreamers: 211, unresolvedChannelKeys: 5,
+    delivery: { since: new Date().toISOString(), alertsDispatched: 60, notificationsSent: 91,
+      multicastSuccess: 90, multicastFailure: 1 },
+    webhook: { configured: true, errors: 1, lastErrorCode: "<img src=x onerror=alert(1)>" },
+    poller: { active: true, intervalSeconds: 60, lastCycleSucceeded: false, failedCycles: 1,
+      lastSuccessAt: new Date().toISOString(), lastErrorCode: "upstream_http_503" },
+  };
+  const failed = render({ fcm });
+  assert.match(failed, /99%/);
+  assert.match(failed, /90 accepted · 1 rejected/);
+  assert.match(failed, /211/);
+  assert.match(failed, /5 unresolved lookup keys/);
+  assert.doesNotMatch(failed, /1,737/);
+  assert.match(failed, /Awaiting verified traffic/);
+  assert.match(failed, /Last poll failed/);
+  assert.match(failed, /&lt;img/);
+  assert.doesNotMatch(failed, /<img/);
+
+  fcm.webhook.lastReceivedAt = new Date().toISOString();
+  fcm.poller.lastCycleSucceeded = true;
+  const recovered = render({ fcm });
+  assert.match(recovered, /Verified traffic received/);
+  assert.match(recovered, /Last poll succeeded/);
+  assert.match(recovered, /upstream_http_503/);
+  assert.doesNotMatch(recovered, /Last poll failed/);
+  fcm.poller.lastSuccessAt = new Date(Date.now() - 240000).toISOString();
+  assert.match(render({ fcm }), /No recent successful poll/);
+});
+
+test("dashboard disables the date range only for session-scoped push counters", () => {
+  const html = readFileSync(new URL("./dashboard.html", import.meta.url), "utf8");
+  const start = html.indexOf("function render(d)");
+  const end = html.indexOf("function renderOverviewTab(", start);
+  const root = {};
+  const rangeSelect = {};
+  const state = { activeTab: "fcm" };
+  const render = runInNewContext(html.slice(start, end) + ";render", {
+    root, rangeSelect, state, document: { querySelectorAll: () => [] },
+    escapeHtml: String, renderFcmTab: () => "push content", renderSystemTab: () => "system content",
+  });
+  render({ currentMonth: "2026-11" });
+  assert.equal(rangeSelect.disabled, true);
+  assert.match(rangeSelect.title, /current backend session/);
+  assert.match(root.innerHTML, /Push counters: since backend restart/);
+  assert.doesNotMatch(root.innerHTML, /Telemetry period/);
+  state.activeTab = "system";
+  render({ currentMonth: "2026-11" });
+  assert.equal(rangeSelect.disabled, false);
+  assert.equal(rangeSelect.title, "");
+  assert.match(root.innerHTML, /Telemetry period 2026-11/);
+});
+
+test("dashboard counts HMAC rejections within 4xx and rate limits as failed requests", () => {
+  const html = readFileSync(new URL("./dashboard.html", import.meta.url), "utf8");
+  const start = html.indexOf("function renderEndpointHealthTable(");
+  const end = html.indexOf("function renderDiagCounters(", start);
+  const state = { healthRange: "today" };
+  const render = runInNewContext(html.slice(start, end) + ";renderEndpointHealthTable", {
+    state, fmt: value => String(value), escapeHtml: value => String(value),
+  });
+  const store = createMetricsStore({ salt: "endpoint-counts" });
+  const endpoint = "POST /v1/metrics/crash";
+  try {
+    store.countersHmacRejected(endpoint);
+    for (const status of [401, 204, 400, 400, 413]) store.countersEndpoint(endpoint, status);
+    for (const range of ["today", "week"]) {
+      state.healthRange = range;
+      const table = render(store.computeStats());
+      assert.match(table, /<td class="num">5<\/td>/);
+      assert.match(table, /80% failure/);
+      assert.match(table, /1 hmac \(4xx\)/);
+      assert.match(table, /HMAC rejections are included in 4xx/);
+    }
+
+    store.countersEndpoint(endpoint, 429);
+    const limited = render(store.computeStats());
+    assert.match(limited, /<td class="num">6<\/td>/);
+    assert.match(limited, /83% failure/);
+    for (let i = 0; i < 7; i++) store.countersEndpoint("POST /v1/limited", 429);
+    const sorted = render(store.computeStats());
+    assert.ok(sorted.indexOf("/limited") < sorted.indexOf("/metrics/crash"));
+    assert.match(sorted, /100% failure/);
+    assert.match(render({}), /No endpoint telemetry available/);
+  } finally {
+    store.close();
+  }
 });
 
 test("crash endpoint retains client retry eligibility when storage fails and rate limits uploads", async () => {

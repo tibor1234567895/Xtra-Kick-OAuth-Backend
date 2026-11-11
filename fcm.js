@@ -212,6 +212,7 @@ export function createFcmStore({ dataFile, logger, maxTokens = 100000 } = {}) {
   let saveTimer = null;
   let nextRevision = 0;
   const deliveryStats = {
+    since: new Date().toISOString(),
     alertsDispatched: 0,
     notificationsSent: 0,
     multicastSuccess: 0,
@@ -412,6 +413,21 @@ export function createFcmStore({ dataFile, logger, maxTokens = 100000 } = {}) {
     },
 
     stats() {
+      const streamers = new Set();
+      let unresolvedChannelKeys = 0;
+      const now = Date.now();
+      for (const key of channelIndex.keys()) {
+        const resolved = channelResolutionCache.get(key.toLowerCase());
+        if (resolved && resolved.expiresAt > now) {
+          const identity = resolved.userId ? `user:${resolved.userId}`
+            : resolved.channelId ? `channel:${resolved.channelId}` : null;
+          if (identity) {
+            streamers.add(identity);
+            continue;
+          }
+        }
+        unresolvedChannelKeys++;
+      }
       let dataFileSizeKb = null;
       if (dataFile && existsSync(dataFile)) {
         try {
@@ -421,6 +437,8 @@ export function createFcmStore({ dataFile, logger, maxTokens = 100000 } = {}) {
       return {
         totalTokens: tokens.size,
         activeChannels: channelIndex.size,
+        monitoredStreamers: streamers.size,
+        unresolvedChannelKeys,
         dataFileSizeKb,
         delivery: {
           ...deliveryStats,
@@ -547,29 +565,50 @@ export async function sendLivePushNotification({
   return total;
 }
 
+const recentStreamSessions = new WeakMap();
+
+function streamStartKey(value) {
+  const text = String(value).trim();
+  const unzoned = /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?$/.test(text);
+  const timestamp = Date.parse(unzoned ? `${text.replace(" ", "T")}Z` : text);
+  return Number.isFinite(timestamp) ? String(timestamp) : text;
+}
+
 function sameStreamStartTime(left, right) {
-  if (!left || !right) return false;
-  if (left === right) return true;
-  const utcMillis = (value) => {
-    const text = String(value).trim();
-    const unzoned = /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?$/.test(text);
-    return Date.parse(unzoned ? `${text.replace(" ", "T")}Z` : text);
-  };
-  const first = utcMillis(left);
-  return Number.isFinite(first) && first === utcMillis(right);
+  return Boolean(left && right && streamStartKey(left) === streamStartKey(right));
+}
+
+function hasSeenStream(seenStreams, keys, startTime) {
+  if (!seenStreams || !startTime) return false;
+  const history = recentStreamSessions.get(seenStreams);
+  const startKey = streamStartKey(startTime);
+  return keys.some(key => key && (sameStreamStartTime(seenStreams.get(key), startTime) ||
+    history?.has(`${key}\n${startKey}`)));
 }
 
 function markStreamSeen(seenStreams, keys, startTime) {
   if (!seenStreams || !startTime) return;
+  let history = recentStreamSessions.get(seenStreams);
+  if (!history) {
+    history = new Map();
+    recentStreamSessions.set(seenStreams, history);
+  }
+  const startKey = streamStartKey(startTime);
   for (const key of keys) {
-    if (key) seenStreams.set(key, startTime);
+    if (key) {
+      seenStreams.set(key, startTime);
+      // Keep session reservations when a delayed offline observation clears live state.
+      history.set(`${key}\n${startKey}`, true);
+    }
   }
   while (seenStreams.size > 5000) seenStreams.delete(seenStreams.keys().next().value);
+  while (history.size > 5000) history.delete(history.keys().next().value);
 }
 
 function clearFailedStream(seenStreams, keys, startTime) {
   for (const key of keys) {
     if (key && sameStreamStartTime(seenStreams?.get(key), startTime)) seenStreams.delete(key);
+    if (key && startTime) recentStreamSessions.get(seenStreams)?.delete(`${key}\n${streamStartKey(startTime)}`);
   }
 }
 
@@ -734,7 +773,7 @@ export function createPusherRelay({ fcmStore, messaging, logger, seenStreams = n
 
       const candidateKeys = [channelFromPusher, channelIdFromData, userId, slug].filter(Boolean);
       const startTime = data.start_time || data.created_at || data.createdAt;
-      if (candidateKeys.some((key) => sameStreamStartTime(seenStreams.get(key), startTime))) return;
+      if (hasSeenStream(seenStreams, candidateKeys, startTime)) return;
       const tokenSet = new Set();
       for (const key of candidateKeys) {
         for (const tok of fcmStore.getTokensForChannel(key)) {
@@ -821,12 +860,16 @@ export function createLiveStreamPoller({
   let timer = null;
   let isPolling = false;
   let isFirstPoll = true;
+  const status = { lastAttemptAt: null, lastSuccessAt: null, lastErrorAt: null, lastErrorCode: null, lastCycleSucceeded: null, failedCycles: 0 };
 
   async function checkLiveStreams() {
     if (isClosed || isPolling) return;
     if (!fcmStore || !messaging) return;
 
     isPolling = true;
+    status.lastAttemptAt = new Date().toISOString();
+    let cycleError = null;
+    let completed = false;
     try {
       const allActive = fcmStore.getActiveChannels();
       if (allActive.length === 0) return;
@@ -838,6 +881,7 @@ export function createLiveStreamPoller({
         logger,
       });
       if (!token) {
+        cycleError = "app_token_unavailable";
         logger?.warn("live_poller_skipped_no_app_token");
         return;
       }
@@ -881,9 +925,11 @@ export function createLiveStreamPoller({
               foundChannels.push(ch);
             }
           } else {
+            cycleError = `upstream_http_${res.status}`;
             logger?.warn({ status: res.status }, "live_poller_batch_fetch_failed");
           }
         } catch (err) {
+          cycleError = "upstream_request_failed";
           logger?.warn({ err: err.message }, "live_poller_batch_fetch_error");
         }
       }
@@ -912,8 +958,11 @@ export function createLiveStreamPoller({
             for (const ch of data) {
               foundChannels.push(ch);
             }
+          } else {
+            cycleError = `upstream_http_${res.status}`;
           }
         } catch (err) {
+          cycleError = "upstream_request_failed";
           logger?.debug({ err: err?.message, slug }, "pusher_poll_slug_query_failed");
         }
       }
@@ -934,7 +983,7 @@ export function createLiveStreamPoller({
         if (isLive && startTime) {
           liveCount++;
           const seenKeys = [channelKey, slug, uId, ch.channel_id ? String(ch.channel_id) : null];
-          if (!seenKeys.some((key) => key && sameStreamStartTime(seenStreams.get(key), startTime))) {
+          if (!hasSeenStream(seenStreams, seenKeys, startTime)) {
             // Transition: stream just started (or first time seeing it)
             markStreamSeen(seenStreams, seenKeys, startTime);
 
@@ -1002,10 +1051,21 @@ export function createLiveStreamPoller({
         "live_poller_cycle_complete"
       );
       isFirstPoll = false;
+      completed = true;
     } catch (err) {
+      cycleError = "poll_failed";
       logger?.warn({ err: err.message }, "live_poller_cycle_failed");
     } finally {
       isPolling = false;
+      if (cycleError) {
+        status.lastCycleSucceeded = false;
+        status.lastErrorAt = new Date().toISOString();
+        status.lastErrorCode = cycleError;
+        status.failedCycles++;
+      } else if (completed) {
+        status.lastCycleSucceeded = true;
+        status.lastSuccessAt = new Date().toISOString();
+      }
     }
   }
 
@@ -1029,6 +1089,9 @@ export function createLiveStreamPoller({
 
   return {
     checkLiveStreams,
+    getStatus() {
+      return { ...status, active: !isClosed, running: isPolling, intervalSeconds: pollIntervalMs / 1000 };
+    },
     getSeenStreams() {
       return seenStreams;
     },
@@ -1178,7 +1241,7 @@ export async function handleWebhookLiveEvent({
   // Stream is live: check deduplication
   const streamKey = userId || slug;
   const candidateKeys = [userId, slug, channelId].filter(Boolean);
-  if (candidateKeys.some((key) => sameStreamStartTime(seenStreams?.get(key), startTime))) {
+  if (hasSeenStream(seenStreams, candidateKeys, startTime)) {
     logger?.info({ streamKey, startTime }, "kick_webhook_stream_already_seen");
     return { ok: true, duplicate: true };
   }

@@ -269,7 +269,7 @@ export function createApp(config, deps = {}) {
         return res.status(error.status === 429 ? 429 : 503).json({ code: "crash_report_unavailable" });
       }
     });
-    app.get("/v1/metrics/stats", requireAdminToken(config.metrics), statsHandler(metrics, fcmStore, pusherRelay, liveStreamPoller, crashReports));
+    app.get("/v1/metrics/stats", requireAdminToken(config.metrics), statsHandler(metrics, fcmStore, pusherRelay, liveStreamPoller, crashReports, kickWebhookHandler));
     if (config.metrics.dashPath) {
       // The page is only a login shell; its data request remains token-protected.
       const dash = dashboardHandler(config.metrics);
@@ -892,13 +892,20 @@ export function createKickWebhookHandler({
   kickApiBaseUrl = "https://api.kick.com",
   seenWebhookMessages = new Map(),
 } = {}) {
-  return async (req, res) => {
+  const status = { lastReceivedAt: null, lastErrorAt: null, lastErrorCode: null, verifiedEvents: 0, errors: 0 };
+  function recordError(code) {
+    status.lastErrorAt = new Date().toISOString();
+    status.lastErrorCode = code;
+    status.errors++;
+  }
+  const handler = async (req, res) => {
     const messageId = req.headers["kick-event-message-id"];
     const timestamp = req.headers["kick-event-message-timestamp"];
     const signature = req.headers["kick-event-signature"];
     const eventType = req.headers["kick-event-type"];
 
     if (!messageId || !timestamp || !signature) {
+      recordError("missing_signature_headers");
       return res.status(400).json({
         code: "invalid_request",
         message: "Missing Kick webhook signature headers",
@@ -913,6 +920,7 @@ export function createKickWebhookHandler({
 
     const publicKey = await getKickPublicKey({ fetchFn, kickApiBaseUrl, logger });
     if (!publicKey) {
+      recordError("public_key_unavailable");
       logger?.error("kick_webhook_public_key_unavailable");
       return res.status(502).json({
         code: "upstream_unavailable",
@@ -930,6 +938,7 @@ export function createKickWebhookHandler({
     });
 
     if (!isValid) {
+      recordError("invalid_signature");
       logger?.warn({ messageId }, "kick_webhook_signature_verification_failed");
       return res.status(401).json({
         code: "invalid_signature",
@@ -938,6 +947,8 @@ export function createKickWebhookHandler({
     }
 
     seenWebhookMessages.set(messageId, now + 10 * 60 * 1000);
+    status.lastReceivedAt = new Date().toISOString();
+    status.verifiedEvents++;
     while (seenWebhookMessages.size > 10000) {
       seenWebhookMessages.delete(seenWebhookMessages.keys().next().value);
     }
@@ -952,11 +963,14 @@ export function createKickWebhookHandler({
         logger,
       });
     } catch (err) {
+      recordError("processing_failed");
       logger?.error({ err: err.message, messageId }, "kick_webhook_processing_error");
     }
 
     return res.status(200).json({ ok: true });
   };
+  handler.getStatus = () => ({ ...status, configured: Boolean(messaging) });
+  return handler;
 }
 
 export async function backfillStoredSubscriptions(fcmStore, pusherRelay, { logger, config, fetchFn = globalThis.fetch } = {}) {
@@ -1108,7 +1122,7 @@ function pingHandler(metrics, lookupCountry) {
   };
 }
 
-function statsHandler(metrics, fcmStore, pusherRelay, liveStreamPoller, crashReports) {
+function statsHandler(metrics, fcmStore, pusherRelay, liveStreamPoller, crashReports, kickWebhookHandler) {
   return async (req, res) => {
     const daysParam = req.query.days;
     const days = typeof daysParam === "string" && /^\d{1,3}$/.test(daysParam) ? Number(daysParam) : 60;
@@ -1125,8 +1139,8 @@ function statsHandler(metrics, fcmStore, pusherRelay, liveStreamPoller, crashRep
     const fcm = fcmStore ? {
       ...fcmStore.stats(),
       pusher: pusherRelay?.getStatus ? pusherRelay.getStatus() : null,
-      poller: liveStreamPoller ? { active: true, intervalSeconds: 60 } : { active: false },
-      webhook: { active: true, path: "/api/events/webhook" },
+      poller: liveStreamPoller?.getStatus?.() || { active: false },
+      webhook: kickWebhookHandler?.getStatus?.() || null,
     } : null;
     const payload = metrics.computeStats(new Date(), days, { fcm, system });
     res.setHeader("Cache-Control", "no-store");
