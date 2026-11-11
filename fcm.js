@@ -25,7 +25,7 @@ async function fetchJsonWithTimeout(fetchFn, url, options, timeoutMs) {
     if (!response.ok && typeof response.body?.cancel === "function") {
       await response.body.cancel();
     }
-    return { ok: response.ok, status: response.status, body };
+    return { ok: response.ok, status: response.status, headers: response.headers, body };
   } finally {
     clearTimeout(timer);
   }
@@ -1303,6 +1303,17 @@ export async function handleWebhookLiveEvent({
   };
 }
 
+const SUBSCRIPTION_RETRY_BASE_MS = 60_000;
+const SUBSCRIPTION_RETRY_MAX_MS = 15 * 60_000;
+
+function subscriptionRetryDelay(response) {
+  const value = response?.headers?.get?.("retry-after")?.trim();
+  const delay = value && /^\d+$/.test(value) ? Number(value) * 1000 : Date.parse(value) - Date.now();
+  return Number.isFinite(delay)
+    ? Math.min(24 * 60 * 60_000, Math.max(SUBSCRIPTION_RETRY_BASE_MS, delay))
+    : SUBSCRIPTION_RETRY_BASE_MS;
+}
+
 export async function syncKickEventSubscriptions({
   fcmStore,
   fetchFn = globalThis.fetch,
@@ -1350,7 +1361,7 @@ export async function syncKickEventSubscriptions({
   });
   if (!appToken) {
     logger?.warn("kick_webhook_sync_skipped_no_app_token");
-    return { synced: 0, added: 0 };
+    return { synced: 0, added: 0, retryAfterMs: SUBSCRIPTION_RETRY_BASE_MS };
   }
 
   let existingSubscribedIds = new Set();
@@ -1365,7 +1376,7 @@ export async function syncKickEventSubscriptions({
     if (res.ok) {
       if (!Array.isArray(res.body?.data)) {
         logger?.warn("kick_webhook_subscriptions_invalid_response");
-        return { synced: 0, added: 0 };
+        return { synced: 0, added: 0, retryAfterMs: SUBSCRIPTION_RETRY_BASE_MS };
       }
       const data = res.body.data;
       for (const sub of data) {
@@ -1375,14 +1386,16 @@ export async function syncKickEventSubscriptions({
       }
     } else {
       logger?.warn({ status: res.status }, "kick_webhook_subscriptions_fetch_failed");
-      return { synced: 0, added: 0 };
+      return { synced: 0, added: 0, ...(res.status === 429 || res.status >= 500
+        ? { retryAfterMs: subscriptionRetryDelay(res) } : {}) };
     }
   } catch (err) {
     logger?.warn({ err: err.message }, "kick_webhook_subscriptions_fetch_error");
-    return { synced: 0, added: 0 };
+    return { synced: 0, added: 0, retryAfterMs: SUBSCRIPTION_RETRY_BASE_MS };
   }
 
   let added = 0;
+  let retryAfterMs = null;
   for (const userId of targetUserIds) {
     if (!existingSubscribedIds.has(userId)) {
       if (throttleMs > 0 && added > 0) {
@@ -1410,8 +1423,7 @@ export async function syncKickEventSubscriptions({
 
         let subRes = await fetchJsonWithTimeout(fetchFn, `${kickApiBaseUrl}/public/v1/events/subscriptions`, payload, 10000);
 
-        // If rate-limited by Kick API, back off and retry once
-        if (subRes.status === 429) {
+        if (subRes.status === 429 && !subRes.headers?.get?.("retry-after")) {
           logger?.warn({ userId }, "kick_webhook_subscription_rate_limited_backing_off");
           if (retryDelayMs > 0) {
             await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
@@ -1425,36 +1437,70 @@ export async function syncKickEventSubscriptions({
           logger?.info({ userId }, "kick_webhook_subscription_created");
         } else {
           logger?.warn({ userId, status: subRes.status, body: subRes.body }, "kick_webhook_subscription_create_failed");
-          if (subRes.status === 429) break;
+          if (subRes.status === 429 || subRes.status >= 500) {
+            retryAfterMs = subscriptionRetryDelay(subRes);
+            break;
+          }
         }
       } catch (err) {
         logger?.warn({ userId, err: err.message }, "kick_webhook_subscription_create_error");
+        retryAfterMs = SUBSCRIPTION_RETRY_BASE_MS;
+        break;
       }
     }
   }
 
-  logger?.info({ targetChannels: targetUserIds.length, existing: existingSubscribedIds.size, added }, "kick_webhook_sync_complete");
-  return { synced: targetUserIds.length, added };
+  logger?.info({ targetChannels: targetUserIds.length, existing: existingSubscribedIds.size, added },
+    retryAfterMs ? "kick_webhook_sync_incomplete" : "kick_webhook_sync_complete");
+  return { synced: targetUserIds.length, added, ...(retryAfterMs ? { retryAfterMs } : {}) };
 }
 
-let syncInProgress = null;
-let syncQueued = false;
+const subscriptionSyncStates = new WeakMap();
 
-export async function scheduleKickSubscriptionSync(options) {
-  if (syncInProgress) {
-    syncQueued = true;
-    return syncInProgress;
+export function scheduleKickSubscriptionSync(options) {
+  if (!options?.fcmStore) return Promise.resolve({ synced: 0, added: 0 });
+  let state = subscriptionSyncStates.get(options.fcmStore);
+  if (!state) {
+    state = { inProgress: null, timer: null, queued: false, failures: 0, result: null };
+    subscriptionSyncStates.set(options.fcmStore, state);
   }
-  syncInProgress = (async () => {
+  state.options = options;
+  if (state.inProgress) {
+    state.queued = true;
+    return state.inProgress;
+  }
+  if (state.timer) return Promise.resolve(state.result);
+
+  state.inProgress = (async () => {
+    let result;
     try {
-      await syncKickEventSubscriptions(options);
-    } finally {
-      syncInProgress = null;
-      if (syncQueued) {
-        syncQueued = false;
-        scheduleKickSubscriptionSync(options).catch(() => {});
+      result = await syncKickEventSubscriptions(state.options);
+    } catch (err) {
+      state.options.logger?.warn({ err: err.message }, "kick_webhook_sync_failed");
+      result = { synced: 0, added: 0, retryAfterMs: SUBSCRIPTION_RETRY_BASE_MS };
+    }
+    state.inProgress = null;
+    state.result = result;
+    if (result.retryAfterMs) {
+      state.queued = false;
+      state.failures = result.added > 0 ? 1 : Math.min(state.failures + 1, 5);
+      const delayMs = Math.max(result.retryAfterMs,
+        Math.min(SUBSCRIPTION_RETRY_MAX_MS, SUBSCRIPTION_RETRY_BASE_MS * 2 ** (state.failures - 1)));
+      state.options.logger?.warn({ delayMs, nextRetryAt: new Date(Date.now() + delayMs).toISOString() },
+        "kick_webhook_sync_retry_scheduled");
+      state.timer = setTimeout(() => {
+        state.timer = null;
+        scheduleKickSubscriptionSync(state.options).catch(() => {});
+      }, delayMs);
+      state.timer.unref?.();
+    } else {
+      state.failures = 0;
+      if (state.queued) {
+        state.queued = false;
+        scheduleKickSubscriptionSync(state.options).catch(() => {});
       }
     }
+    return result;
   })();
-  return syncInProgress;
+  return state.inProgress;
 }

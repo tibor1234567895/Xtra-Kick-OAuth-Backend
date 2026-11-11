@@ -6,6 +6,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { runInNewContext, Script } from "node:vm";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { setImmediate as settle } from "node:timers/promises";
 import pino from "pino";
 import { backfillStoredSubscriptions, computeHmacSignature, createApp, createCountryLookup, loadConfig, redactPaths } from "./server.js";
 import { createMetricsStore } from "./metrics.js";
@@ -19,6 +20,7 @@ import {
   createPusherRelay,
   getKickPublicKey,
   handleWebhookLiveEvent,
+  scheduleKickSubscriptionSync,
   sendLivePushNotification,
   syncKickEventSubscriptions,
   verifyKickWebhookSignature,
@@ -2388,7 +2390,7 @@ test("subscription sync preserves existing subscriptions when listing fails and 
         return jsonResponse(failure, {});
       },
     };
-    assert.deepEqual(await syncKickEventSubscriptions(options), { synced: 0, added: 0 });
+    assert.deepEqual(await syncKickEventSubscriptions(options), { synced: 0, added: 0, retryAfterMs: 60000 });
     assert.equal(posts, 0, `Listing failure ${failure} must not recreate existing subscriptions`);
     recovering = true;
     assert.equal((await syncKickEventSubscriptions(options)).added, 1);
@@ -2467,6 +2469,243 @@ test("syncKickEventSubscriptions retries on 429 rate limit and succeeds", async 
   assert.equal(result.synced, 1);
   assert.equal(result.added, 1);
   assert.equal(postAttempts, 2);
+});
+
+test("subscription scheduler honors server cooldown and includes channels added while waiting", async t => {
+  clearChannelResolutionCache();
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
+  const store = createFcmStore();
+  store.subscribe({ token: "scheduled-token", channelIds: ["42"] });
+  let blocked = true;
+  let listings = 0;
+  const posts = [];
+  const options = {
+    fcmStore: store, clientId: "test", clientSecret: "test", throttleMs: 0,
+    fetchFn: async (url, request = {}) => {
+      if (url.includes("/oauth/token")) return jsonResponse(200, { access_token: "test", expires_in: 3600 });
+      if (request.method === "POST") {
+        posts.push(JSON.parse(request.body).broadcaster_user_id);
+        return jsonResponse(200, {});
+      }
+      listings++;
+      return blocked ? new Response("", { status: 429, headers: { "Retry-After": "120" } })
+        : jsonResponse(200, { data: [{ broadcaster_user_id: 42, event: "livestream.status.updated" }] });
+    },
+  };
+  assert.equal((await scheduleKickSubscriptionSync(options)).retryAfterMs, 120000);
+  store.subscribe({ token: "scheduled-token", channelIds: ["42", "43"] });
+  for (let i = 0; i < 10; i++) await scheduleKickSubscriptionSync(options);
+  assert.equal(listings, 1);
+  assert.equal(posts.length, 0);
+  blocked = false;
+  t.mock.timers.tick(119999);
+  await settle();
+  assert.equal(listings, 1);
+  t.mock.timers.tick(1);
+  await settle();
+  assert.equal(listings, 2);
+  assert.deepEqual(posts, [43]);
+  t.mock.timers.tick(3600000);
+  await settle();
+  assert.equal(listings, 2, "Successful sync cancels further retries");
+});
+
+test("subscription scheduler backs off repeated failures, caps the delay, and resets after recovery", async t => {
+  clearChannelResolutionCache();
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
+  const store = createFcmStore();
+  store.subscribe({ token: "backoff-token", channelIds: ["42"] });
+  let listings = 0;
+  let blocked = true;
+  const delays = [];
+  const options = {
+    fcmStore: store, clientId: "test", clientSecret: "test",
+    logger: {
+      info() {},
+      warn: (details, msg) => { if (msg === "kick_webhook_sync_retry_scheduled") delays.push(details.delayMs); },
+    },
+    fetchFn: async url => {
+      if (url.includes("/oauth/token")) return jsonResponse(200, { access_token: "test", expires_in: 36000 });
+      listings++;
+      return blocked ? jsonResponse(503, {})
+        : jsonResponse(200, { data: [{ broadcaster_user_id: 42, event: "livestream.status.updated" }] });
+    },
+  };
+  await scheduleKickSubscriptionSync(options);
+  for (const delay of [60000, 120000, 240000, 480000, 900000]) {
+    const before = listings;
+    t.mock.timers.tick(delay - 1);
+    await settle();
+    assert.equal(listings, before);
+    t.mock.timers.tick(1);
+    await settle();
+    assert.equal(listings, before + 1);
+  }
+  assert.deepEqual(delays, [60000, 120000, 240000, 480000, 900000, 900000]);
+  blocked = false;
+  t.mock.timers.tick(900000);
+  await settle();
+  blocked = true;
+  await scheduleKickSubscriptionSync(options);
+  assert.equal(delays.at(-1), 60000);
+});
+
+test("subscription scheduler resumes partial progress without recreating successful subscriptions", async t => {
+  clearChannelResolutionCache();
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: Math.floor(Date.now() / 1000) * 1000 });
+  const store = createFcmStore();
+  store.subscribe({ token: "partial-token", channelIds: ["42", "43"] });
+  const registered = new Set();
+  const posts = [];
+  let blocked = true;
+  const options = {
+    fcmStore: store, clientId: "test", clientSecret: "test", throttleMs: 0,
+    fetchFn: async (url, request = {}) => {
+      if (url.includes("/oauth/token")) return jsonResponse(200, { access_token: "test", expires_in: 3600 });
+      if (request.method !== "POST") return jsonResponse(200, {
+        data: [...registered].map(id => ({ broadcaster_user_id: id, event: "livestream.status.updated" })),
+      });
+      const id = JSON.parse(request.body).broadcaster_user_id;
+      posts.push(id);
+      if (id === 43 && blocked) return new Response("", {
+        status: 429, headers: { "Retry-After": new Date(Date.now() + 180000).toUTCString() },
+      });
+      registered.add(id);
+      return jsonResponse(200, {});
+    },
+  };
+  const first = await scheduleKickSubscriptionSync(options);
+  assert.equal(first.added, 1);
+  assert.equal(first.retryAfterMs, 180000);
+  assert.deepEqual(posts, [42, 43], "Server cooldown prevents the immediate retry too");
+  store.subscribe({ token: "partial-token", channelIds: ["42", "43", "44"] });
+  blocked = false;
+  t.mock.timers.tick(180000);
+  await settle();
+  assert.deepEqual(posts, [42, 43, 43, 44]);
+  assert.equal(registered.size, 3);
+});
+
+test("subscription scheduler coalesces an active sync and preserves cooldown for queued requests", async t => {
+  clearChannelResolutionCache();
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
+  const store = createFcmStore();
+  store.subscribe({ token: "overlap-sync-token", channelIds: ["42"] });
+  let release;
+  let listings = 0;
+  const options = {
+    fcmStore: store, clientId: "test", clientSecret: "test",
+    fetchFn: async url => {
+      if (url.includes("/oauth/token")) return jsonResponse(200, { access_token: "test", expires_in: 3600 });
+      if (++listings === 1) return new Promise(resolve => { release = resolve; });
+      return jsonResponse(200, { data: [{ broadcaster_user_id: 42, event: "livestream.status.updated" }] });
+    },
+  };
+  const first = scheduleKickSubscriptionSync(options);
+  await settle();
+  assert.equal(scheduleKickSubscriptionSync(options), first);
+  release(new Response("", { status: 429, headers: { "Retry-After": "90" } }));
+  await first;
+  await settle();
+  assert.equal(listings, 1, "Queued requests cannot bypass the cooldown");
+  t.mock.timers.tick(90000);
+  await settle();
+  assert.equal(listings, 2);
+});
+
+test("subscription scheduler follows successful active runs with fresh subscriptions and isolates stores", async () => {
+  clearChannelResolutionCache();
+  const firstStore = createFcmStore();
+  firstStore.subscribe({ token: "first-store", channelIds: ["42"] });
+  const secondStore = createFcmStore();
+  secondStore.subscribe({ token: "second-store", channelIds: ["99"] });
+  let release;
+  let listings = 0;
+  const registered = new Set();
+  const posts = [];
+  const firstOptions = {
+    fcmStore: firstStore, clientId: "test", clientSecret: "test", throttleMs: 0,
+    fetchFn: async (url, request = {}) => {
+      if (url.includes("/oauth/token")) return jsonResponse(200, { access_token: "test", expires_in: 3600 });
+      if (request.method !== "POST") {
+        if (++listings === 1) return new Promise(resolve => { release = resolve; });
+        return jsonResponse(200, { data: [...registered].map(id => ({ broadcaster_user_id: id, event: "livestream.status.updated" })) });
+      }
+      const id = JSON.parse(request.body).broadcaster_user_id;
+      posts.push(id);
+      registered.add(id);
+      return jsonResponse(200, {});
+    },
+  };
+  const first = scheduleKickSubscriptionSync(firstOptions);
+  await settle();
+  const second = await scheduleKickSubscriptionSync({
+    fcmStore: secondStore, clientId: "test", clientSecret: "test",
+    fetchFn: async () => jsonResponse(200, { data: [{ broadcaster_user_id: 99, event: "livestream.status.updated" }] }),
+  });
+  assert.equal(second.synced, 1, "An unrelated store is not blocked by an in-flight sync");
+  firstStore.subscribe({ token: "first-store", channelIds: ["42", "43"] });
+  assert.equal(scheduleKickSubscriptionSync(firstOptions), first);
+  release(jsonResponse(200, { data: [] }));
+  await first;
+  await settle();
+  assert.equal(listings, 2);
+  assert.deepEqual(posts, [42, 43]);
+});
+
+test("subscription scheduler retries transient failures but does not loop on permanent errors", async t => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
+  for (const failure of ["token", "network", "invalid", "post-network", "post-503", 503, 401, 403, 404, "post-400"]) {
+    clearChannelResolutionCache();
+    const store = createFcmStore();
+    store.subscribe({ token: "failure-token", channelIds: ["42"] });
+    let failing = true;
+    let created = 0;
+    let requests = 0;
+    const options = {
+      fcmStore: store, clientId: "test", clientSecret: "test", throttleMs: 0,
+      fetchFn: async (url, request = {}) => {
+        requests++;
+        if (url.includes("/oauth/token")) return failing && failure === "token" ? jsonResponse(503, {})
+          : jsonResponse(200, { access_token: "test", expires_in: 3600 });
+        if (request.method === "POST") {
+          if (failing && failure === "post-network") throw new Error("network unavailable");
+          if (failing && failure === "post-503") return jsonResponse(503, {});
+          if (failing && failure === "post-400") return jsonResponse(400, {});
+          created++;
+          return jsonResponse(200, {});
+        }
+        if (failing && failure === "network") throw new Error("network unavailable");
+        if (failing && failure === "invalid") return jsonResponse(200, {});
+        if (failing && typeof failure === "number") return jsonResponse(failure, {});
+        return jsonResponse(200, { data: [] });
+      },
+    };
+    const result = await scheduleKickSubscriptionSync(options);
+    const transient = ![401, 403, 404, "post-400"].includes(failure);
+    assert.equal(Boolean(result.retryAfterMs), transient, String(failure));
+    const before = requests;
+    failing = false;
+    t.mock.timers.tick(60000);
+    await settle();
+    assert.equal(created, transient ? 1 : 0, String(failure));
+    if (!transient) assert.equal(requests, before);
+  }
+});
+
+test("subscription Retry-After values are bounded and malformed values use the default delay", async () => {
+  clearChannelResolutionCache();
+  const store = createFcmStore();
+  store.subscribe({ token: "header-token", channelIds: ["42"] });
+  for (const [header, expected] of [["garbage", 60000], ["0", 60000], ["-5", 60000], ["2592000", 86400000]]) {
+    const result = await syncKickEventSubscriptions({
+      fcmStore: store, clientId: "test", clientSecret: "test",
+      fetchFn: async url => url.includes("/oauth/token")
+        ? jsonResponse(200, { access_token: "test", expires_in: 3600 })
+        : new Response("", { status: 429, headers: { "Retry-After": header } }),
+    });
+    assert.equal(result.retryAfterMs, expected, header);
+  }
 });
 
 test("ping accepts pe, c, wt and reflects player engines, watch time, and crashes in stats", async () => {
