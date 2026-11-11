@@ -2367,6 +2367,53 @@ test("syncKickEventSubscriptions creates missing webhook subscriptions on Kick",
   assert.deepEqual(createdSubs[0].events, [{ name: "livestream.status.updated", version: 1 }]);
 });
 
+test("subscription sync preserves existing subscriptions when listing fails and can recover", async () => {
+  clearChannelResolutionCache();
+  for (const failure of [429, 503, "network", "invalid"]) {
+    const store = createFcmStore();
+    store.subscribe({ token: "sync-token", channelIds: ["42", "43"] });
+    let recovering = false;
+    let posts = 0;
+    const options = {
+      fcmStore: store, clientId: "test", clientSecret: "test", throttleMs: 0, retryDelayMs: 0,
+      fetchFn: async (url, request = {}) => {
+        if (url.includes("/oauth/token")) return jsonResponse(200, { access_token: "sync-token", expires_in: 3600 });
+        if (request.method === "POST") {
+          posts++;
+          return jsonResponse(200, { data: [] });
+        }
+        if (recovering) return jsonResponse(200, { data: [{ broadcaster_user_id: 42, event: "livestream.status.updated" }] });
+        if (failure === "network") throw new Error("network unavailable");
+        if (failure === "invalid") return jsonResponse(200, {});
+        return jsonResponse(failure, {});
+      },
+    };
+    assert.deepEqual(await syncKickEventSubscriptions(options), { synced: 0, added: 0 });
+    assert.equal(posts, 0, `Listing failure ${failure} must not recreate existing subscriptions`);
+    recovering = true;
+    assert.equal((await syncKickEventSubscriptions(options)).added, 1);
+    assert.equal(posts, 1);
+  }
+});
+
+test("subscription sync stops the batch after persistent rate limiting", async () => {
+  clearChannelResolutionCache();
+  const store = createFcmStore();
+  store.subscribe({ token: "rate-limit-token", channelIds: ["42", "43", "44"] });
+  let posts = 0;
+  const result = await syncKickEventSubscriptions({
+    fcmStore: store, clientId: "test", clientSecret: "test", throttleMs: 0, retryDelayMs: 0,
+    fetchFn: async (url, request = {}) => {
+      if (url.includes("/oauth/token")) return jsonResponse(200, { access_token: "sync-token", expires_in: 3600 });
+      if (request.method !== "POST") return jsonResponse(200, { data: [] });
+      posts++;
+      return jsonResponse(429, {});
+    },
+  });
+  assert.equal(result.added, 0);
+  assert.equal(posts, 2, "Retry once, then stop without attempting the remaining streamers");
+});
+
 test("syncKickEventSubscriptions retries on 429 rate limit and succeeds", async () => {
   clearChannelResolutionCache();
   const fcmStore = createFcmStore();

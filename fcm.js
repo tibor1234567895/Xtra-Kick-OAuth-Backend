@@ -1363,7 +1363,11 @@ export async function syncKickEventSubscriptions({
     }, 10000);
 
     if (res.ok) {
-      const data = Array.isArray(res.body?.data) ? res.body.data : [];
+      if (!Array.isArray(res.body?.data)) {
+        logger?.warn("kick_webhook_subscriptions_invalid_response");
+        return { synced: 0, added: 0 };
+      }
+      const data = res.body.data;
       for (const sub of data) {
         if (sub?.event === "livestream.status.updated" && sub?.broadcaster_user_id) {
           existingSubscribedIds.add(String(sub.broadcaster_user_id));
@@ -1371,9 +1375,11 @@ export async function syncKickEventSubscriptions({
       }
     } else {
       logger?.warn({ status: res.status }, "kick_webhook_subscriptions_fetch_failed");
+      return { synced: 0, added: 0 };
     }
   } catch (err) {
     logger?.warn({ err: err.message }, "kick_webhook_subscriptions_fetch_error");
+    return { synced: 0, added: 0 };
   }
 
   let added = 0;
@@ -1419,6 +1425,7 @@ export async function syncKickEventSubscriptions({
           logger?.info({ userId }, "kick_webhook_subscription_created");
         } else {
           logger?.warn({ userId, status: subRes.status, body: subRes.body }, "kick_webhook_subscription_create_failed");
+          if (subRes.status === 429) break;
         }
       } catch (err) {
         logger?.warn({ userId, err: err.message }, "kick_webhook_subscription_create_error");
