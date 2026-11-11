@@ -979,6 +979,16 @@ export function createLiveStreamPoller({
 
         const isLive = Boolean(ch.stream && ch.stream.is_live);
         const startTime = ch.stream?.start_time ? String(ch.stream.start_time) : null;
+        const cached = channelResolutionCache.get(channelKey);
+        const resolved = {
+          channelId: ch.channel_id ? String(ch.channel_id) : cached?.userId === uId ? cached.channelId : null,
+          userId: uId,
+          slug,
+          expiresAt: Date.now() + RESOLUTION_TTL_MS,
+        };
+        if (slug) cacheChannel(slug, resolved);
+        if (uId) cacheChannel(uId, resolved);
+        if (resolved.channelId) cacheChannel(resolved.channelId, resolved);
 
         if (isLive && startTime) {
           liveCount++;
@@ -986,17 +996,6 @@ export function createLiveStreamPoller({
           if (!hasSeenStream(seenStreams, seenKeys, startTime)) {
             // Transition: stream just started (or first time seeing it)
             markStreamSeen(seenStreams, seenKeys, startTime);
-
-            // Cache channel resolution details for aliases
-            const resolved = {
-              channelId: ch.channel_id ? String(ch.channel_id) : null,
-              userId: uId,
-              slug,
-              expiresAt: Date.now() + RESOLUTION_TTL_MS,
-            };
-            if (slug) cacheChannel(slug, resolved);
-            if (uId) cacheChannel(uId, resolved);
-            if (resolved.channelId) cacheChannel(resolved.channelId, resolved);
 
             // Skip notifications on the first cycle (warm-up: seed seenStreams only)
             if (isFirstPoll) continue;

@@ -1795,6 +1795,32 @@ test("poller and webhook deduplicate equivalent UTC start-time formats after war
   }
 });
 
+test("poller resolves offline streamer aliases for accurate monitoring counts", async () => {
+  clearChannelResolutionCache();
+  const store = createFcmStore();
+  store.subscribe({ token: "offline-token", channelIds: ["42", "44", "offline-streamer"] });
+  let channelId = 44;
+  const poller = createLiveStreamPoller({
+    fcmStore: store, messaging: {}, config: { kickClientId: "test", kickClientSecret: "test" },
+    fetchFn: async url => url.includes("/oauth/token")
+      ? jsonResponse(200, { access_token: "test-token", expires_in: 3600 })
+      : jsonResponse(200, { data: [{ broadcaster_user_id: 42, channel_id: channelId, slug: "offline-streamer", stream: null }] }),
+  });
+  try {
+    await poller.checkLiveStreams();
+    const stats = store.stats();
+    assert.equal(stats.monitoredStreamers, 1);
+    assert.equal(stats.unresolvedChannelKeys, 0);
+    assert.equal(stats.delivery.alertsDispatched, 0);
+    channelId = undefined;
+    await poller.checkLiveStreams();
+    assert.equal(channelResolutionCache.get("42").channelId, "44");
+  } finally {
+    poller.close();
+    clearChannelResolutionCache();
+  }
+});
+
 test("poller health records token failures, partial upstream failures, and recovery", async () => {
   clearChannelResolutionCache();
   const store = createFcmStore();
