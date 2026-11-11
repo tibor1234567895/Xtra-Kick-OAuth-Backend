@@ -1087,6 +1087,7 @@
         if (state.activeTab === "overview") {
           drawChart(d);
           bindOverviewControls(d);
+          showCrashReports(d.crashReports, d.crashReportsUnavailable);
         } else if (state.activeTab === "ops") {
           bindOpsControls(d);
         }
@@ -1726,7 +1727,45 @@
               <span class="pill ok" style="margin-left:4px;">${crashesWeek} in 7d</span>
             </div>
           </div>
+          <div id="crashReports" style="margin-top:12px;"></div>
         `;
+      }
+
+      function showCrashReports(reports, unavailable) {
+        const container = document.getElementById("crashReports");
+        if (!container) return;
+        if (unavailable) {
+          container.textContent = "Crash report storage is unavailable. Other telemetry is still available.";
+          return;
+        }
+        const note = document.createElement("p");
+        note.style.cssText = "font-size:11px;color:var(--muted);";
+        note.textContent = "Crash details received in the last 90 days (up to 200 groups). Reporting is enabled by default and can be disabled in the app. Counts above come from daily pings and may differ. Expand a report to inspect its stack frames. Messages and diagnostic logs are excluded.";
+        container.append(note);
+        if (!Array.isArray(reports) || !reports.length) {
+          const empty = document.createElement("p");
+          empty.textContent = "No crash details received. Reporting requires a supporting app update and enabled crash reporting and usage statistics; older crash counts have no stored stack trace.";
+          empty.style.cssText = "font-size:12px;color:var(--muted);";
+          container.append(empty);
+          return;
+        }
+        for (const report of reports) {
+          const details = document.createElement("details");
+          details.style.cssText = "border-top:1px solid var(--border-subtle);padding:10px 0;font-size:12px;";
+          const summary = document.createElement("summary");
+          summary.style.cssText = "cursor:pointer;overflow-wrap:anywhere;";
+          summary.textContent = `${report.exceptions?.[0]?.type || "Exception"} · v${report.version} (${report.build}) · API ${report.sdk} · ${report.count} report(s)`;
+          const metadata = document.createElement("p");
+          metadata.textContent = `CPU architecture: ${report.abi || "unknown"} · Live engine preference: ${report.liveEnginePreference || "unknown"} · Last crash: ${new Date(report.crashedAt).toISOString()} · Last received: ${new Date(report.lastSeen).toISOString()}`;
+          const stack = document.createElement("pre");
+          stack.style.cssText = "white-space:pre-wrap;overflow-wrap:anywhere;font-size:11px;max-height:320px;overflow:auto;";
+          stack.textContent = (report.exceptions || []).map((exception, index) =>
+            (index ? "Caused by: " : "") + exception.type + "\n" +
+            exception.frames.map(frame => `    at ${frame.class}.${frame.method}(${frame.file}:${frame.line})`).join("\n")
+          ).join("\n");
+          details.append(summary, metadata, stack);
+          container.append(details);
+        }
       }
 
       function renderEndpointHealthTable(d) {

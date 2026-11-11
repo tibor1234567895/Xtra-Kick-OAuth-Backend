@@ -9,6 +9,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import geoip from "geoip-country";
+import { crashReportSchema, createCrashReportStore } from "./crash-reports.js";
 import {
   createMetricsStore,
   loadMetricsConfig,
@@ -113,6 +114,7 @@ export const KNOWN_ENDPOINTS = new Set([
   "POST /v1/kick/oauth/revoke",
   "POST /v1/kick/oauth/introspect",
   "POST /v1/metrics/ping",
+  "POST /v1/metrics/crash",
   "GET /v1/metrics/stats",
   "GET /v1/metrics/dashboard",
   "GET /v1/metrics/dashboard/v2",
@@ -125,6 +127,10 @@ export const KNOWN_ENDPOINTS = new Set([
 ]);
 
 const BLOCKED_PROBE_REGEX = /(\.env|\.git|\.php|\.bak|\.asp|\.jsp|graphql|wp-admin|phpmyadmin|\.\.)/i;
+
+function isCrashReportRequest(req) {
+  return /^\/v1\/metrics\/crash\/?$/i.test(req.path);
+}
 
 export function createApp(config, deps = {}) {
   const app = express();
@@ -170,7 +176,11 @@ export function createApp(config, deps = {}) {
     }
     return next();
   });
-  app.use(pinoHttp({ logger: config.logger }));
+  const httpLogger = pinoHttp({ logger: config.logger });
+  app.use((req, res, next) => {
+    if (isCrashReportRequest(req)) return next();
+    return httpLogger(req, res, next);
+  });
   app.use(
     express.json({
       limit: "32kb",
@@ -244,7 +254,22 @@ export function createApp(config, deps = {}) {
   if (metrics) {
     app.use("/v1/metrics", createLimiter(120));
     registerPost("/v1/metrics/ping", createLimiter(10), pingHandler(metrics, createCountryLookup(config.metrics)));
-    app.get("/v1/metrics/stats", requireAdminToken(config.metrics), statsHandler(metrics, fcmStore, pusherRelay, liveStreamPoller));
+    const crashReports = deps.crashReports || createCrashReportStore({
+      dataPath: `${config.metrics.dataPath}.crashes.json`,
+    });
+    app.locals.crashReports = crashReports;
+    // Crash uploads always require signing, including in unauthenticated OAuth development mode.
+    app.post("/v1/metrics/crash", requireHmac || ((_req, res) => unauthorized(res)), createLimiter(5), (req, res) => {
+      const parsed = crashReportSchema.safeParse(req.body);
+      if (!parsed.success) return res.status(400).json({ code: "invalid_crash_report" });
+      try {
+        crashReports.record(parsed.data);
+        return res.status(204).end();
+      } catch (error) {
+        return res.status(error.status === 429 ? 429 : 503).json({ code: "crash_report_unavailable" });
+      }
+    });
+    app.get("/v1/metrics/stats", requireAdminToken(config.metrics), statsHandler(metrics, fcmStore, pusherRelay, liveStreamPoller, crashReports));
     if (config.metrics.dashPath) {
       // The page is only a login shell; its data request remains token-protected.
       const dash = dashboardHandler(config.metrics);
@@ -280,7 +305,11 @@ export function createApp(config, deps = {}) {
     if (err.type === "entity.too.large") {
       return res.status(413).json({ code: "payload_too_large", message: "Request body too large" });
     }
-    (req.log || config.logger).error({ err: { message: err.message, code: err.code, status: err.status } }, "unhandled error");
+    if (isCrashReportRequest(req)) {
+      config.logger.error({ code: "crash_request_failed" }, "Crash request failed");
+    } else {
+      (req.log || config.logger).error({ err: { message: err.message, code: err.code, status: err.status } }, "unhandled error");
+    }
     return res.status(500).json({ code: "internal_error", message: "Unexpected server error" });
   });
 
@@ -1079,7 +1108,7 @@ function pingHandler(metrics, lookupCountry) {
   };
 }
 
-function statsHandler(metrics, fcmStore, pusherRelay, liveStreamPoller) {
+function statsHandler(metrics, fcmStore, pusherRelay, liveStreamPoller, crashReports) {
   return async (req, res) => {
     const daysParam = req.query.days;
     const days = typeof daysParam === "string" && /^\d{1,3}$/.test(daysParam) ? Number(daysParam) : 60;
@@ -1100,6 +1129,13 @@ function statsHandler(metrics, fcmStore, pusherRelay, liveStreamPoller) {
       webhook: { active: true, path: "/api/events/webhook" },
     } : null;
     const payload = metrics.computeStats(new Date(), days, { fcm, system });
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      payload.crashReports = crashReports.list();
+    } catch {
+      payload.crashReports = [];
+      payload.crashReportsUnavailable = true;
+    }
     return res.status(200).json(payload);
   };
 }

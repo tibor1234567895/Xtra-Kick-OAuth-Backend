@@ -389,13 +389,26 @@ export function createMetricsStore(options = {}) {
     const aidPrefix = aidHash ? aidHash.slice(0, EVERSEEN_PREFIX_CHARS) : null;
     const accountKnown = aidPrefix !== null && accountEverSeenSet.has(aidPrefix);
     prune();
-    noteTraffic(now);
     const month = ensureMonth(serverEpoch, "devices");
-    if (aidPrefix) {
-      const pingMonth = ensureMonth(serverEpoch, "pingAccounts");
-      pingMonth[aidHash] = true;
-    }
     const existing = month[pidHash];
+    if (!existing && monthCounts.devices.get(serverEpoch) >= maxDevicesPerMonth) {
+      const error = new Error("metrics device capacity reached");
+      error.status = 429;
+      error.code = "metrics_capacity_reached";
+      throw error;
+    }
+    const pingMonth = aidHash ? ensureMonth(serverEpoch, "pingAccounts") : null;
+    if (pingMonth && !pingMonth[aidHash] && monthCounts.pingAccounts.get(serverEpoch) >= maxDevicesPerMonth) {
+      const error = new Error("metrics ping account capacity reached");
+      error.status = 429;
+      error.code = "metrics_capacity_reached";
+      throw error;
+    }
+    noteTraffic(now);
+    if (pingMonth && !pingMonth[aidHash]) {
+      pingMonth[aidHash] = true;
+      monthCounts.pingAccounts.set(serverEpoch, monthCounts.pingAccounts.get(serverEpoch) + 1);
+    }
     const dayBit = 1 << (dayIndexUtc(now) - 1);
     if (existing) {
       existing.d |= dayBit;
@@ -429,12 +442,6 @@ export function createMetricsStore(options = {}) {
       }
       scheduleFlush();
       return { isNewInstall: false, month: serverEpoch };
-    }
-    if (monthCounts.devices.get(serverEpoch) >= maxDevicesPerMonth) {
-      const error = new Error("metrics device capacity reached");
-      error.status = 429;
-      error.code = "metrics_capacity_reached";
-      throw error;
     }
     const entry = { v: safeVersion, d: dayBit, t: dayKey(now) };
     if (safeOs) entry.os = safeOs;
@@ -731,10 +738,10 @@ export function createMetricsStore(options = {}) {
         { label: "Media3 / ExoPlayer", code: "exo", count: playerEngines.exo },
       ],
       watchTime: [
-        { label: "None / No watch", code: "0", count: watchTime["0"] },
-        { label: "< 15 min", code: "1", count: watchTime["1"] },
-        { label: "15 min – 1 hr", code: "2", count: watchTime["2"] },
-        { label: "> 1 hour", code: "3", count: watchTime["3"] },
+        { label: "< 15 min", code: "0", count: watchTime["0"] },
+        { label: "15 min – 1 hr", code: "1", count: watchTime["1"] },
+        { label: "1 hr – 3 hr", code: "2", count: watchTime["2"] },
+        { label: "3 hr or more", code: "3", count: watchTime["3"] },
       ],
       upstreamLatency: computeLatencyPercentiles(),
       storage,

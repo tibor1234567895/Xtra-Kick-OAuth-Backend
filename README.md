@@ -9,6 +9,7 @@ Minimal OAuth proxy for Kick token operations.
 - `POST /v1/kick/oauth/revoke`
 - `POST /v1/kick/oauth/introspect`
 - `POST /v1/metrics/ping` (enabled when `METRICS_SALT` is set)
+- `POST /v1/metrics/crash` (requires app HMAC signing and metrics enabled)
 - `GET /v1/metrics/stats` (requires `METRICS_ADMIN_TOKEN`)
 - `GET /v1/metrics/dashboard` (static operations cockpit; requires `METRICS_DASHBOARD_FILE`)
 - `GET /v1/metrics/dashboard/v2` (backward-compatible alias for the operations dashboard)
@@ -41,6 +42,30 @@ Minimal OAuth proxy for Kick token operations.
   auto-refresh, and reads `?days=` from `/v1/metrics/stats`.
 
 ## Notes
+- Crash reporting is enabled by default under **Settings > System & Advanced > Send crash reports**,
+  and also requires **Anonymous usage statistics**. Existing disabled settings are preserved;
+  no preference migration forces reporting back on. Release builds save up to five pending
+  Java/Kotlin uncaught exceptions in app-private storage excluded from backups and retry
+  on a later foreground launch, independently of the daily ping. Disabling either switch
+  clears pending reports. Native crashes and ANRs are not captured by this handler.
+- Reports contain only a random per-crash retry ID, app version/build, Android SDK,
+  process CPU architecture and configured live-player preference (IVS/Media3/unknown),
+  crash timestamp, and bounded exception types and stack frames (cause chain only).
+  They exclude exception messages, thread names, device/account identifiers, and diagnostic logs.
+- The backend stores up to 200 crash groups and 20,000 retry IDs for 90 days in
+  `<METRICS_DATA_FILE>.crashes.json`. It rejects new reports at the retry-ID capacity
+  rather than double-counting retries. Expiration runs on reads, writes, startup,
+  and once per minute while running. A successful response requires persistence.
+  Crash details are included only in the admin-protected stats response and displayed
+  under **Reported Uncaught Crashes**. No new environment variables are needed.
+- Crash-detail counts are separate from daily-ping crash counts; older counts cannot
+  be expanded into reports. Offline reports expire after 90 days when the app next processes
+  its queue. The configured live-player preference does not identify the engine active at
+  the moment of a crash, particularly for VODs. Old clients without these fields report unknown.
+- Crash requests bypass application access logging, including invalid or failed uploads.
+  Unexpected request errors log only a fixed error code/message. Aggregate request outcomes
+  and in-memory rate limits remain enabled. Reverse-proxy and infrastructure logs are a
+  separate boundary; do not claim complete anonymity based only on the report payload.
 - Keep `KICK_CLIENT_SECRET` only on backend.
 - Configure Kick dev dashboard redirect URI to `https://localhost/callback`.
 - Keep real client IDs, client secrets, access tokens, refresh tokens, and authorization codes out of docs and logs.
@@ -53,6 +78,35 @@ Minimal OAuth proxy for Kick token operations.
   stored; request IPs are never persisted. Set `METRICS_GEOIP=off` to disable.
 
 ## Ubuntu service
+
+### Crash-report proxy logging
+
+Read-only inspection on 2026-11-11 confirmed Caddy access logging is enabled for the backend
+hostname, with no crash-route exclusion. Before activating crash uploads in production, add
+the following inside the existing `kickauth.tiborlaszlo.ovh` site block:
+
+```caddyfile
+@crashReports path_regexp crashReports (?i)^/v1/metrics/crash/?$
+skip_log @crashReports
+```
+
+The deployed Caddy uses the older directive name `skip_log`; Caddy 2.8+ calls it `log_skip`.
+This covers case variants and the optional trailing slash accepted by Express. It leaves
+other endpoint access logs enabled. This directive covers access logs; runtime/transport
+error logs and any upstream provider logs need a separate privacy review. Keep debug logging
+disabled in production. The repository change does not modify or reload Caddy.
+
+After reviewing the full Caddyfile, validate it before an explicitly authorized reload:
+
+```bash
+sudo caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+sudo systemctl reload caddy
+```
+
+Verify a test crash request is absent from both access and service logs, including the
+backend-unavailable case, before describing production reporting as anonymous.
+
+### Backend update
 
 After pulling and installing production dependencies, restart the existing systemd service:
 

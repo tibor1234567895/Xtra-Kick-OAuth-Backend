@@ -2,12 +2,14 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { createHash, createSign, generateKeyPairSync } from "node:crypto";
 import { test } from "node:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { runInNewContext, Script } from "node:vm";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import pino from "pino";
 import { backfillStoredSubscriptions, computeHmacSignature, createApp, createCountryLookup, loadConfig, redactPaths } from "./server.js";
 import { createMetricsStore } from "./metrics.js";
+import { CRASH_RETENTION_MS, MAX_CRASH_GROUPS, MAX_CRASH_EVENTS, crashReportSchema, createCrashReportStore } from "./crash-reports.js";
 import {
   clearChannelResolutionCache,
   clearKickPublicKeyCache,
@@ -426,7 +428,7 @@ function appWithMetrics(fetchImpl, overrides = {}) {
     accountSalt: cfg.metrics.accountSalt,
     dataPath: null,
   });
-  return { app: createApp(cfg, { fetch: fetchImpl, metrics: store }), store };
+  return { app: createApp(cfg, { fetch: fetchImpl, metrics: store, crashReports: createCrashReportStore() }), store };
 }
 
 function makePingBody(version = "1.0.0") {
@@ -487,11 +489,74 @@ test("metrics device cap returns 429 without adding another device", () => {
   });
   store.recordPing({ pidHash: "a".repeat(64), version: "1", clientEpoch: aMonthString() });
   assert.throws(
-    () => store.recordPing({ pidHash: "b".repeat(64), version: "1", clientEpoch: aMonthString() }),
+    () => store.recordPing({ pidHash: "b".repeat(64), version: "1", clientEpoch: aMonthString(), accountAid: "c".repeat(64) }),
     (error) => error.status === 429 && error.code === "metrics_capacity_reached"
   );
   assert.equal(store.computeStats().mau, 1);
+  assert.equal(store.computeStats().pingAccountsMau, 0);
   store.close();
+});
+
+test("metrics caps ping accounts from returning devices before changing their data", () => {
+  const store = createMetricsStore({ salt: "s", maxDevicesPerMonth: 1 });
+  const now = new Date();
+  const ping = { pidHash: "a".repeat(64), version: "1", accountAid: "b".repeat(64), c: 1, wt: "1" };
+  store.recordPing(ping, now);
+  const before = structuredClone(store.state);
+
+  assert.throws(
+    () => store.recordPing({ ...ping, version: "2", accountAid: "c".repeat(64), c: 5, wt: "3" }, now),
+    (error) => error.status === 429 && error.code === "metrics_capacity_reached"
+  );
+  assert.deepEqual(store.state, before);
+  store.recordPing({ ...ping, c: 0 }, now);
+  store.recordPing({ pidHash: ping.pidHash, version: "2" }, now);
+  const stats = store.computeStats(now);
+  assert.equal(stats.mau, 1);
+  assert.equal(stats.pingAccountsMau, 1);
+  assert.equal(stats.counters.today.crashes.total, 1);
+  store.close();
+});
+
+test("a full ping account bucket rejects a new device without recording it", () => {
+  const store = createMetricsStore({ salt: "s", maxDevicesPerMonth: 2 });
+  const now = new Date();
+  const ping = { pidHash: "a".repeat(64), version: "1", accountAid: "b".repeat(64) };
+  store.recordPing(ping, now);
+  store.recordPing({ ...ping, accountAid: "c".repeat(64) }, now);
+  const before = structuredClone(store.state);
+  assert.throws(
+    () => store.recordPing({ ...ping, pidHash: "d".repeat(64), accountAid: "e".repeat(64) }, now),
+    (error) => error.status === 429 && error.code === "metrics_capacity_reached"
+  );
+  assert.deepEqual(store.state, before);
+  assert.equal(store.computeStats(now).mau, 1);
+  store.close();
+});
+
+test("ping account capacity survives reload and resets for a new month", () => {
+  const dir = mkdtempSync(join(tmpdir(), "metrics-ping-cap-"));
+  const options = { salt: "s", maxDevicesPerMonth: 1, dataPath: join(dir, "metrics.json") };
+  const now = new Date();
+  const ping = { pidHash: "a".repeat(64), version: "1", accountAid: "b".repeat(64) };
+  let store = createMetricsStore(options);
+  try {
+    store.recordPing(ping, now);
+    store.close();
+    store = createMetricsStore(options);
+    const nextAccount = { ...ping, accountAid: "c".repeat(64) };
+    assert.throws(() => store.recordPing(nextAccount, now), (error) => error.status === 429);
+    store.recordPing(ping, now);
+    assert.equal(store.computeStats(now).pingAccountsMau, 1);
+
+    const nextMonth = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1));
+    store.recordPing(nextAccount, nextMonth);
+    assert.equal(store.computeStats(nextMonth).pingAccountsMau, 1);
+    assert.equal(store.computeStats(now).pingAccountsMau, 1);
+  } finally {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("ping endpoint hidden when METRICS_SALT is unset", async () => {
@@ -1176,6 +1241,11 @@ test("sendLivePushNotification handles multicast response and prunes invalid tok
   assert.equal(result.failureCount, 1);
   assert.deepEqual(result.invalidTokens, [invalidToken]);
   assert.deepEqual(fcmStore.getTokensForChannel("888"), [validToken]);
+  const delivery = fcmStore.stats().delivery;
+  assert.equal(delivery.alertsDispatched, 1);
+  assert.equal(delivery.multicastSuccess, 1);
+  assert.equal(delivery.multicastFailure, 1);
+  assert.equal(delivery.tokensPruned, 1);
 });
 
 test("handleLiveEvent matches subscribers by channelId, userId, and slug", async () => {
@@ -1262,6 +1332,7 @@ test("sendLivePushNotification includes channel_id and properly trims leading sl
 
 test("multicast sends no more than 500 tokens per batch and continues after failures", async () => {
   const sizes = [];
+  const fcmStore = createFcmStore();
   const messaging = {
     async sendEachForMulticast({ tokens }) {
       sizes.push(tokens.length);
@@ -1271,10 +1342,66 @@ test("multicast sends no more than 500 tokens per batch and continues after fail
   };
   const result = await sendLivePushNotification({
     messaging, tokens: Array.from({ length: 1001 }, (_, index) => `token-${index}`), channelSlug: "test",
+    fcmStore, source: "webhook",
   });
   assert.deepEqual(sizes, [500, 500, 1]);
   assert.equal(result.successCount, 501);
   assert.equal(result.failureCount, 500);
+  const delivery = fcmStore.stats().delivery;
+  assert.equal(delivery.alertsDispatched, 1);
+  assert.equal(delivery.notificationsSent, 1001);
+  assert.equal(delivery.multicastSuccess, 501);
+  assert.equal(delivery.multicastFailure, 500);
+  assert.equal(delivery.sources.webhook, 1);
+  assert.equal(delivery.recentAlerts.length, 1);
+  assert.equal(delivery.recentAlerts[0].recipients, 1001);
+  assert.equal(delivery.recentAlerts[0].successCount, 501);
+  assert.equal(delivery.recentAlerts[0].failureCount, 500);
+});
+
+test("invalid tokens in later multicast batches are pruned using that batch's indices", async () => {
+  const fcmStore = createFcmStore();
+  const tokens = Array.from({ length: 501 }, (_, index) => `token-${index}`);
+  fcmStore.subscribe({ token: tokens[0], channelIds: ["test"] });
+  fcmStore.subscribe({ token: tokens[500], channelIds: ["test"] });
+  const messaging = {
+    async sendEachForMulticast({ tokens: batch }) {
+      const invalid = batch.length === 1;
+      return {
+        successCount: invalid ? 0 : batch.length,
+        failureCount: invalid ? 1 : 0,
+        responses: batch.map(() => invalid
+          ? { success: false, error: { code: "messaging/registration-token-not-registered" } }
+          : { success: true }),
+      };
+    },
+  };
+  const result = await sendLivePushNotification({ messaging, tokens, fcmStore, channelSlug: "test" });
+  assert.equal(result.successCount, 500);
+  assert.equal(result.failureCount, 1);
+  assert.deepEqual(result.invalidTokens, [tokens[500]]);
+  assert.deepEqual(fcmStore.getTokensForChannel("test"), [tokens[0]]);
+  assert.equal(fcmStore.stats().delivery.alertsDispatched, 1);
+  assert.equal(fcmStore.stats().delivery.tokensPruned, 1);
+});
+
+test("failed multicast batches record one failed alert and empty sends record none", async () => {
+  const fcmStore = createFcmStore();
+  const messaging = { async sendEachForMulticast() { throw new Error("unavailable"); } };
+  const options = { messaging, fcmStore, channelSlug: "test", source: "poller" };
+  await sendLivePushNotification({ ...options, tokens: [] });
+  await sendLivePushNotification({ ...options, messaging: null, tokens: ["token"] });
+  assert.equal(fcmStore.stats().delivery.alertsDispatched, 0);
+
+  const result = await sendLivePushNotification({ ...options, tokens: Array(501).fill("token") });
+  assert.equal(result.successCount, 0);
+  assert.equal(result.failureCount, 501);
+  const delivery = fcmStore.stats().delivery;
+  assert.equal(delivery.alertsDispatched, 1);
+  assert.equal(delivery.notificationsSent, 501);
+  assert.equal(delivery.multicastFailure, 501);
+  assert.equal(delivery.sources.poller, 1);
+  assert.equal(delivery.recentAlerts.length, 1);
 });
 
 test("stale alias resolution cannot change a replacement subscription", () => {
@@ -2208,6 +2335,20 @@ test("ping accepts pe, c, wt and reflects player engines, watch time, and crashe
   assert.equal(stats.counters.today.crashes?.total, 2);
 });
 
+test("watch time labels match the buckets sent by released Android clients", () => {
+  const store = createMetricsStore({ salt: "watch-buckets" });
+  for (const code of ["0", "1", "2", "3"]) {
+    store.recordPing({ pidHash: code.repeat(64), version: "2.55.0", wt: code });
+  }
+  assert.deepEqual(store.computeStats().watchTime, [
+    { code: "0", label: "< 15 min", count: 1 },
+    { code: "1", label: "15 min – 1 hr", count: 1 },
+    { code: "2", label: "1 hr – 3 hr", count: 1 },
+    { code: "3", label: "3 hr or more", count: 1 },
+  ]);
+  store.close();
+});
+
 test("upstream latency percentiles compute correctly", () => {
   const store = createMetricsStore({ salt: "salt-lat-test" });
   for (let i = 1; i <= 100; i++) {
@@ -2255,6 +2396,307 @@ test("telemetry coverage calculates ratio of ping accounts vs oauth accounts", (
   assert.equal(stats.accountsMau, 4);
   assert.equal(stats.pingAccountsMau, 3);
   assert.equal(stats.telemetryCoverage, 0.75);
+});
+
+function makeCrashReport(overrides = {}) {
+  return {
+    id: "12345678-1234-4234-8234-123456789abc",
+    version: "2.54.0",
+    build: 25400,
+    sdk: 35,
+    abi: "arm64-v8a",
+    liveEnginePreference: "ivs",
+    crashedAt: Date.now(),
+    exceptions: [{ type: "java.lang.IllegalStateException", frames: [
+      { class: "com.xtrakick.app.Example", method: "play", file: "Example.kt", line: 42 },
+    ] }],
+    ...overrides,
+  };
+}
+
+test("crash endpoint requires HMAC, rejects private fields, deduplicates, and protects details", async () => {
+  const secret = "crash-test-secret";
+  const { app, store } = appWithMetrics(async () => jsonResponse(200, {}), { APP_HMAC_SECRET: secret });
+  const path = "/v1/metrics/crash";
+  const report = makeCrashReport();
+  await withServer(app, async baseUrl => {
+    assert.equal((await httpRequest(baseUrl, "POST", path, report)).status, 401);
+    const invalid = { ...report, message: "Bearer private-token" };
+    const rejected = await httpRequest(baseUrl, "POST", path, invalid, {
+      headers: signedHeaders({ secret, method: "POST", path, bodyObject: invalid }),
+    });
+    assert.equal(rejected.status, 400);
+    assert.ok(!JSON.stringify(rejected.body).includes("private-token"));
+    for (let i = 0; i < 2; i++) {
+      assert.equal((await httpRequest(baseUrl, "POST", path, report, {
+        headers: signedHeaders({ secret, method: "POST", path, bodyObject: report }),
+      })).status, 204);
+    }
+    assert.equal((await httpRequest(baseUrl, "GET", "/v1/metrics/stats")).status, 401);
+    const stats = await httpRequest(baseUrl, "GET", "/v1/metrics/stats", undefined, {
+      headers: { Authorization: "Bearer admin-secret" },
+    });
+    assert.equal(stats.status, 200);
+    assert.equal(stats.headers["cache-control"], "no-store");
+    assert.equal(stats.body.crashReports.length, 1);
+    assert.equal(stats.body.crashReports[0].count, 1);
+    assert.equal(stats.body.crashReports[0].exceptions[0].frames[0].line, 42);
+    assert.equal(stats.body.crashReports[0].id, undefined);
+  });
+  store.close();
+  app.locals.crashReports.close();
+});
+
+test("crash upload stays disabled without signing even in unauthenticated development mode", async () => {
+  const { app, store } = appWithMetrics(async () => jsonResponse(200, {}));
+  const response = await withServer(app, baseUrl => httpRequest(baseUrl, "POST", "/v1/metrics/crash", makeCrashReport()));
+  assert.equal(response.status, 401);
+  store.close();
+  app.locals.crashReports.close();
+});
+
+test("crash schema rejects unknown fields, unsafe frames, and unbounded traces", () => {
+  for (const report of [
+    makeCrashReport({ pid: "user-id" }),
+    makeCrashReport({ abi: "device-identifier" }),
+    makeCrashReport({ liveEnginePreference: "https://private.example" }),
+    makeCrashReport({ exceptions: [{ type: "Error", message: "secret", frames: [] }] }),
+    makeCrashReport({ exceptions: [{ type: "<script>alert(1)</script>", frames: [] }] }),
+    makeCrashReport({ exceptions: [{ type: "Error", frames: Array(33).fill(makeCrashReport().exceptions[0].frames[0]) }] }),
+    makeCrashReport({ exceptions: Array(9).fill({ type: "Error", frames: [] }) }),
+  ]) assert.equal(crashReportSchema.safeParse(report).success, false);
+});
+
+test("crash store persists retries, groups occurrences, and expires data on disk", () => {
+  const dir = mkdtempSync(join(tmpdir(), "crash-reports-"));
+  const dataPath = join(dir, "crashes.json");
+  const now = Date.now();
+  let store;
+  try {
+    store = createCrashReportStore({ dataPath });
+    const report = makeCrashReport({ crashedAt: now });
+    store.record(report, now);
+    store.close();
+    store = createCrashReportStore({ dataPath });
+    store.record(report, now + 1);
+    assert.equal(store.list(now + 1)[0].count, 1);
+    store.record(makeCrashReport({ id: "22345678-1234-4234-8234-123456789abc", crashedAt: now + 2 }), now + 2);
+    assert.equal(store.list(now + 2)[0].count, 2);
+    // Counts and firstSeen must age out even when a signature keeps recurring.
+    assert.equal(store.list(now + CRASH_RETENTION_MS + 1)[0].count, 1);
+    assert.equal(store.list(now + CRASH_RETENTION_MS + 1)[0].firstSeen, now + 2);
+    assert.deepEqual(store.list(now + CRASH_RETENTION_MS + 3), []);
+    store.close();
+    store = createCrashReportStore({ dataPath });
+    assert.deepEqual(store.list(), []);
+  } finally {
+    store?.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("crash storage caps groups and keeps deduplication IDs for evicted groups", () => {
+  const store = createCrashReportStore();
+  const now = Date.now();
+  try {
+    for (let i = 0; i <= MAX_CRASH_GROUPS; i++) {
+      store.record(makeCrashReport({
+        id: `${i.toString(16).padStart(8, "0")}-1234-4234-8234-123456789abc`,
+        build: i + 1,
+        crashedAt: now,
+      }), now);
+    }
+    assert.equal(store.list(now).length, MAX_CRASH_GROUPS);
+    // Old IDs still deduplicate even if their group has been evicted.
+    store.record(makeCrashReport({ id: "00000000-1234-4234-8234-123456789abc", build: 1 }), now);
+    assert.equal(store.list(now).length, MAX_CRASH_GROUPS);
+  } finally { store.close(); }
+});
+
+test("crash retry capacity rejects new IDs without losing existing retry deduplication", () => {
+  const dir = mkdtempSync(join(tmpdir(), "crash-capacity-"));
+  const dataPath = join(dir, "crashes.json");
+  const now = Date.now();
+  const events = Array.from({ length: MAX_CRASH_EVENTS }, (_, i) => ({
+    id: `${i.toString(16).padStart(8, "0")}-1234-4234-8234-123456789abc`,
+    signature: "a".repeat(64), receivedAt: now,
+  }));
+  writeFileSync(dataPath, JSON.stringify({ reports: [], events }));
+  const store = createCrashReportStore({ dataPath });
+  try {
+    assert.throws(() => store.record(makeCrashReport(), now), error => error.status === 429);
+    store.record(makeCrashReport({ id: events[0].id }), now);
+    assert.deepEqual(store.list(now), []);
+    const later = now + CRASH_RETENTION_MS + 1;
+    store.record(makeCrashReport({ crashedAt: later }), later);
+    assert.equal(store.list(later)[0].count, 1);
+  } finally {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("expired and future-dated crash reports are discarded", () => {
+  const store = createCrashReportStore();
+  const now = Date.now();
+  store.record(makeCrashReport({ crashedAt: now - CRASH_RETENTION_MS }), now);
+  store.record(makeCrashReport({ crashedAt: now + 300_001 }), now);
+  assert.deepEqual(store.list(now), []);
+  store.close();
+});
+
+test("crash details last 90 days and older clients get unknown technical context", () => {
+  assert.equal(CRASH_RETENTION_MS, 90 * 86_400_000);
+  const legacy = makeCrashReport();
+  delete legacy.abi;
+  delete legacy.liveEnginePreference;
+  const parsed = crashReportSchema.parse(legacy);
+  assert.equal(parsed.abi, "unknown");
+  assert.equal(parsed.liveEnginePreference, "unknown");
+  const store = createCrashReportStore();
+  const now = Date.now();
+  const sixtyDaysAgo = now - 60 * 86_400_000;
+  store.record({ ...parsed, crashedAt: sixtyDaysAgo }, sixtyDaysAgo);
+  assert.equal(store.list(now).length, 1);
+  store.close();
+});
+
+test("crash requests never enter access logs, including rejected and failed uploads", async () => {
+  const logs = [];
+  const cfg = loadConfig(metricsEnv({ APP_HMAC_SECRET: "crash-test-secret", TRUST_PROXY: "loopback" }));
+  cfg.logger = pino({ level: "info" }, { write(line) { logs.push(JSON.parse(line)); } });
+  const metrics = createMetricsStore({ salt: "s" });
+  const crashReports = createCrashReportStore();
+  const app = createApp(cfg, { metrics, crashReports });
+  const path = "/V1/METRICS/CRASH/?private-query=private-query-value";
+  const headers = {
+    "X-Forwarded-For": "203.0.113.42", "X-Real-IP": "203.0.113.42",
+    "User-Agent": "private-user-agent", Cookie: "account=private-cookie",
+    Authorization: "Bearer private-authorization", "X-Request-ID": "private-request-id",
+  };
+  const send = (baseUrl, report) => httpRequest(baseUrl, "POST", path, report, { headers: {
+    ...headers, ...signedHeaders({ secret: cfg.appHmacSecret, method: "POST", path, bodyObject: report }),
+  } });
+  try {
+    await withServer(app, async baseUrl => {
+      await httpRequest(baseUrl, "GET", "/healthz");
+      assert.ok(logs.some(log => log.req?.url === "/healthz"), "Normal endpoint logging stays enabled");
+      logs.length = 0;
+      assert.equal((await httpRequest(baseUrl, "POST", path, makeCrashReport(), { headers })).status, 401);
+      assert.equal((await send(baseUrl, makeCrashReport())).status, 204);
+      assert.equal((await send(baseUrl, makeCrashReport({ message: "private-message" }))).status, 400);
+      const malformed = await fetch(baseUrl + path, { method: "POST", headers: { ...headers, "Content-Type": "application/json" }, body: "{private-message" });
+      assert.equal(malformed.status, 400);
+      await malformed.text();
+      const oversized = await httpRequest(baseUrl, "POST", path, { message: "private-message".repeat(4000) }, { headers });
+      assert.equal(oversized.status, 413);
+      crashReports.record = () => { throw new Error("private-storage-error"); };
+      assert.equal((await send(baseUrl, makeCrashReport())).status, 503);
+      let response;
+      for (let i = 0; i < 4; i++) response = await send(baseUrl, makeCrashReport());
+      assert.equal(response.status, 429);
+      const unexpected = await fetch(baseUrl + path, { method: "POST", headers: {
+        ...headers, "Content-Type": "application/json; charset=private-charset",
+      }, body: "{}" });
+      assert.equal(unexpected.status, 500);
+      await unexpected.text();
+    });
+    assert.equal(logs.length, 1);
+    assert.equal(logs[0].code, "crash_request_failed");
+    assert.equal(logs[0].req, undefined);
+    assert.equal(logs[0].err, undefined);
+    assert.doesNotMatch(JSON.stringify(logs), /private-|203\.0\.113\.42|remoteAddress|forwarded/i);
+    assert.ok(metrics.computeStats().counters.today.endpoints["OTHER / 404"]);
+  } finally {
+    metrics.close();
+    crashReports.close();
+  }
+});
+
+test("failed crash persistence does not consume the retry ID or count", () => {
+  const dir = mkdtempSync(join(tmpdir(), "crash-disk-failure-"));
+  const blocked = join(dir, "blocked");
+  writeFileSync(blocked, "not a directory");
+  const store = createCrashReportStore({ dataPath: join(blocked, "crashes.json") });
+  try {
+    const report = makeCrashReport();
+    assert.throws(() => store.record(report));
+    assert.deepEqual(store.list(), []);
+    rmSync(blocked);
+    store.record(report);
+    assert.equal(store.list()[0].count, 1);
+  } finally {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("corrupt crash storage preserves its file and does not take down other telemetry", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "crash-corrupt-"));
+  const dataPath = join(dir, "crashes.json");
+  writeFileSync(dataPath, "corrupt data");
+  const crashes = createCrashReportStore({ dataPath });
+  const metrics = createMetricsStore({ salt: "s" });
+  const cfg = loadConfig(metricsEnv({ APP_HMAC_SECRET: "crash-test-secret" }));
+  try {
+    assert.throws(() => crashes.record(makeCrashReport()));
+    assert.throws(() => crashes.list());
+    assert.equal(readFileSync(dataPath, "utf8"), "corrupt data");
+    const app = createApp(cfg, { metrics, crashReports: crashes });
+    const response = await withServer(app, baseUrl => httpRequest(baseUrl, "GET", "/v1/metrics/stats", undefined, {
+      headers: { Authorization: "Bearer admin-secret" },
+    }));
+    assert.equal(response.status, 200);
+    assert.equal(response.body.crashReportsUnavailable, true);
+    assert.equal(response.body.totalInstalls, 0);
+  } finally {
+    crashes.close();
+    metrics.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("dashboard crash details render untrusted strings only as text", () => {
+  const html = readFileSync(new URL("./dashboard.html", import.meta.url), "utf8");
+  new Script(html.match(/<script>([\s\S]*?)<\/script>/)[1]);
+  function node() {
+    return {
+      children: [], style: {}, textContent: "",
+      append(...children) { this.children.push(...children); },
+      set innerHTML(_value) { throw new Error("Crash details must use textContent"); },
+    };
+  }
+  const container = node();
+  const document = { getElementById: () => container, createElement: node };
+  const start = html.indexOf("function showCrashReports(");
+  const end = html.indexOf("function renderEndpointHealthTable(", start);
+  const render = runInNewContext(html.slice(start, end) + ";showCrashReports", { document });
+  const report = makeCrashReport();
+  report.exceptions[0].type = "<script>throw new Error('injection')</script>";
+  render([{ ...report, count: 1, lastSeen: Date.now() }]);
+  const details = container.children[1];
+  assert.match(details.children[0].textContent, /<script>/);
+  assert.match(details.children[2].textContent, /Example\.kt:42/);
+  render([]);
+  assert.match(container.children.at(-1).textContent, /No crash details received/);
+});
+
+test("crash endpoint retains client retry eligibility when storage fails and rate limits uploads", async () => {
+  const secret = "crash-test-secret";
+  const { app, store } = appWithMetrics(async () => jsonResponse(200, {}), { APP_HMAC_SECRET: secret });
+  const path = "/v1/metrics/crash";
+  const report = makeCrashReport();
+  app.locals.crashReports.record = () => { throw new Error("disk full"); };
+  await withServer(app, async baseUrl => {
+    for (let i = 0; i < 6; i++) {
+      const response = await httpRequest(baseUrl, "POST", path, report, {
+        headers: signedHeaders({ secret, method: "POST", path, bodyObject: report }),
+      });
+      assert.equal(response.status, i < 5 ? 503 : 429);
+    }
+  });
+  store.close();
+  app.locals.crashReports.close();
 });
 
 

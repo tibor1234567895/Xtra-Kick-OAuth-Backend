@@ -478,23 +478,8 @@ export async function sendLivePushNotification({
   source = "unknown",
 }) {
   if (!messaging || !tokens || tokens.length === 0) return { successCount: 0, failureCount: 0 };
-  if (tokens.length > 500) {
-    const total = { successCount: 0, failureCount: 0, invalidTokens: [] };
-    for (let offset = 0; offset < tokens.length; offset += 500) {
-      const result = await sendLivePushNotification({
-        messaging, tokens: tokens.slice(offset, offset + 500), channelId, userId,
-        channelSlug, title, description, profilePicture, startTime, logger, fcmStore, source,
-      });
-      total.successCount += result.successCount;
-      total.failureCount += result.failureCount;
-      total.invalidTokens.push(...(result.invalidTokens || []));
-    }
-    return total;
-  }
-
   const cleanSlug = String(channelSlug || userId || "").trim().replace(/^\/+/, "");
   const payload = {
-    tokens,
     data: {
       type: "stream_live",
       channel_id: String(channelId || ""),
@@ -511,65 +496,55 @@ export async function sendLivePushNotification({
     },
   };
 
-  try {
-    const response = await messaging.sendEachForMulticast(payload);
-    const invalidTokens = [];
-    response.responses.forEach((resp, idx) => {
-      if (!resp.success && resp.error) {
-        const code = resp.error.code;
-        if (
-          code === "messaging/invalid-registration-token" ||
-          code === "messaging/registration-token-not-registered"
-        ) {
-          invalidTokens.push(tokens[idx]);
+  const total = { successCount: 0, failureCount: 0, invalidTokens: [] };
+  for (let offset = 0; offset < tokens.length; offset += 500) {
+    const batch = tokens.slice(offset, offset + 500);
+    try {
+      const response = await messaging.sendEachForMulticast({ ...payload, tokens: batch });
+      const invalidTokens = [];
+      response.responses.forEach((resp, idx) => {
+        if (!resp.success && resp.error) {
+          const code = resp.error.code;
+          if (
+            code === "messaging/invalid-registration-token" ||
+            code === "messaging/registration-token-not-registered"
+          ) {
+            invalidTokens.push(batch[idx]);
+          }
         }
+      });
+
+      if (invalidTokens.length > 0 && fcmStore) {
+        fcmStore.pruneInvalidTokens(invalidTokens);
       }
-    });
 
-    if (invalidTokens.length > 0 && fcmStore) {
-      fcmStore.pruneInvalidTokens(invalidTokens);
+      total.successCount += response.successCount;
+      total.failureCount += response.failureCount;
+      total.invalidTokens.push(...invalidTokens);
+      logger?.info(
+        {
+          channel: cleanSlug,
+          success: response.successCount,
+          failure: response.failureCount,
+          pruned: invalidTokens.length,
+        },
+        "fcm_live_notification_dispatched"
+      );
+    } catch (err) {
+      total.failureCount += batch.length;
+      total.error = err.message;
+      logger?.error({ err: err.message, channel: cleanSlug }, "fcm_live_notification_failed");
     }
-
-    if (fcmStore?.recordDelivery) {
-      fcmStore.recordDelivery({
-        source,
-        channelSlug: cleanSlug,
-        title,
-        recipients: tokens.length,
-        successCount: response.successCount,
-        failureCount: response.failureCount,
-      });
-    }
-
-    logger?.info(
-      {
-        channel: cleanSlug,
-        success: response.successCount,
-        failure: response.failureCount,
-        pruned: invalidTokens.length,
-      },
-      "fcm_live_notification_dispatched"
-    );
-
-    return {
-      successCount: response.successCount,
-      failureCount: response.failureCount,
-      invalidTokens,
-    };
-  } catch (err) {
-    if (fcmStore?.recordDelivery) {
-      fcmStore.recordDelivery({
-        source,
-        channelSlug: cleanSlug,
-        title,
-        recipients: tokens.length,
-        successCount: 0,
-        failureCount: tokens.length,
-      });
-    }
-    logger?.error({ err: err.message, channel: cleanSlug }, "fcm_live_notification_failed");
-    return { successCount: 0, failureCount: tokens.length, error: err.message };
   }
+  fcmStore?.recordDelivery?.({
+    source,
+    channelSlug: cleanSlug,
+    title,
+    recipients: tokens.length,
+    successCount: total.successCount,
+    failureCount: total.failureCount,
+  });
+  return total;
 }
 
 function sameStreamStartTime(left, right) {
