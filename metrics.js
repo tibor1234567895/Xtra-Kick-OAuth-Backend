@@ -286,10 +286,10 @@ export function createMetricsStore(options = {}) {
     const key = dayKey(now);
     noteTraffic(now);
     if (!state.counters[key]) {
-      state.counters[key] = { endpoints: {}, oauth: {}, ping: {}, account: {}, crashes: {} };
+      state.counters[key] = { endpoints: {}, oauth: {}, ping: {}, account: {}, crashes: {}, engineSessions: {} };
     }
     const bucket = state.counters[key];
-    for (const part of ["endpoints", "oauth", "ping", "account", "crashes"]) {
+    for (const part of ["endpoints", "oauth", "ping", "account", "crashes", "engineSessions"]) {
       if (!bucket[part] || typeof bucket[part] !== "object") bucket[part] = {};
     }
     return { key, bucket };
@@ -363,7 +363,7 @@ export function createMetricsStore(options = {}) {
     return true;
   }
 
-  function recordPing({ pidHash, version, clientEpoch, os, cc, sessions, accountAid, geoCountry, pe, c, wt }, now = new Date()) {
+  function recordPing({ pidHash, version, clientEpoch, os, cc, sessions, accountAid, geoCountry, pe, c, wt, si, se }, now = new Date()) {
     if (typeof pidHash !== "string" || !/^[0-9a-f]{64}$/.test(pidHash)) {
       throw new Error("recordPing: invalid pidHash");
     }
@@ -385,6 +385,8 @@ export function createMetricsStore(options = {}) {
     const safePe = (pe === "ivs" || pe === "exo") ? pe : null;
     const safeWt = (wt === "0" || wt === "1" || wt === "2" || wt === "3") ? wt : null;
     const safeCrashes = clampInt(c, 0, 10_000, 0);
+    const safeIvsStarts = clampInt(si, 0, 100_000, 0);
+    const safeExoStarts = clampInt(se, 0, 100_000, 0);
     const aidHash = accountAid ? hashWithSalt(accSalt, accountAid) : null;
     const aidPrefix = aidHash ? aidHash.slice(0, EVERSEEN_PREFIX_CHARS) : null;
     const accountKnown = aidPrefix !== null && accountEverSeenSet.has(aidPrefix);
@@ -423,6 +425,14 @@ export function createMetricsStore(options = {}) {
         const { bucket } = counterBucket(now);
         bumpPlain(bucket.crashes, "total", safeCrashes);
       }
+      if (safeIvsStarts > 0) {
+        const { bucket } = counterBucket(now);
+        bumpPlain(bucket.engineSessions, "ivs", safeIvsStarts);
+      }
+      if (safeExoStarts > 0) {
+        const { bucket } = counterBucket(now);
+        bumpPlain(bucket.engineSessions, "exo", safeExoStarts);
+      }
       // Reinstall revocation: a recently counted install whose account turns
       // out to be a pre-existing one (device was not logged in on first ping)
       // gives its install count back.
@@ -453,6 +463,14 @@ export function createMetricsStore(options = {}) {
     if (safeCrashes > 0) {
       const { bucket } = counterBucket(now);
       bumpPlain(bucket.crashes, "total", safeCrashes);
+    }
+    if (safeIvsStarts > 0) {
+      const { bucket } = counterBucket(now);
+      bumpPlain(bucket.engineSessions, "ivs", safeIvsStarts);
+    }
+    if (safeExoStarts > 0) {
+      const { bucket } = counterBucket(now);
+      bumpPlain(bucket.engineSessions, "exo", safeExoStarts);
     }
     if (accountKnown) {
       // A device whose account is already known is a reinstall or an
@@ -570,7 +588,7 @@ export function createMetricsStore(options = {}) {
   }
 
   function rollupCounters(now, days) {
-    const rollup = { endpoints: {}, oauth: {}, ping: {}, account: {}, crashes: {} };
+    const rollup = { endpoints: {}, oauth: {}, ping: {}, account: {}, crashes: {}, engineSessions: {} };
     for (let offset = 0; offset < days; offset += 1) {
       const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
       d.setUTCDate(d.getUTCDate() - offset);

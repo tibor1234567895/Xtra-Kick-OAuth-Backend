@@ -483,6 +483,24 @@ test("ping rejects malformed payloads", async () => {
   store.close();
 });
 
+test("ping counts playback starts by engine and rejects out-of-range values", async () => {
+  const { app, store } = appWithMetrics(async () => jsonResponse(200, {}));
+
+  const ok = await withServer(app, (baseUrl) =>
+    httpRequest(baseUrl, "POST", "/v1/metrics/ping", { ...makePingBody(), si: 3, se: 2 })
+  );
+  assert.equal(ok.status, 204);
+  assert.equal(ok.headers["x-playback-starts-accepted"], "1");
+  const bad = await withServer(app, (baseUrl) =>
+    httpRequest(baseUrl, "POST", "/v1/metrics/ping", { ...makePingBody("1.0.1"), si: 200_000 })
+  );
+  assert.equal(bad.status, 400);
+
+  const stats = store.computeStats();
+  assert.deepEqual(stats.counters.today.engineSessions, { ivs: 3, exo: 2 });
+  store.close();
+});
+
 test("metrics device cap returns 429 without adding another device", () => {
   const store = createMetricsStore({
     salt: "s",
@@ -2867,6 +2885,38 @@ test("crash upload stays disabled without signing even in unauthenticated develo
   app.locals.crashReports.close();
 });
 
+test("crash dismissal route requires admin, validates, and hides a group until it recurs", async () => {
+  const secret = "crash-test-secret";
+  const { app, store } = appWithMetrics(async () => jsonResponse(200, {}), { APP_HMAC_SECRET: secret });
+  const path = "/v1/metrics/crash";
+  const report = makeCrashReport();
+  await withServer(app, async baseUrl => {
+    assert.equal((await httpRequest(baseUrl, "POST", path, report, {
+      headers: signedHeaders({ secret, method: "POST", path, bodyObject: report }),
+    })).status, 204);
+    const auth = { headers: { Authorization: "Bearer admin-secret" } };
+    assert.equal((await httpRequest(baseUrl, "POST", "/v1/metrics/crash/dismiss", { signature: "abc" })).status, 401);
+    assert.equal((await httpRequest(baseUrl, "POST", "/v1/metrics/crash/dismiss", { signature: "abc" }, auth)).status, 400);
+    const statsBefore = await httpRequest(baseUrl, "GET", "/v1/metrics/stats", undefined, auth);
+    assert.equal(statsBefore.status, 200);
+    assert.equal(statsBefore.body.crashReportsHidden, 0);
+    const signature = statsBefore.body.crashReports[0].signature;
+    assert.equal((await httpRequest(baseUrl, "POST", "/v1/metrics/crash/dismiss", { signature }, auth)).status, 204);
+    const statsHidden = await httpRequest(baseUrl, "GET", "/v1/metrics/stats", undefined, auth);
+    assert.deepEqual(statsHidden.body.crashReports, []);
+    assert.equal(statsHidden.body.crashReportsHidden, 1);
+    const recurring = { ...report, id: "22345678-1234-4234-8234-123456789abc", crashedAt: Date.now() + 5 };
+    assert.equal((await httpRequest(baseUrl, "POST", path, recurring, {
+      headers: signedHeaders({ secret, method: "POST", path, bodyObject: recurring }),
+    })).status, 204);
+    const statsAgain = await httpRequest(baseUrl, "GET", "/v1/metrics/stats", undefined, auth);
+    assert.equal(statsAgain.body.crashReports.length, 1);
+    assert.equal(statsAgain.body.crashReportsHidden, 0);
+  });
+  store.close();
+  app.locals.crashReports.close();
+});
+
 test("crash schema rejects unknown fields, unsafe frames, and unbounded traces", () => {
   for (const report of [
     makeCrashReport({ pid: "user-id" }),
@@ -2901,6 +2951,32 @@ test("crash store persists retries, groups occurrences, and expires data on disk
     store.close();
     store = createCrashReportStore({ dataPath });
     assert.deepEqual(store.list(), []);
+  } finally {
+    store?.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("crash dismissals persist across restarts and reappear when the crash recurs", () => {
+  const dir = mkdtempSync(join(tmpdir(), "crash-reports-"));
+  const dataPath = join(dir, "crashes.json");
+  const now = Date.now();
+  let store;
+  try {
+    store = createCrashReportStore({ dataPath });
+    store.record(makeCrashReport({ crashedAt: now }), now);
+    const signature = store.list(now)[0].signature;
+    store.dismiss(signature, now + 10);
+    assert.deepEqual(store.list(now + 10), []);
+    assert.equal(store.count(now + 10), 1);
+    store.close();
+    store = createCrashReportStore({ dataPath });
+    assert.deepEqual(store.list(now + 20), []);
+    // A recurring crash of the same signature bumps lastSeen past the dismissal.
+    store.record(makeCrashReport({ id: "22345678-1234-4234-8234-123456789abc", crashedAt: now + 30 }), now + 30);
+    const visible = store.list(now + 30);
+    assert.equal(visible.length, 1);
+    assert.equal(visible[0].count, 2);
   } finally {
     store?.close();
     rmSync(dir, { recursive: true, force: true });

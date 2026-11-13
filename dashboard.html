@@ -753,6 +753,7 @@
       };
       const AUTO_MS = 60_000;
       const ROUTE_STATS = "/v1/metrics/stats";
+      const ROUTE_CRASH_DISMISS = "/v1/metrics/crash/dismiss";
 
       const root = document.getElementById("root");
       const navTabs = document.getElementById("navTabs");
@@ -1089,7 +1090,7 @@
         if (state.activeTab === "overview") {
           drawChart(d);
           bindOverviewControls(d);
-          showCrashReports(d.crashReports, d.crashReportsUnavailable);
+          showCrashReports(d.crashReports, d.crashReportsUnavailable, d.crashReportsHidden);
         } else if (state.activeTab === "ops") {
           bindOpsControls(d);
         }
@@ -1694,6 +1695,10 @@
         const totalWatch = watch.reduce((a, b) => a + (b.count || 0), 0) || 1;
         const crashesToday = d.counters?.today?.crashes?.total || 0;
         const crashesWeek = d.counters?.week?.crashes?.total || 0;
+        const engineStartsToday = (d.counters?.today?.engineSessions) || {};
+        const engineStartsWeek = (d.counters?.week?.engineSessions) || {};
+        const hasEngineStarts = (engineStartsToday.ivs || 0) + (engineStartsToday.exo || 0) +
+          (engineStartsWeek.ivs || 0) + (engineStartsWeek.exo || 0) > 0;
 
         return `
           <div>
@@ -1714,6 +1719,33 @@
                 }).join("")}
               </div>
             ` : `<div style="color:var(--muted);font-size:12px;padding:6px 0;">No player engine telemetry yet.</div>`}
+          </div>
+
+          <div style="margin-top:20px;padding-top:16px;border-top:1px solid var(--border-subtle);">
+            <div style="font-size:12px;font-weight:500;color:var(--fg-dim);margin-bottom:8px;">Playback Starts by Engine (actual usage)</div>
+            ${hasEngineStarts ? `
+              <table style="width:100%;font-size:12px;">
+                <thead>
+                  <tr>
+                    <th style="text-align:left;">Engine</th>
+                    <th class="num" style="text-align:right;">Today</th>
+                    <th class="num" style="text-align:right;">7 days</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>Amazon IVS (live streams)</td>
+                    <td class="num">${fmt(engineStartsToday.ivs || 0)}</td>
+                    <td class="num">${fmt(engineStartsWeek.ivs || 0)}</td>
+                  </tr>
+                  <tr>
+                    <td>Media3 / ExoPlayer (VODs, clips, offline)</td>
+                    <td class="num">${fmt(engineStartsToday.exo || 0)}</td>
+                    <td class="num">${fmt(engineStartsWeek.exo || 0)}</td>
+                  </tr>
+                </tbody>
+              </table>
+            ` : `<div style="color:var(--muted);font-size:12px;padding:6px 0;">No playback-start telemetry yet. Requires app 2.55.0 or newer; the engine preference above only reflects user settings.</div>`}
           </div>
 
           <div style="margin-top:20px;padding-top:16px;border-top:1px solid var(--border-subtle);">
@@ -1750,7 +1782,31 @@
         `;
       }
 
-      function showCrashReports(reports, unavailable) {
+      async function dismissCrashReport(signature, btn) {
+        if (btn) btn.disabled = true;
+        if (state.demo) {
+          if (state.lastData && Array.isArray(state.lastData.crashReports)) {
+            state.lastData.crashReports = state.lastData.crashReports.filter(r => r.signature !== signature);
+            render(state.lastData);
+          }
+          return;
+        }
+        try {
+          const res = await fetch(ROUTE_CRASH_DISMISS, {
+            method: "POST",
+            headers: { Authorization: "Bearer " + state.token, "Content-Type": "application/json" },
+            body: JSON.stringify({ signature }),
+          });
+          if (res.status === 401) throw new Error("Invalid admin token (401)");
+          if (!res.ok) throw new Error("HTTP " + res.status);
+          await load();
+        } catch (err) {
+          if (btn) btn.disabled = false;
+          setStatus("err", "Dismiss failed");
+        }
+      }
+
+      function showCrashReports(reports, unavailable, hiddenCount) {
         const container = document.getElementById("crashReports");
         if (!container) return;
         if (unavailable) {
@@ -1759,7 +1815,7 @@
         }
         const note = document.createElement("p");
         note.style.cssText = "font-size:11px;color:var(--muted);";
-        note.textContent = "Crash details received in the last 90 days (up to 200 groups). Reporting is enabled by default and can be disabled in the app. Counts above come from daily pings and may differ. Expand a report to inspect its stack frames. Messages and diagnostic logs are excluded.";
+        note.textContent = `Crash details received in the last 90 days (up to 200 groups${hiddenCount ? `, ${hiddenCount} hidden` : ""}). Reporting is enabled by default and can be disabled in the app. Counts above come from daily pings and may differ. Expand a report to inspect its stack frames. Dismissed groups reappear automatically if the same crash recurs. Messages and diagnostic logs are excluded.`;
         container.append(note);
         if (!Array.isArray(reports) || !reports.length) {
           const empty = document.createElement("p");
@@ -1782,7 +1838,18 @@
             (index ? "Caused by: " : "") + exception.type + "\n" +
             exception.frames.map(frame => `    at ${frame.class}.${frame.method}(${frame.file}:${frame.line})`).join("\n")
           ).join("\n");
-          details.append(summary, metadata, stack);
+          const actions = document.createElement("div");
+          actions.style.cssText = "margin-top:6px;";
+          if (typeof dismissCrashReport === "function") {
+            const dismissBtn = document.createElement("button");
+            dismissBtn.type = "button";
+            dismissBtn.textContent = "Dismiss";
+            dismissBtn.title = "Hide this crash group. It reappears automatically if the same crash recurs.";
+            dismissBtn.style.cssText = "font-size:11px;padding:2px 10px;";
+            dismissBtn.addEventListener?.("click", () => dismissCrashReport(report.signature, dismissBtn));
+            actions.append(dismissBtn);
+          }
+          details.append(summary, metadata, stack, actions);
           container.append(details);
         }
       }

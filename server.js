@@ -115,6 +115,7 @@ export const KNOWN_ENDPOINTS = new Set([
   "POST /v1/kick/oauth/introspect",
   "POST /v1/metrics/ping",
   "POST /v1/metrics/crash",
+  "POST /v1/metrics/crash/dismiss",
   "GET /v1/metrics/stats",
   "GET /v1/metrics/dashboard",
   "GET /v1/metrics/dashboard/v2",
@@ -270,6 +271,19 @@ export function createApp(config, deps = {}) {
       }
     });
     app.get("/v1/metrics/stats", requireAdminToken(config.metrics), statsHandler(metrics, fcmStore, pusherRelay, liveStreamPoller, crashReports, kickWebhookHandler));
+    app.post("/v1/metrics/crash/dismiss", requireAdminToken(config.metrics), createLimiter(10), (req, res) => {
+      const signature = typeof req.body?.signature === "string" ? req.body.signature : "";
+      if (!/^[0-9a-f]{64}$/.test(signature)) {
+        return res.status(400).json({ code: "invalid_crash_signature" });
+      }
+      try {
+        crashReports.dismiss(signature);
+        return res.status(204).end();
+      } catch (error) {
+        if (error.status === 400) return res.status(400).json({ code: "invalid_crash_signature" });
+        return res.status(503).json({ code: "crash_report_unavailable" });
+      }
+    });
     if (config.metrics.dashPath) {
       // The page is only a login shell; its data request remains token-protected.
       const dash = dashboardHandler(config.metrics);
@@ -355,6 +369,8 @@ const pingSchema = z.object({
   pe: z.enum(["ivs", "exo"]).optional(),
   c: z.number().int().min(0).max(10_000).optional(),
   wt: z.enum(["0", "1", "2", "3"]).optional(),
+  si: z.number().int().min(0).max(100_000).optional(),
+  se: z.number().int().min(0).max(100_000).optional(),
 });
 
 function createLimiter(max) {
@@ -1106,9 +1122,12 @@ function pingHandler(metrics, lookupCountry) {
           pe: parsed.data.pe,
           c: parsed.data.c,
           wt: parsed.data.wt,
+          si: parsed.data.si,
+          se: parsed.data.se,
         },
         now
       );
+      res.setHeader("X-Playback-Starts-Accepted", "1");
       return res.status(204).end();
     } catch (error) {
       try {
@@ -1146,6 +1165,7 @@ function statsHandler(metrics, fcmStore, pusherRelay, liveStreamPoller, crashRep
     res.setHeader("Cache-Control", "no-store");
     try {
       payload.crashReports = crashReports.list();
+      payload.crashReportsHidden = Math.max(0, crashReports.count() - payload.crashReports.length);
     } catch {
       payload.crashReports = [];
       payload.crashReportsUnavailable = true;

@@ -10,6 +10,7 @@ Minimal OAuth proxy for Kick token operations.
 - `POST /v1/kick/oauth/introspect`
 - `POST /v1/metrics/ping` (enabled when `METRICS_SALT` is set)
 - `POST /v1/metrics/crash` (requires app HMAC signing and metrics enabled)
+- `POST /v1/metrics/crash/dismiss` (requires `METRICS_ADMIN_TOKEN`)
 - `GET /v1/metrics/stats` (requires `METRICS_ADMIN_TOKEN`)
 - `GET /v1/metrics/dashboard` (static operations cockpit; requires `METRICS_DASHBOARD_FILE`)
 - `GET /v1/metrics/dashboard/v2` (backward-compatible alias for the operations dashboard)
@@ -42,6 +43,14 @@ Minimal OAuth proxy for Kick token operations.
   auto-refresh, and reads `?days=` from `/v1/metrics/stats`.
 
 ## Notes
+- Playback-start counts track content changes per engine, excluding buffering and
+  pause/resume of the same content. Content identifiers stay in app memory and are
+  never uploaded. The app retains these counters until the ping response includes
+  `X-Playback-Starts-Accepted: 1`, so an older backend cannot silently discard them.
+  Deploy the backend before releasing the app to start collecting them immediately.
+- Watch-time and player-preference distributions describe each reporting device's
+  latest values in the current calendar month, not individual sessions or a seven-day
+  history. Preserve the existing data; corrected clients replace their own snapshots.
 - Crash reporting is enabled by default under **Settings > System & Advanced > Send crash reports**,
   and also requires **Anonymous usage statistics**. Existing disabled settings are preserved;
   no preference migration forces reporting back on. Release builds save up to five pending

@@ -27,13 +27,13 @@ export const crashReportSchema = z.object({
 }).strict();
 
 export function createCrashReportStore({ dataPath = null } = {}) {
-  let state = { reports: [], events: [] };
+  let state = { reports: [], events: [], dismissed: {} };
   let loadFailed = false;
   if (dataPath && existsSync(dataPath)) {
     try {
       const parsed = JSON.parse(readFileSync(dataPath, "utf8"));
       if (!Array.isArray(parsed.reports) || !Array.isArray(parsed.events)) throw new Error("Invalid crash report store");
-      state = parsed;
+      state = { dismissed: {}, ...parsed };
     } catch {
       loadFailed = true;
     }
@@ -57,10 +57,15 @@ export function createCrashReportStore({ dataPath = null } = {}) {
       count.count++;
       counts.set(event.signature, count);
     }
+    const dismissed = {};
+    for (const [signature, at] of Object.entries(state.dismissed || {})) {
+      if (at > cutoff) dismissed[signature] = at;
+    }
     return {
       reports: state.reports.filter(r => counts.has(r.signature)).slice(-MAX_CRASH_GROUPS)
         .map(r => ({ ...r, ...counts.get(r.signature) })),
       events,
+      dismissed,
     };
   }
 
@@ -99,6 +104,23 @@ export function createCrashReportStore({ dataPath = null } = {}) {
     save(next);
   }
 
+  // Dismissal hides a group until something new happens for it: any later event
+  // for the same signature bumps lastSeen past the dismissal timestamp, so the
+  // group reappears on its own ("show again if it happens again"). Because the
+  // signature covers version and build, the same stack on a new build is a new
+  // group and is never affected by an old dismissal.
+  function dismiss(signature, now = Date.now()) {
+    if (loadFailed) throw new Error("Crash report storage unavailable");
+    if (typeof signature !== "string" || !/^[0-9a-f]{64}$/.test(signature)) {
+      const error = new Error("Invalid signature");
+      error.status = 400;
+      throw error;
+    }
+    const next = pruned(now);
+    next.dismissed = { ...next.dismissed, [signature]: now };
+    save(next);
+  }
+
   try { prune(); } catch { loadFailed = true; }
   const timer = setInterval(() => {
     try { prune(); } catch { /* Retry expiration on the next read or timer. */ }
@@ -106,10 +128,18 @@ export function createCrashReportStore({ dataPath = null } = {}) {
   timer.unref();
   return {
     record,
+    dismiss,
+    count(now = Date.now()) {
+      if (loadFailed) throw new Error("Crash report storage unavailable");
+      prune(now);
+      return state.reports.length;
+    },
     list(now = Date.now()) {
       if (loadFailed) throw new Error("Crash report storage unavailable");
       prune(now);
-      return state.reports.slice().reverse();
+      const dismissed = state.dismissed || {};
+      return state.reports.slice().reverse()
+        .filter(r => !(dismissed[r.signature] && r.lastSeen <= dismissed[r.signature]));
     },
     close() { clearInterval(timer); },
   };
