@@ -14,6 +14,10 @@ Minimal OAuth proxy for Kick token operations.
 - `GET /v1/metrics/stats` (requires `METRICS_ADMIN_TOKEN`)
 - `GET /v1/metrics/dashboard` (static operations cockpit; requires `METRICS_DASHBOARD_FILE`)
 - `GET /v1/metrics/dashboard/v2` (backward-compatible alias for the operations dashboard)
+- `POST /v1/fcm/subscribe` (registers a Firebase device token with Kick channel subscriptions for live-notification push; app HMAC applies when configured)
+- `POST /v1/fcm/unsubscribe` (removes a device token)
+- `GET /v1/fcm/stats` (requires `METRICS_ADMIN_TOKEN`)
+- `POST /v1/events/webhook` and `POST /api/events/webhook` (Kick webhook receiver)
 
 ## Setup
 1. Copy `.env.example` to `.env` and fill values.
@@ -30,6 +34,19 @@ Minimal OAuth proxy for Kick token operations.
 - `UPSTREAM_TIMEOUT_MS` defaults to `10000`.
 - `TRUST_PROXY` defaults to `loopback`.
 - `LOG_LEVEL` defaults to `info`.
+- `HMAC_TIMESTAMP_TOLERANCE_SECONDS` defaults to `300` and bounds how old a signed
+  request's timestamp may be.
+- FCM push relay (live-notification delivery to app devices):
+  - `FCM_SERVICE_ACCOUNT_KEY_PATH` defaults to `./firebase-service-account.json`.
+    When the file is absent the backend only records subscriptions and never
+    dispatches push.
+  - `FCM_DATA_FILE` defaults to `./data/fcm_subscriptions.json`; the store caps at
+    100,000 device tokens.
+  - With a service account configured, live events reach devices through the
+    backend's Kick webhook receiver and live stream poller.
+    `FCM_PUSHER_RELAY_ENABLED=true` additionally relays Kick Pusher events directly.
+  - The app re-syncs its subscriptions through `POST /v1/fcm/subscribe` whenever its
+    per-channel notification settings change.
 - `METRICS_MAX_DEVICES_PER_MONTH` defaults to `100000` and bounds anonymous
   metrics storage for the active month.
 - `METRICS_RETENTION_MONTHS` defaults to `3` (stats can chart up to 90 days).

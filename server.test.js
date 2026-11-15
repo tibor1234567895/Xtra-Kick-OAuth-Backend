@@ -38,6 +38,23 @@ const baseEnv = {
   FCM_SERVICE_ACCOUNT_KEY_PATH: "none",
 };
 
+test("webhook quotas apply before JSON parsing and leave ordinary traffic independent", async () => {
+  for (const [body, rejection] of [["{", 400], [JSON.stringify({ data: "x".repeat(33_000) }), 413], ["{}", 400]]) {
+    const app = appWithFetch(() => { throw new Error("No upstream request expected"); });
+    await withServer(app, async (baseUrl) => {
+      const paths = ["/api/events/webhook", "/v1/events/webhook/", "/V1/EVENTS/WEBHOOK?audit=1"];
+      for (let i = 0; i <= 600; i++) {
+        const response = await fetch(`${baseUrl}${paths[i % paths.length]}`, {
+          method: "POST", headers: { "Content-Type": "application/json" }, body,
+        });
+        await response.text();
+        assert.equal(response.status, i < 600 ? rejection : 429, `request ${i + 1}`);
+      }
+      assert.equal((await fetch(`${baseUrl}/healthz`)).status, 200);
+    });
+  }
+});
+
 function config(overrides = {}) {
   return loadConfig({ ...baseEnv, ...overrides });
 }

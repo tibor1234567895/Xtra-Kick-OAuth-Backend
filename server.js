@@ -139,7 +139,12 @@ export function createApp(config, deps = {}) {
 
   app.disable("x-powered-by");
   app.set("trust proxy", config.trustProxy);
-  app.use(createLimiter(180));
+  const generalLimiter = createLimiter(180);
+  const webhookLimiter = createLimiter(600);
+  app.use((req, res, next) => {
+    const webhook = req.method === "POST" && /^\/(?:api|v1)\/events\/webhook\/?$/i.test(req.path);
+    return (webhook ? webhookLimiter : generalLimiter)(req, res, next);
+  });
   app.use(helmet({ contentSecurityPolicy: false }));
 
   const metrics = deps.metrics || (config.metrics?.enabled
@@ -300,9 +305,8 @@ export function createApp(config, deps = {}) {
     app.get("/v1/fcm/stats", requireAdminToken(config.metrics), fcmStatsHandler(fcmStore));
   }
 
-  const webhookLimiter = createLimiter(600);
-  app.post("/api/events/webhook", webhookLimiter, kickWebhookHandler);
-  app.post("/v1/events/webhook", webhookLimiter, kickWebhookHandler);
+  app.post("/api/events/webhook", kickWebhookHandler);
+  app.post("/v1/events/webhook", kickWebhookHandler);
 
   app.get("/healthz", (_req, res) => {
     res.status(200).json({ ok: true });
@@ -413,7 +417,9 @@ function createHmacMiddleware(config, metrics = null) {
 
     const reject = () => {
       try {
-        metrics?.countersHmacRejected(`${req.method} ${new URL(req.originalUrl, "http://internal").pathname}`);
+        const path = new URL(req.originalUrl, "http://internal").pathname.replace(/\/$/, "").toLowerCase();
+        const endpoint = `${req.method} ${path}`;
+        metrics?.countersHmacRejected(KNOWN_ENDPOINTS.has(endpoint) ? endpoint : "OTHER / 404");
       } catch {
         // Counters are best-effort.
       }
