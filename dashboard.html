@@ -1830,6 +1830,10 @@
           const summary = document.createElement("summary");
           summary.style.cssText = "cursor:pointer;overflow-wrap:anywhere;";
           summary.textContent = `${report.exceptions?.[0]?.type || "Exception"} · v${report.version} (${report.build}) · API ${report.sdk} · ${report.count} report(s)`;
+          const received = document.createElement("span");
+          received.style.cssText = "display:block;margin-top:4px;font-size:11px;color:var(--muted);";
+          received.textContent = `Last received: ${new Date(report.lastSeen).toLocaleString(undefined, { timeZoneName: "short" })}`;
+          summary.append(received);
           const metadata = document.createElement("p");
           metadata.textContent = `CPU architecture: ${report.abi || "unknown"} · Live engine preference: ${report.liveEnginePreference || "unknown"} · Last crash: ${new Date(report.crashedAt).toISOString()} · Last received: ${new Date(report.lastSeen).toISOString()}`;
           const stack = document.createElement("pre");

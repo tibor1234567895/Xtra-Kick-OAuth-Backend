@@ -3178,9 +3178,13 @@ test("dashboard crash details render untrusted strings only as text", () => {
   const render = runInNewContext(html.slice(start, end) + ";showCrashReports", { document });
   const report = makeCrashReport();
   report.exceptions[0].type = "<script>throw new Error('injection')</script>";
-  render([{ ...report, count: 1, lastSeen: Date.now() }]);
+  const receivedAt = Date.UTC(2026, 10, 15, 14, 49, 18);
+  render([{ ...report, count: 1, lastSeen: receivedAt }]);
   const details = container.children[1];
   assert.match(details.children[0].textContent, /<script>/);
+  const received = details.children[0].children[0];
+  assert.equal(received.textContent, `Last received: ${new Date(receivedAt).toLocaleString(undefined, { timeZoneName: "short" })}`);
+  assert.match(received.style.cssText, /display:block/);
   assert.match(details.children[2].textContent, /Example\.kt:42/);
   render([]);
   assert.match(container.children.at(-1).textContent, /No crash details received/);
