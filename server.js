@@ -23,6 +23,7 @@ import {
   getKickPublicKey,
   handleWebhookLiveEvent,
   initFirebaseMessaging,
+  isNegativelyCachedChannel,
   loadFcmConfig,
   resolveKickBroadcasterUserIds,
   resolveKickChannel,
@@ -237,6 +238,7 @@ export function createApp(config, deps = {}) {
     kickApiBaseUrl: config.kickApiBaseUrl || "https://api.kick.com",
   });
 
+  app.locals.metrics = metrics;
   app.locals.fcmStore = fcmStore;
   app.locals.pusherRelay = pusherRelay;
   app.locals.liveStreamPoller = liveStreamPoller;
@@ -276,7 +278,7 @@ export function createApp(config, deps = {}) {
       }
     });
     app.get("/v1/metrics/stats", requireAdminToken(config.metrics), statsHandler(metrics, fcmStore, pusherRelay, liveStreamPoller, crashReports, kickWebhookHandler));
-    app.post("/v1/metrics/crash/dismiss", requireAdminToken(config.metrics), createLimiter(10), (req, res) => {
+    app.post("/v1/metrics/crash/dismiss", createLimiter(10), requireAdminToken(config.metrics), (req, res) => {
       const signature = typeof req.body?.signature === "string" ? req.body.signature : "";
       if (!/^[0-9a-f]{64}$/.test(signature)) {
         return res.status(400).json({ code: "invalid_crash_signature" });
@@ -351,7 +353,7 @@ const revokeSchema = z.object({
 
 const fcmSubscribeSchema = z.object({
   token: z.string().trim().min(20).max(500),
-  kick_user_id: z.string().trim().optional(),
+  kick_user_id: z.string().trim().max(64).optional(),
   channel_ids: z.array(z.string().trim().min(1).max(100)).max(500),
 });
 
@@ -399,8 +401,18 @@ function unauthorized(res) {
   return res.status(401).json({ code: "unauthorized", message: "Request signature is invalid" });
 }
 
+export const MAX_NONCE_LENGTH = 128;
+export const MAX_SEEN_NONCES = 50_000;
+
+export function asyncHandler(fn) {
+  return (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+}
+
 function createHmacMiddleware(config, metrics = null) {
   const toleranceMs = config.hmacToleranceSeconds * 1000;
+  const maxSeenNonces = Number.isInteger(config.maxSeenNonces) && config.maxSeenNonces > 0
+    ? config.maxSeenNonces
+    : MAX_SEEN_NONCES;
   const seenNonces = new Map();
   const cleanup = setInterval(() => {
     const now = Date.now();
@@ -426,7 +438,15 @@ function createHmacMiddleware(config, metrics = null) {
       return unauthorized(res);
     };
 
-    if (!timestamp || !nonce || !signature || typeof nonce !== "string") {
+    if (
+      !timestamp ||
+      !nonce ||
+      !signature ||
+      typeof nonce !== "string" ||
+      nonce.length > MAX_NONCE_LENGTH ||
+      typeof signature !== "string" ||
+      !/^[0-9a-f]{64}$/i.test(signature)
+    ) {
       return reject();
     }
     if (!/^\d+$/.test(timestamp)) {
@@ -466,6 +486,17 @@ function createHmacMiddleware(config, metrics = null) {
     const previousExpiry = seenNonces.get(nonce);
     if (previousExpiry && previousExpiry > now) {
       return reject();
+    }
+    if (previousExpiry !== undefined) {
+      seenNonces.delete(nonce);
+    }
+    if (seenNonces.size >= maxSeenNonces) {
+      for (const [key, exp] of seenNonces) {
+        if (exp <= now || seenNonces.size >= maxSeenNonces) {
+          seenNonces.delete(key);
+        }
+        if (seenNonces.size < maxSeenNonces) break;
+      }
     }
     seenNonces.set(nonce, nonceExpiresAt);
 
@@ -782,64 +813,107 @@ function introspectHandler(config, upstreamFetch) {
   };
 }
 
+export const MAX_UNCACHED_SLUGS_PER_REQUEST = 25;
+export const MAX_ACTIVE_RESOLUTIONS = 4;
+
 function fcmSubscribeHandler(fcmStore, pusherRelay, { upstreamFetch, config } = {}) {
   let activeResolutions = 0;
-  return async (req, res) => {
+  return asyncHandler(async (req, res) => {
     const parsed = fcmSubscribeSchema.safeParse(req.body);
     if (!parsed.success) return validationError(res, parsed);
-    if (parsed.data.channel_ids.length > 0 && activeResolutions >= 4) {
+
+    const rawChannelIds = Array.from(
+      new Set(parsed.data.channel_ids.map((id) => id.trim().toLowerCase()).filter(Boolean))
+    );
+    const now = Date.now();
+    const numericIds = [];
+    const persistedChannelIds = [];
+    const uncachedSlugs = [];
+    const pushCachedAliases = (cached) => {
+      if (cached.channelId) persistedChannelIds.push(cached.channelId);
+      if (cached.userId) persistedChannelIds.push(cached.userId);
+      if (cached.slug) persistedChannelIds.push(cached.slug);
+    };
+
+    for (const id of rawChannelIds) {
+      if (/^\d+$/.test(id)) {
+        numericIds.push(id);
+        persistedChannelIds.push(id);
+        const cached = channelResolutionCache.get(id);
+        if (cached && cached.expiresAt > now) {
+          pushCachedAliases(cached);
+        }
+      } else if (isNegativelyCachedChannel(id, now)) {
+        continue;
+      } else {
+        const cached = channelResolutionCache.get(id);
+        if (cached && cached.expiresAt > now) {
+          persistedChannelIds.push(id);
+          pushCachedAliases(cached);
+        } else if (fcmStore.hasChannel(id)) {
+          persistedChannelIds.push(id);
+        } else {
+          uncachedSlugs.push(id);
+        }
+      }
+    }
+
+    const uncachedSlugsToResolve = uncachedSlugs.slice(0, MAX_UNCACHED_SLUGS_PER_REQUEST);
+    const unknownNumeric = numericIds.filter((id) => {
+      const cached = channelResolutionCache.get(id);
+      return !cached || cached.expiresAt <= now || cached.channelId !== id;
+    });
+    const needsResolution = uncachedSlugsToResolve.length > 0 || unknownNumeric.length > 0;
+
+    if (needsResolution && activeResolutions >= MAX_ACTIVE_RESOLUTIONS) {
       return res.status(503).json({ ok: false, code: "subscription_busy" });
     }
 
     const result = fcmStore.subscribe({
       token: parsed.data.token,
       kickUserId: parsed.data.kick_user_id,
-      channelIds: parsed.data.channel_ids,
+      channelIds: persistedChannelIds,
     });
     if (result.error) return res.status(503).json({ ok: false, code: result.error });
     pusherRelay?.syncSubscriptions();
 
-    // In the background, resolve any slugs or keys so numeric channel_ids are guaranteed
-    // to be subscribed on the Pusher WebSocket and registered to the device token.
+    // In the background, resolve any uncached slugs or numeric keys so resolved
+    // channel_ids are subscribed on the Pusher WebSocket and registered to the device token.
     const token = parsed.data.token;
-    const channelIds = parsed.data.channel_ids;
     const fetchFn = upstreamFetch || globalThis.fetch;
     const logger = req.log || config?.logger;
 
-    activeResolutions++;
-    (async () => {
-      try {
-        const nonNumeric = channelIds.filter((id) => !/^\d+$/.test(id));
-        const numericIds = channelIds.filter((id) => /^\d+$/.test(id));
-        if (nonNumeric.length === 0 && numericIds.length === 0) return;
-
-        const resolvedIds = [];
-        // 1. Resolve non-numeric slugs with controlled concurrency
-        if (nonNumeric.length > 0) {
-          const BATCH_SIZE = 5;
-          for (let i = 0; i < nonNumeric.length; i += BATCH_SIZE) {
-            if (!fcmStore.isCurrentSubscription(token, result.revision)) return;
-            const batch = nonNumeric.slice(i, i + BATCH_SIZE);
-            const results = await Promise.all(
-              batch.map((slug) => resolveKickChannel(slug, { fetchFn, logger }))
-            );
-            for (const r of results) {
-              if (r) {
-                if (r.channelId) resolvedIds.push(r.channelId);
-                if (r.userId) resolvedIds.push(r.userId);
+    if (needsResolution || (config?.kickClientId && config?.kickClientSecret && persistedChannelIds.length > 0)) {
+      if (needsResolution) activeResolutions++;
+      (async () => {
+        try {
+          const resolvedIds = [];
+          // 1. Resolve capped non-numeric uncached slugs with controlled concurrency
+          if (uncachedSlugsToResolve.length > 0) {
+            const BATCH_SIZE = 5;
+            for (let i = 0; i < uncachedSlugsToResolve.length; i += BATCH_SIZE) {
+              if (!fcmStore.isCurrentSubscription(token, result.revision)) return;
+              const batch = uncachedSlugsToResolve.slice(i, i + BATCH_SIZE);
+              const results = await Promise.all(
+                batch.map(async (slug) => ({
+                  slug,
+                  resolved: await resolveKickChannel(slug, { fetchFn, logger }),
+                }))
+              );
+              for (const { slug, resolved } of results) {
+                if (resolved) {
+                  if (resolved.channelId) resolvedIds.push(resolved.channelId);
+                  if (resolved.userId) resolvedIds.push(resolved.userId);
+                  if (resolved.slug) resolvedIds.push(resolved.slug);
+                  resolvedIds.push(slug);
+                }
               }
             }
           }
-        }
 
-        // 2. Resolve numeric broadcaster user IDs that are not yet known as channelIds
-        if (numericIds.length > 0) {
-          if (!fcmStore.isCurrentSubscription(token, result.revision)) return;
-          const unknownNumeric = numericIds.filter((id) => {
-            const cached = channelResolutionCache.get(id);
-            return !cached || cached.channelId !== id;
-          });
+          // 2. Resolve numeric broadcaster user IDs that are not yet known as channelIds
           if (unknownNumeric.length > 0) {
+            if (!fcmStore.isCurrentSubscription(token, result.revision)) return;
             const results = await resolveKickBroadcasterUserIds(unknownNumeric, {
               fetchFn,
               logger,
@@ -854,55 +928,55 @@ function fcmSubscribeHandler(fcmStore, pusherRelay, { upstreamFetch, config } = 
               }
             }
           }
-        }
 
-        if (resolvedIds.length > 0) {
-          const added = fcmStore.addAliasesToToken(token, resolvedIds, result.revision);
-          if (added > 0) {
-            pusherRelay?.syncSubscriptions();
-            logger?.info({ token: token.slice(-8), resolvedCount: resolvedIds.length, added }, "fcm_slugs_resolved_and_synced");
+          if (resolvedIds.length > 0) {
+            const added = fcmStore.addAliasesToToken(token, resolvedIds, result.revision);
+            if (added > 0) {
+              pusherRelay?.syncSubscriptions();
+              logger?.info({ token: token.slice(-8), resolvedCount: resolvedIds.length, added }, "fcm_slugs_resolved_and_synced");
+            }
           }
-        }
 
-        if (config?.kickClientId && config?.kickClientSecret) {
-          scheduleKickSubscriptionSync({
-            fcmStore,
-            fetchFn,
-            clientId: config.kickClientId,
-            clientSecret: config.kickClientSecret,
-            kickApiBaseUrl: config.kickApiBaseUrl || "https://api.kick.com",
-            logger,
-          }).catch(() => {});
+          if (config?.kickClientId && config?.kickClientSecret) {
+            scheduleKickSubscriptionSync({
+              fcmStore,
+              fetchFn,
+              clientId: config.kickClientId,
+              clientSecret: config.kickClientSecret,
+              kickApiBaseUrl: config.kickApiBaseUrl || "https://api.kick.com",
+              logger,
+            }).catch(() => {});
+          }
+        } catch (err) {
+          logger?.warn({ err: err.message }, "fcm_background_resolution_failed");
+        } finally {
+          if (needsResolution) activeResolutions--;
         }
-      } catch (err) {
-        logger?.warn({ err: err.message }, "fcm_background_resolution_failed");
-      } finally {
-        activeResolutions--;
-      }
-    })().catch(() => {});
+      })().catch(() => {});
+    }
 
     return res.status(200).json({
       ok: true,
       subscribed_channels: result.subscribedChannels,
     });
-  };
+  });
 }
 
 function fcmUnsubscribeHandler(fcmStore, pusherRelay) {
-  return async (req, res) => {
+  return asyncHandler(async (req, res) => {
     const parsed = fcmUnsubscribeSchema.safeParse(req.body);
     if (!parsed.success) return validationError(res, parsed);
 
     const removed = fcmStore.unsubscribe({ token: parsed.data.token });
     if (removed) pusherRelay?.syncSubscriptions();
     return res.status(200).json({ ok: true, unsubscribed: removed });
-  };
+  });
 }
 
 function fcmStatsHandler(fcmStore) {
-  return async (_req, res) => {
+  return asyncHandler(async (_req, res) => {
     return res.status(200).json({ ok: true, stats: fcmStore.stats() });
-  };
+  });
 }
 
 export function createKickWebhookHandler({
@@ -920,7 +994,7 @@ export function createKickWebhookHandler({
     status.lastErrorCode = code;
     status.errors++;
   }
-  const handler = async (req, res) => {
+  const handler = asyncHandler(async (req, res) => {
     const messageId = req.headers["kick-event-message-id"];
     const timestamp = req.headers["kick-event-message-timestamp"];
     const signature = req.headers["kick-event-signature"];
@@ -935,12 +1009,7 @@ export function createKickWebhookHandler({
     }
 
     const now = Date.now();
-    const cachedExpiry = seenWebhookMessages.get(messageId);
-    if (cachedExpiry && cachedExpiry > now) {
-      return res.status(200).json({ ok: true, duplicate: true });
-    }
-
-    const publicKey = await getKickPublicKey({ fetchFn, kickApiBaseUrl, logger });
+    let publicKey = await getKickPublicKey({ fetchFn, kickApiBaseUrl, logger, now });
     if (!publicKey) {
       recordError("public_key_unavailable");
       logger?.error("kick_webhook_public_key_unavailable");
@@ -950,7 +1019,7 @@ export function createKickWebhookHandler({
       });
     }
 
-    const isValid = verifyKickWebhookSignature({
+    let isValid = verifyKickWebhookSignature({
       publicKey,
       messageId,
       timestamp,
@@ -958,6 +1027,27 @@ export function createKickWebhookHandler({
       rawBody: req.rawBody,
       now,
     });
+
+    if (!isValid) {
+      const refreshedKey = await getKickPublicKey({
+        fetchFn,
+        kickApiBaseUrl,
+        logger,
+        forceRefresh: true,
+        now,
+      });
+      if (refreshedKey && refreshedKey !== publicKey) {
+        publicKey = refreshedKey;
+        isValid = verifyKickWebhookSignature({
+          publicKey,
+          messageId,
+          timestamp,
+          signature,
+          rawBody: req.rawBody,
+          now,
+        });
+      }
+    }
 
     if (!isValid) {
       recordError("invalid_signature");
@@ -968,15 +1058,16 @@ export function createKickWebhookHandler({
       });
     }
 
-    seenWebhookMessages.set(messageId, now + 10 * 60 * 1000);
-    status.lastReceivedAt = new Date().toISOString();
-    status.verifiedEvents++;
-    while (seenWebhookMessages.size > 10000) {
-      seenWebhookMessages.delete(seenWebhookMessages.keys().next().value);
+    const cachedExpiry = seenWebhookMessages.get(messageId);
+    if (cachedExpiry && cachedExpiry > now) {
+      return res.status(200).json({ ok: true, duplicate: true });
     }
 
+    status.lastReceivedAt = new Date().toISOString();
+    status.verifiedEvents++;
+
     try {
-      await handleWebhookLiveEvent({
+      const result = await handleWebhookLiveEvent({
         eventType,
         payload: req.body,
         fcmStore,
@@ -984,13 +1075,34 @@ export function createKickWebhookHandler({
         seenStreams,
         logger,
       });
+      if (
+        result?.delivery &&
+        result.delivery.successCount === 0 &&
+        result.delivery.failureCount > (result.delivery.invalidTokens?.length || 0)
+      ) {
+        recordError("processing_failed");
+        logger?.error({ messageId }, "kick_webhook_delivery_failed");
+        return res.status(500).json({
+          code: "internal_error",
+          message: "Webhook processing failed",
+        });
+      }
     } catch (err) {
       recordError("processing_failed");
       logger?.error({ err: err.message, messageId }, "kick_webhook_processing_error");
+      return res.status(500).json({
+        code: "internal_error",
+        message: "Webhook processing failed",
+      });
+    }
+
+    seenWebhookMessages.set(messageId, now + 10 * 60 * 1000);
+    while (seenWebhookMessages.size > 10000) {
+      seenWebhookMessages.delete(seenWebhookMessages.keys().next().value);
     }
 
     return res.status(200).json({ ok: true });
-  };
+  });
   handler.getStatus = () => ({ ...status, configured: Boolean(messaging) });
   return handler;
 }
@@ -1084,9 +1196,44 @@ function inactiveTokenResponse() {
 export function startServer(env = process.env, deps = {}) {
   const config = loadConfig(env);
   const app = createApp(config, deps);
-  return app.listen(config.port, () => {
+  const server = app.listen(config.port, () => {
     config.logger.info({ port: config.port, trustProxy: config.trustProxy }, "Kick OAuth backend running");
   });
+
+  let shuttingDown = false;
+  const shutdown = (signal) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    config.logger.info({ signal }, "Kick OAuth backend shutting down");
+    try {
+      app.locals.liveStreamPoller?.close?.();
+    } catch {}
+    try {
+      app.locals.pusherRelay?.close?.();
+    } catch {}
+    try {
+      app.locals.crashReports?.close?.();
+    } catch {}
+    try {
+      app.locals.metrics?.close?.();
+    } catch {}
+    try {
+      app.locals.fcmStore?.close?.();
+    } catch {}
+    process.off("SIGTERM", onSigTerm);
+    process.off("SIGINT", onSigInt);
+    server.close();
+  };
+  const onSigTerm = () => shutdown("SIGTERM");
+  const onSigInt = () => shutdown("SIGINT");
+  process.on("SIGTERM", onSigTerm);
+  process.on("SIGINT", onSigInt);
+  server.on("close", () => {
+    process.off("SIGTERM", onSigTerm);
+    process.off("SIGINT", onSigInt);
+  });
+
+  return server;
 }
 
 // Approximates the country of a ping from its (already proxy-resolved)
@@ -1148,7 +1295,7 @@ function pingHandler(metrics, lookupCountry) {
 }
 
 function statsHandler(metrics, fcmStore, pusherRelay, liveStreamPoller, crashReports, kickWebhookHandler) {
-  return async (req, res) => {
+  return asyncHandler(async (req, res) => {
     const daysParam = req.query.days;
     const days = typeof daysParam === "string" && /^\d{1,3}$/.test(daysParam) ? Number(daysParam) : 60;
     const mem = process.memoryUsage();
@@ -1167,7 +1314,7 @@ function statsHandler(metrics, fcmStore, pusherRelay, liveStreamPoller, crashRep
       poller: liveStreamPoller?.getStatus?.() || { active: false },
       webhook: kickWebhookHandler?.getStatus?.() || null,
     } : null;
-    const payload = metrics.computeStats(new Date(), days, { fcm, system });
+    const payload = await metrics.computeStats(new Date(), days, { fcm, system });
     res.setHeader("Cache-Control", "no-store");
     try {
       payload.crashReports = crashReports.list();
@@ -1177,7 +1324,7 @@ function statsHandler(metrics, fcmStore, pusherRelay, liveStreamPoller, crashRep
       payload.crashReportsUnavailable = true;
     }
     return res.status(200).json(payload);
-  };
+  });
 }
 
 function dashboardHandler(metricsConfig) {

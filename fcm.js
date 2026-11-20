@@ -7,13 +7,39 @@ import { getMessaging } from "firebase-admin/messaging";
 
 const PUSHER_URL = "wss://ws-us2.pusher.com/app/32cbd69e4b950bf97679?protocol=7&client=js&version=8.5.0&flash=false";
 export const channelResolutionCache = new Map(); // slug/id -> { channelId, userId, slug, expiresAt }
+export const negativeResolutionCache = new Map(); // slug/id -> expiresAt
 const RESOLUTION_TTL_MS = 24 * 60 * 60 * 1000;
+const NEGATIVE_RESOLUTION_TTL_MS = 20 * 60 * 1000;
 
 function cacheChannel(key, channel) {
-  channelResolutionCache.set(key, channel);
+  const normalized = String(key || "").trim().toLowerCase();
+  if (!normalized) return;
+  negativeResolutionCache.delete(normalized);
+  channelResolutionCache.set(normalized, channel);
   while (channelResolutionCache.size > 5000) {
     channelResolutionCache.delete(channelResolutionCache.keys().next().value);
   }
+}
+
+export function cacheNegativeChannel(key, ttlMs = NEGATIVE_RESOLUTION_TTL_MS) {
+  const normalized = String(key || "").trim().toLowerCase();
+  if (!normalized) return;
+  negativeResolutionCache.delete(normalized);
+  negativeResolutionCache.set(normalized, Date.now() + ttlMs);
+  while (negativeResolutionCache.size > 10000) {
+    negativeResolutionCache.delete(negativeResolutionCache.keys().next().value);
+  }
+}
+
+export function isNegativelyCachedChannel(key, now = Date.now()) {
+  const normalized = String(key || "").trim().toLowerCase();
+  const expiresAt = negativeResolutionCache.get(normalized);
+  if (!expiresAt) return false;
+  if (expiresAt <= now) {
+    negativeResolutionCache.delete(normalized);
+    return false;
+  }
+  return true;
 }
 
 async function fetchJsonWithTimeout(fetchFn, url, options, timeoutMs) {
@@ -33,6 +59,7 @@ async function fetchJsonWithTimeout(fetchFn, url, options, timeoutMs) {
 
 export function clearChannelResolutionCache() {
   channelResolutionCache.clear();
+  negativeResolutionCache.clear();
   cachedAppToken = null;
   tokenFetchPromise = null;
   clearKickPublicKeyCache();
@@ -163,6 +190,13 @@ export async function resolveKickChannel(slugOrId, { fetchFn = globalThis.fetch,
   if (cached && cached.expiresAt > Date.now()) {
     return cached;
   }
+  if (isNegativelyCachedChannel(key)) {
+    return null;
+  }
+  if (!/^[a-z0-9_-]{1,100}$/i.test(key)) {
+    cacheNegativeChannel(key);
+    return null;
+  }
 
   try {
     const res = await fetchJsonWithTimeout(fetchFn, `https://kick.com/api/v2/channels/${encodeURIComponent(key)}`, {
@@ -171,9 +205,17 @@ export async function resolveKickChannel(slugOrId, { fetchFn = globalThis.fetch,
       },
     }, 5000);
 
-    if (!res.ok) return null;
+    if (!res.ok) {
+      if (res.status === 404 || res.status === 400 || res.status === 422) {
+        cacheNegativeChannel(key);
+      }
+      return null;
+    }
     const body = res.body;
-    if (!body || !body.id) return null;
+    if (!body || !body.id) {
+      cacheNegativeChannel(key);
+      return null;
+    }
 
     const result = {
       channelId: String(body.id),
@@ -206,7 +248,7 @@ export function loadFcmConfig(env = process.env) {
   };
 }
 
-export function createFcmStore({ dataFile, logger, maxTokens = 100000 } = {}) {
+export function createFcmStore({ dataFile, logger, maxTokens = 100000, maxChannelsPerToken = 500 } = {}) {
   const tokens = new Map(); // token -> { kickUserId, channelIds: Set, updatedAt, lastActiveAt }
   const channelIndex = new Map(); // channelId -> Set<token>
   let saveTimer = null;
@@ -230,9 +272,13 @@ export function createFcmStore({ dataFile, logger, maxTokens = 100000 } = {}) {
       if (Array.isArray(parsed)) {
         for (const item of parsed) {
           if (item && typeof item.token === "string") {
-            const channelSet = new Set(Array.isArray(item.channelIds) ? item.channelIds.map(String) : []);
+            const normalizedIds = Array.isArray(item.channelIds)
+              ? Array.from(new Set(item.channelIds.map((id) => String(id).trim().toLowerCase()).filter(Boolean)))
+                  .slice(0, maxChannelsPerToken)
+              : [];
+            const channelSet = new Set(normalizedIds);
             tokens.set(item.token, {
-              kickUserId: item.kickUserId ? String(item.kickUserId) : null,
+              kickUserId: item.kickUserId ? String(item.kickUserId).trim().slice(0, 64) : null,
               channelIds: channelSet,
               updatedAt: item.updatedAt || Date.now(),
               lastActiveAt: item.lastActiveAt || Date.now(),
@@ -278,7 +324,7 @@ export function createFcmStore({ dataFile, logger, maxTokens = 100000 } = {}) {
         });
       }
       const tmpFile = `${dataFile}.${Date.now()}.tmp`;
-      writeFileSync(tmpFile, JSON.stringify(data), "utf8");
+      writeFileSync(tmpFile, JSON.stringify(data), { encoding: "utf8", mode: 0o600 });
       renameSync(tmpFile, dataFile);
     } catch (err) {
       logger?.error({ err: err.message }, "fcm_store_persist_failed");
@@ -290,7 +336,10 @@ export function createFcmStore({ dataFile, logger, maxTokens = 100000 } = {}) {
   return {
     subscribe({ token, kickUserId, channelIds }) {
       const normalizedToken = String(token).trim();
-      const normalizedChannels = new Set((channelIds || []).map((id) => String(id).trim()).filter(Boolean));
+      const normalizedChannels = new Set(
+        Array.from(new Set((channelIds || []).map((id) => String(id).trim().toLowerCase()).filter(Boolean)))
+          .slice(0, maxChannelsPerToken)
+      );
       const now = Date.now();
 
       const existing = tokens.get(normalizedToken);
@@ -314,7 +363,7 @@ export function createFcmStore({ dataFile, logger, maxTokens = 100000 } = {}) {
 
       tokens.set(normalizedToken, {
         revision: ++nextRevision,
-        kickUserId: kickUserId ? String(kickUserId).trim() : null,
+        kickUserId: kickUserId ? String(kickUserId).trim().slice(0, 64) : null,
         channelIds: normalizedChannels,
         updatedAt: now,
         lastActiveAt: now,
@@ -342,13 +391,18 @@ export function createFcmStore({ dataFile, logger, maxTokens = 100000 } = {}) {
     },
 
     getTokensForChannel(channelId) {
-      const normalized = String(channelId).trim();
+      const normalized = String(channelId).trim().toLowerCase();
       const set = channelIndex.get(normalized);
       return set ? Array.from(set) : [];
     },
 
     getActiveChannels() {
       return Array.from(channelIndex.keys());
+    },
+
+    hasChannel(channelId) {
+      const normalized = String(channelId).trim().toLowerCase();
+      return Boolean(normalized && channelIndex.has(normalized));
     },
 
     isCurrentSubscription(token, revision) {
@@ -363,7 +417,8 @@ export function createFcmStore({ dataFile, logger, maxTokens = 100000 } = {}) {
 
       let addedCount = 0;
       for (const alias of aliases) {
-        const normalized = String(alias).trim();
+        if (existing.channelIds.size >= maxChannelsPerToken) break;
+        const normalized = String(alias).trim().toLowerCase();
         if (!normalized) continue;
         if (!existing.channelIds.has(normalized)) {
           existing.channelIds.add(normalized);
@@ -378,6 +433,32 @@ export function createFcmStore({ dataFile, logger, maxTokens = 100000 } = {}) {
         scheduleSave();
       }
       return addedCount;
+    },
+
+    removeChannelsFromToken(token, channelIds, revision) {
+      const normalizedToken = String(token).trim();
+      const existing = tokens.get(normalizedToken);
+      if (!existing || !Array.isArray(channelIds) || channelIds.length === 0) return 0;
+      if (revision !== undefined && existing.revision !== revision) return 0;
+
+      let removedCount = 0;
+      for (const ch of channelIds) {
+        const normalized = String(ch).trim().toLowerCase();
+        if (!normalized || !existing.channelIds.has(normalized)) continue;
+        existing.channelIds.delete(normalized);
+        const set = channelIndex.get(normalized);
+        if (set) {
+          set.delete(normalizedToken);
+          if (set.size === 0) channelIndex.delete(normalized);
+        }
+        removedCount++;
+      }
+
+      if (removedCount > 0) {
+        existing.updatedAt = Date.now();
+        scheduleSave();
+      }
+      return removedCount;
     },
 
     pruneInvalidTokens(invalidTokens) {
@@ -454,6 +535,23 @@ export function createFcmStore({ dataFile, logger, maxTokens = 100000 } = {}) {
         saveTimer = null;
       }
       persist();
+    },
+
+    close() {
+      const syncState = subscriptionSyncStates.get(this);
+      if (syncState?.timer) {
+        clearTimeout(syncState.timer);
+        syncState.timer = null;
+      }
+      if (saveTimer) {
+        clearTimeout(saveTimer);
+        saveTimer = null;
+      }
+      try {
+        persist();
+      } catch {
+        // ignore
+      }
     },
   };
 }
@@ -578,27 +676,39 @@ function sameStreamStartTime(left, right) {
   return Boolean(left && right && streamStartKey(left) === streamStartKey(right));
 }
 
+const LIVE_FALLBACK_START_TIME = "__live__";
+
 function hasSeenStream(seenStreams, keys, startTime) {
-  if (!seenStreams || !startTime) return false;
+  if (!seenStreams) return false;
+  if (!startTime) {
+    return keys.some((key) => key && seenStreams.has(key));
+  }
   const history = recentStreamSessions.get(seenStreams);
   const startKey = streamStartKey(startTime);
-  return keys.some(key => key && (sameStreamStartTime(seenStreams.get(key), startTime) ||
-    history?.has(`${key}\n${startKey}`)));
+  return keys.some((key) => {
+    if (!key) return false;
+    const current = seenStreams.get(key);
+    if (current === LIVE_FALLBACK_START_TIME) return true;
+    return sameStreamStartTime(current, startTime) || Boolean(history?.has(`${key}\n${startKey}`));
+  });
 }
 
 function markStreamSeen(seenStreams, keys, startTime) {
-  if (!seenStreams || !startTime) return;
+  if (!seenStreams) return;
+  const effectiveStartTime = startTime || LIVE_FALLBACK_START_TIME;
   let history = recentStreamSessions.get(seenStreams);
   if (!history) {
     history = new Map();
     recentStreamSessions.set(seenStreams, history);
   }
-  const startKey = streamStartKey(startTime);
+  const startKey = startTime ? streamStartKey(startTime) : null;
   for (const key of keys) {
     if (key) {
-      seenStreams.set(key, startTime);
+      seenStreams.set(key, effectiveStartTime);
       // Keep session reservations when a delayed offline observation clears live state.
-      history.set(`${key}\n${startKey}`, true);
+      if (startKey) {
+        history.set(`${key}\n${startKey}`, true);
+      }
     }
   }
   while (seenStreams.size > 5000) seenStreams.delete(seenStreams.keys().next().value);
@@ -606,13 +716,19 @@ function markStreamSeen(seenStreams, keys, startTime) {
 }
 
 function clearFailedStream(seenStreams, keys, startTime) {
+  const effectiveStartTime = startTime || LIVE_FALLBACK_START_TIME;
   for (const key of keys) {
-    if (key && sameStreamStartTime(seenStreams?.get(key), startTime)) seenStreams.delete(key);
+    if (
+      key &&
+      (seenStreams?.get(key) === effectiveStartTime || sameStreamStartTime(seenStreams?.get(key), startTime))
+    ) {
+      seenStreams.delete(key);
+    }
     if (key && startTime) recentStreamSessions.get(seenStreams)?.delete(`${key}\n${streamStartKey(startTime)}`);
   }
 }
 
-export function createPusherRelay({ fcmStore, messaging, logger, seenStreams = new Map() }) {
+export function createPusherRelay({ fcmStore, messaging, logger, seenStreams = new Map(), wsUrl = PUSHER_URL }) {
   let ws = null;
   let isClosed = false;
   let reconnectTimeout = null;
@@ -657,7 +773,7 @@ export function createPusherRelay({ fcmStore, messaging, logger, seenStreams = n
   function connect() {
     if (isClosed) return;
     try {
-      ws = new WebSocket(PUSHER_URL);
+      ws = new WebSocket(wsUrl);
 
       ws.on("open", () => {
         logger?.info("pusher_relay_connected");
@@ -695,7 +811,6 @@ export function createPusherRelay({ fcmStore, messaging, logger, seenStreams = n
             return;
           }
           if (
-            msg.event === "kick_fcm_test_event" ||
             msg.event === "NotifyFollowersStreamHasStarted" ||
             msg.event === "App\\Events\\NotifyFollowersStreamHasStarted"
           ) {
@@ -853,6 +968,9 @@ export function createLiveStreamPoller({
   config,
   fetchFn = globalThis.fetch,
   pollIntervalMs = 60_000,
+  maxCycleDurationMs = 45_000,
+  maxSlugPollsPerCycle = 25,
+  slugPollConcurrency = 5,
   logger,
   seenStreams = new Map(),
 } = {}) {
@@ -867,6 +985,8 @@ export function createLiveStreamPoller({
     if (!fcmStore || !messaging) return;
 
     isPolling = true;
+    const cycleStartMs = Date.now();
+    const isBudgetExhausted = () => Date.now() - cycleStartMs >= maxCycleDurationMs;
     status.lastAttemptAt = new Date().toISOString();
     let cycleError = null;
     let completed = false;
@@ -889,14 +1009,17 @@ export function createLiveStreamPoller({
       // Collect user IDs and slugs to poll
       const userIds = new Set();
       const slugs = new Set();
+      const now = Date.now();
 
-      for (const ch of allActive) {
+      for (const rawCh of allActive) {
+        const ch = String(rawCh).trim().toLowerCase();
+        if (!ch) continue;
         const cached = channelResolutionCache.get(ch);
-        if (cached && cached.userId) {
+        if (cached && cached.expiresAt > now && cached.userId) {
           userIds.add(cached.userId);
         } else if (/^\d+$/.test(ch)) {
           userIds.add(ch);
-        } else {
+        } else if (!isNegativelyCachedChannel(ch, now)) {
           slugs.add(ch);
         }
       }
@@ -907,7 +1030,7 @@ export function createLiveStreamPoller({
       const userIdsArr = Array.from(userIds);
       const BATCH_SIZE = 25;
       for (let i = 0; i < userIdsArr.length; i += BATCH_SIZE) {
-        if (isClosed) break;
+        if (isClosed || isBudgetExhausted()) break;
         const chunk = userIdsArr.slice(i, i + BATCH_SIZE);
         const query = chunk.map((id) => `broadcaster_user_id=${encodeURIComponent(id)}`).join("&");
         try {
@@ -934,37 +1057,49 @@ export function createLiveStreamPoller({
         }
       }
 
-      // 2. Poll any remaining non-numeric slugs not yet resolved
+      // 2. Poll any remaining non-numeric slugs not yet resolved (bounded concurrency & count)
       const foundSlugsSet = new Set(
         foundChannels
           .map((c) => (c.slug ? String(c.slug).toLowerCase() : null))
           .filter(Boolean)
       );
-      const remainingSlugs = Array.from(slugs).filter((s) => !foundSlugsSet.has(s.toLowerCase()));
+      const remainingSlugs = Array.from(slugs)
+        .filter((s) => !foundSlugsSet.has(s.toLowerCase()) && !isNegativelyCachedChannel(s))
+        .slice(0, maxSlugPollsPerCycle);
+      const slugBatchSize = Math.max(1, slugPollConcurrency);
 
-      for (const slug of remainingSlugs) {
-        if (isClosed) break;
-        try {
-          const res = await fetchJsonWithTimeout(fetchFn, `https://api.kick.com/public/v1/channels?slug=${encodeURIComponent(slug)}`, {
-            headers: {
-              "Authorization": `Bearer ${token}`,
-              "Accept": "application/json",
-            },
-          }, 8_000);
+      for (let i = 0; i < remainingSlugs.length; i += slugBatchSize) {
+        if (isClosed || isBudgetExhausted()) break;
+        const batch = remainingSlugs.slice(i, i + slugBatchSize);
+        await Promise.all(
+          batch.map(async (slug) => {
+            if (isClosed) return;
+            try {
+              const res = await fetchJsonWithTimeout(fetchFn, `https://api.kick.com/public/v1/channels?slug=${encodeURIComponent(slug)}`, {
+                headers: {
+                  "Authorization": `Bearer ${token}`,
+                  "Accept": "application/json",
+                },
+              }, 8_000);
 
-          if (res.ok) {
-            const body = res.body;
-            const data = Array.isArray(body?.data) ? body.data : [];
-            for (const ch of data) {
-              foundChannels.push(ch);
+              if (res.ok) {
+                const body = res.body;
+                const data = Array.isArray(body?.data) ? body.data : [];
+                for (const ch of data) {
+                  foundChannels.push(ch);
+                }
+              } else {
+                if (res.status === 404) {
+                  cacheNegativeChannel(slug);
+                }
+                cycleError = `upstream_http_${res.status}`;
+              }
+            } catch (err) {
+              cycleError = "upstream_request_failed";
+              logger?.debug({ err: err?.message, slug }, "pusher_poll_slug_query_failed");
             }
-          } else {
-            cycleError = `upstream_http_${res.status}`;
-          }
-        } catch (err) {
-          cycleError = "upstream_request_failed";
-          logger?.debug({ err: err?.message, slug }, "pusher_poll_slug_query_failed");
-        }
+          })
+        );
       }
 
       // 3. Process channels and detect stream start transitions
@@ -1017,15 +1152,22 @@ export function createLiveStreamPoller({
                 { channelKey, slug, userId: uId, tokensCount: tokens.length, startTime },
                 "live_poller_new_stream_detected"
               );
+              const streamTitle = ch.stream_title || ch.title || ch.stream?.title || "";
+              const profilePicture =
+                ch.profile_picture ||
+                ch.broadcaster?.profile_picture ||
+                ch.user?.profile_picture ||
+                ch.user?.profile_pic ||
+                "";
               const delivery = await sendLivePushNotification({
                 messaging,
                 tokens,
                 channelId: resolved.channelId || uId,
                 userId: uId,
                 channelSlug: slug || uId,
-                title: ch.stream_title || `${slug || channelKey} is live!`,
-                description: ch.channel_description || "",
-                profilePicture: ch.banner_picture || "",
+                title: streamTitle || `${slug || channelKey} is live!`,
+                description: "",
+                profilePicture,
                 startTime,
                 logger,
                 fcmStore,
@@ -1117,12 +1259,23 @@ export async function getKickPublicKey({
   kickApiBaseUrl = "https://api.kick.com",
   logger,
   ttlMs = 24 * 60 * 60 * 1000,
+  forceRefresh = false,
+  minRefreshIntervalMs = 5 * 60 * 1000,
+  now = Date.now(),
 } = {}) {
-  if (cachedKickPublicKey && cachedKickPublicKey.expiresAt > Date.now()) {
-    return cachedKickPublicKey.key;
+  if (cachedKickPublicKey) {
+    if (!forceRefresh && cachedKickPublicKey.expiresAt > now) {
+      return cachedKickPublicKey.key;
+    }
+    if (forceRefresh && now - cachedKickPublicKey.lastRefreshAt < minRefreshIntervalMs) {
+      return cachedKickPublicKey.key;
+    }
   }
   if (kickPublicKeyPromise) {
     return kickPublicKeyPromise;
+  }
+  if (cachedKickPublicKey && forceRefresh) {
+    cachedKickPublicKey.lastRefreshAt = now;
   }
   kickPublicKeyPromise = (async () => {
     try {
@@ -1131,23 +1284,25 @@ export async function getKickPublicKey({
       }, 5000);
       if (!res.ok) {
         logger?.warn({ status: res.status }, "kick_public_key_fetch_failed");
-        return null;
+        return cachedKickPublicKey?.expiresAt > now ? cachedKickPublicKey.key : null;
       }
       const data = res.body?.data;
       const key = data?.public_key;
       if (typeof key === "string" && key.includes("PUBLIC KEY")) {
         cachedKickPublicKey = {
           key,
-          expiresAt: Date.now() + ttlMs,
+          fetchedAt: now,
+          lastRefreshAt: now,
+          expiresAt: now + ttlMs,
         };
         logger?.info("kick_public_key_cached");
         return key;
       }
       logger?.warn({ body: res.body }, "kick_public_key_invalid_format");
-      return null;
+      return cachedKickPublicKey?.expiresAt > now ? cachedKickPublicKey.key : null;
     } catch (err) {
       logger?.warn({ err: err.message }, "kick_public_key_request_error");
-      return null;
+      return cachedKickPublicKey?.expiresAt > now ? cachedKickPublicKey.key : null;
     } finally {
       kickPublicKeyPromise = null;
     }
@@ -1222,7 +1377,8 @@ export async function handleWebhookLiveEvent({
     .replace(/^\/+/, "")
     .toLowerCase();
   const isLive = Boolean(data.is_live);
-  const startTime = String(data.started_at || data.start_time || new Date().toISOString());
+  const rawStartTime = (data.started_at || data.start_time) ? String(data.started_at || data.start_time) : null;
+  const startTime = rawStartTime || new Date().toISOString();
   const title = String(data.title || (slug ? `${slug} is live!` : "Stream is live!"));
   const profilePicture = String(broadcaster.profile_picture || data.profile_picture || "");
 
@@ -1240,13 +1396,16 @@ export async function handleWebhookLiveEvent({
   // Stream is live: check deduplication
   const streamKey = userId || slug;
   const candidateKeys = [userId, slug, channelId].filter(Boolean);
-  if (hasSeenStream(seenStreams, candidateKeys, startTime)) {
+  if (hasSeenStream(seenStreams, candidateKeys, rawStartTime)) {
+    if (rawStartTime && candidateKeys.some((k) => seenStreams?.get(k) === LIVE_FALLBACK_START_TIME)) {
+      markStreamSeen(seenStreams, candidateKeys, rawStartTime);
+    }
     logger?.info({ streamKey, startTime }, "kick_webhook_stream_already_seen");
     return { ok: true, duplicate: true };
   }
 
   // Mark as seen immediately across all identifiers
-  markStreamSeen(seenStreams, candidateKeys, startTime);
+  markStreamSeen(seenStreams, candidateKeys, rawStartTime);
 
   // Update resolution cache
   const resolved = {
@@ -1292,7 +1451,7 @@ export async function handleWebhookLiveEvent({
     source: "webhook",
   });
   if (delivery.successCount === 0 && delivery.failureCount > 0) {
-    clearFailedStream(seenStreams, candidateKeys, startTime);
+    clearFailedStream(seenStreams, candidateKeys, rawStartTime);
   }
 
   return {
@@ -1332,18 +1491,20 @@ export async function syncKickEventSubscriptions({
   const userIds = new Set();
   const unresolvedSlugs = [];
 
-  for (const ch of activeChannels) {
+  for (const rawCh of activeChannels) {
+    const ch = String(rawCh).trim().toLowerCase();
+    if (!ch) continue;
     const cached = channelResolutionCache.get(ch);
-    if (cached && cached.userId) {
+    if (cached && cached.expiresAt > Date.now() && cached.userId) {
       userIds.add(cached.userId);
     } else if (/^\d+$/.test(ch)) {
       userIds.add(ch);
-    } else {
+    } else if (!isNegativelyCachedChannel(ch)) {
       unresolvedSlugs.push(ch);
     }
   }
 
-  for (const slug of unresolvedSlugs) {
+  for (const slug of unresolvedSlugs.slice(0, 25)) {
     const res = await resolveKickChannel(slug, { fetchFn, logger });
     if (res && res.userId) {
       userIds.add(res.userId);

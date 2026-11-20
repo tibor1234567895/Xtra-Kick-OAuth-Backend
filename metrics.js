@@ -221,7 +221,7 @@ export function createMetricsStore(options = {}) {
     if (!dataPath) return;
     ensureDir(dataPath);
     const tmp = `${dataPath}.tmp`;
-    writeFileSync(tmp, JSON.stringify(state));
+    writeFileSync(tmp, JSON.stringify(state), { encoding: "utf8", mode: 0o600 });
     renameSync(tmp, dataPath);
     pendingFlush = null;
   }
@@ -296,18 +296,24 @@ export function createMetricsStore(options = {}) {
   }
 
   function bump(map, name, field, amount = 1) {
-    if (!map[name] || typeof map[name] !== "object") map[name] = {};
-    map[name][field] = (map[name][field] || 0) + amount;
+    if (!Object.hasOwn(map, name) || typeof map[name] !== "object" || map[name] === null) {
+      map[name] = Object.create(null);
+    }
+    const current = Object.hasOwn(map[name], field) ? Number(map[name][field]) || 0 : 0;
+    map[name][field] = current + amount;
   }
 
   function bumpPlain(map, name, amount = 1) {
-    map[name] = (Number(map[name]) || 0) + amount;
+    const current = Object.hasOwn(map, name) ? Number(map[name]) || 0 : 0;
+    map[name] = current + amount;
   }
 
   function countersEndpoint(endpoint, statusCode, detailCode) {
     const { bucket } = counterBucket(new Date());
     const entry = bucket.endpoints;
-    if (!entry[endpoint] || typeof entry[endpoint] !== "object") entry[endpoint] = {};
+    if (!Object.hasOwn(entry, endpoint) || typeof entry[endpoint] !== "object" || entry[endpoint] === null) {
+      entry[endpoint] = Object.create(null);
+    }
     const status = Number(statusCode) || 0;
     if (status >= 200 && status < 400) bump(entry, endpoint, "ok");
     else if (status === 429) bump(entry, endpoint, "limited");
@@ -678,10 +684,10 @@ export function createMetricsStore(options = {}) {
     let dauToday = 0;
     let newToday = 0;
     let sessionsToday = 0;
-    const versions = {};
-    const osCounts = {};
-    const countryCounts = {};
-    const geoCountryCounts = {};
+    const versions = Object.create(null);
+    const osCounts = Object.create(null);
+    const countryCounts = Object.create(null);
+    const geoCountryCounts = Object.create(null);
     const playerEngines = { ivs: 0, exo: 0 };
     const watchTime = { "0": 0, "1": 0, "2": 0, "3": 0 };
     for (const entry of Object.values(devicesBucket)) {
@@ -699,10 +705,10 @@ export function createMetricsStore(options = {}) {
       countryCounts[ccKey] = (countryCounts[ccKey] || 0) + 1;
       const gcKey = entry.gc || "unknown";
       geoCountryCounts[gcKey] = (geoCountryCounts[gcKey] || 0) + 1;
-      if (entry.pe && playerEngines[entry.pe] !== undefined) {
+      if (entry.pe && Object.hasOwn(playerEngines, entry.pe)) {
         playerEngines[entry.pe]++;
       }
-      if (entry.wt && watchTime[entry.wt] !== undefined) {
+      if (entry.wt && Object.hasOwn(watchTime, entry.wt)) {
         watchTime[entry.wt]++;
       }
     }

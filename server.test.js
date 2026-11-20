@@ -8,7 +8,8 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { setImmediate as settle } from "node:timers/promises";
 import pino from "pino";
-import { backfillStoredSubscriptions, computeHmacSignature, createApp, createCountryLookup, loadConfig, redactPaths } from "./server.js";
+import { WebSocketServer } from "ws";
+import { backfillStoredSubscriptions, computeHmacSignature, createApp, createCountryLookup, loadConfig, redactPaths, startServer } from "./server.js";
 import { createMetricsStore } from "./metrics.js";
 import { CRASH_RETENTION_MS, MAX_CRASH_GROUPS, MAX_CRASH_EVENTS, crashReportSchema, createCrashReportStore } from "./crash-reports.js";
 import {
@@ -20,6 +21,7 @@ import {
   createPusherRelay,
   getKickPublicKey,
   handleWebhookLiveEvent,
+  negativeResolutionCache,
   scheduleKickSubscriptionSync,
   sendLivePushNotification,
   syncKickEventSubscriptions,
@@ -1678,6 +1680,7 @@ test("createLiveStreamPoller detects stream start, sends notification, and dedup
               slug: "dougthegiant",
               stream_title: "Doug Stream Live",
               channel_description: "Giant gaming",
+              profile_picture: "https://example.com/avatar.jpg",
               banner_picture: "https://example.com/banner.jpg",
               stream: {
                 is_live: mockIsLive,
@@ -1726,6 +1729,8 @@ test("createLiveStreamPoller detects stream start, sends notification, and dedup
     assert.equal(sentPayload.data.channel_id, "129698");
     assert.equal(sentPayload.data.user_id, "131146");
     assert.equal(sentPayload.data.title, "Doug Stream Live");
+    assert.equal(sentPayload.data.description, "");
+    assert.equal(sentPayload.data.profile_picture, "https://example.com/avatar.jpg");
   } finally {
     poller.close();
   }
@@ -2939,11 +2944,44 @@ test("crash schema rejects unknown fields, unsafe frames, and unbounded traces",
     makeCrashReport({ pid: "user-id" }),
     makeCrashReport({ abi: "device-identifier" }),
     makeCrashReport({ liveEnginePreference: "https://private.example" }),
-    makeCrashReport({ exceptions: [{ type: "Error", message: "secret", frames: [] }] }),
+    makeCrashReport({ exceptions: [{ type: "Error", extra: "secret", frames: [] }] }),
+    makeCrashReport({ exceptions: [{ type: "Error", message: "", frames: [] }] }),
+    makeCrashReport({ exceptions: [{ type: "Error", message: "line1\nline2", frames: [] }] }),
+    makeCrashReport({ exceptions: [{ type: "Error", message: "a".repeat(201), frames: [] }] }),
     makeCrashReport({ exceptions: [{ type: "<script>alert(1)</script>", frames: [] }] }),
     makeCrashReport({ exceptions: [{ type: "Error", frames: Array(33).fill(makeCrashReport().exceptions[0].frames[0]) }] }),
     makeCrashReport({ exceptions: Array(9).fill({ type: "Error", frames: [] }) }),
   ]) assert.equal(crashReportSchema.safeParse(report).success, false);
+});
+
+test("crash schema accepts optional exception message and groups across differing messages", () => {
+  const base = makeCrashReport();
+  const first = makeCrashReport({
+    id: "22345678-1234-4234-8234-123456789abc",
+    exceptions: [{ ...base.exceptions[0], message: "Failed resolution of: Landroid/net/http/HttpEngine;" }],
+  });
+  const second = makeCrashReport({
+    id: "32345678-1234-4234-8234-123456789abc",
+    exceptions: [{ ...base.exceptions[0], message: "a".repeat(200) }],
+  });
+  assert.equal(crashReportSchema.safeParse(first).success, true);
+  assert.equal(crashReportSchema.safeParse(second).success, true);
+
+  const store = createCrashReportStore();
+  try {
+    const t0 = Date.now();
+    store.record(base, t0);
+    const sigWithoutMsg = store.list(t0)[0].signature;
+    store.record(first, t0 + 1);
+    store.record(second, t0 + 2);
+    const listed = store.list(t0 + 2);
+    assert.equal(listed.length, 1);
+    assert.equal(listed[0].signature, sigWithoutMsg);
+    assert.equal(listed[0].count, 3);
+    assert.equal(listed[0].exceptions[0].message, "a".repeat(200));
+  } finally {
+    store.close();
+  }
 });
 
 test("crash store persists retries, groups occurrences, and expires data on disk", () => {
@@ -3178,6 +3216,7 @@ test("dashboard crash details render untrusted strings only as text", () => {
   const render = runInNewContext(html.slice(start, end) + ";showCrashReports", { document });
   const report = makeCrashReport();
   report.exceptions[0].type = "<script>throw new Error('injection')</script>";
+  report.exceptions[0].message = "<img src=x onerror=alert(1)>";
   const receivedAt = Date.UTC(2026, 10, 15, 14, 49, 18);
   render([{ ...report, count: 1, lastSeen: receivedAt }]);
   const details = container.children[1];
@@ -3185,6 +3224,7 @@ test("dashboard crash details render untrusted strings only as text", () => {
   const received = details.children[0].children[0];
   assert.equal(received.textContent, `Last received: ${new Date(receivedAt).toLocaleString(undefined, { timeZoneName: "short" })}`);
   assert.match(received.style.cssText, /display:block/);
+  assert.match(details.children[2].textContent, /: <img src=x onerror=alert\(1\)>/);
   assert.match(details.children[2].textContent, /Example\.kt:42/);
   render([]);
   assert.match(container.children.at(-1).textContent, /No crash details received/);
@@ -3307,6 +3347,737 @@ test("crash endpoint retains client retry eligibility when storage fails and rat
   store.close();
   app.locals.crashReports.close();
 });
+
+test("POST /v1/kick/oauth/refresh happy path returns tokens and records account metrics", async () => {
+  let upstreamBody;
+  const { app, store } = appWithMetrics(async (url, options) => {
+    if (String(url).includes("/oauth/token") && !String(url).includes("introspect")) {
+      upstreamBody = options.body;
+      return jsonResponse(200, {
+        access_token: "fresh-access-token",
+        refresh_token: "fresh-refresh-token",
+        expires_in: 7200,
+        token_type: "Bearer",
+        scope: "user:read",
+      });
+    }
+    return jsonResponse(200, { data: { active: true, user_id: "777", username: "refreshed_user" } });
+  });
+
+  try {
+    await withServer(app, async (baseUrl) => {
+      const invalid = await httpRequest(baseUrl, "POST", "/v1/kick/oauth/refresh", { refreshToken: "" });
+      assert.equal(invalid.status, 400);
+      assert.equal(invalid.body.code, "invalid_request");
+
+      const res = await httpRequest(baseUrl, "POST", "/v1/kick/oauth/refresh", {
+        refreshToken: "old-refresh-token",
+      });
+      assert.equal(res.status, 200);
+      assert.equal(res.body.access_token, "fresh-access-token");
+      assert.equal(res.body.refresh_token, "fresh-refresh-token");
+      assert.equal(res.body.expires_in, 7200);
+      assert.equal(upstreamBody.get("grant_type"), "refresh_token");
+      assert.equal(upstreamBody.get("refresh_token"), "old-refresh-token");
+      assert.equal(upstreamBody.get("client_id"), "client-id");
+      assert.equal(upstreamBody.get("client_secret"), "client-secret");
+      await waitFor(() => store.computeStats().accountsMau === 1);
+    });
+    const stats = store.computeStats();
+    assert.equal(stats.accountsMau, 1);
+    assert.equal(stats.counters.today.oauth.refresh_ok, 1);
+    assert.ok(stats.upstreamLatency.count >= 1);
+  } finally {
+    store.close();
+    app.locals.crashReports.close();
+  }
+});
+
+test("POST /v1/kick/oauth/revoke validates input, forwards tokenTypeHint, and handles errors", async () => {
+  let upstreamBody;
+  let shouldFail = false;
+  const app = appWithFetch(async (_url, options) => {
+    upstreamBody = options.body;
+    if (shouldFail) {
+      return jsonResponse(503, { error: "server_error" });
+    }
+    return jsonResponse(200, {});
+  });
+
+  await withServer(app, async (baseUrl) => {
+    const invalid = await httpRequest(baseUrl, "POST", "/v1/kick/oauth/revoke", { token: "" });
+    assert.equal(invalid.status, 400);
+    assert.equal(invalid.body.code, "invalid_request");
+
+    const invalidHint = await httpRequest(baseUrl, "POST", "/v1/kick/oauth/revoke", {
+      token: "tok-1",
+      tokenTypeHint: "invalid_hint",
+    });
+    assert.equal(invalidHint.status, 400);
+
+    const ok = await httpRequest(baseUrl, "POST", "/v1/kick/oauth/revoke", {
+      token: "tok-to-revoke",
+      tokenTypeHint: "refresh_token",
+    });
+    assert.equal(ok.status, 200);
+    assert.deepEqual(ok.body, { revoked: true });
+    assert.equal(upstreamBody.get("token"), "tok-to-revoke");
+    assert.equal(upstreamBody.get("token_type_hint"), "refresh_token");
+    assert.equal(upstreamBody.get("client_id"), "client-id");
+    assert.equal(upstreamBody.get("client_secret"), "client-secret");
+
+    shouldFail = true;
+    const failed = await httpRequest(baseUrl, "POST", "/v1/kick/oauth/revoke", {
+      token: "tok-to-revoke",
+    });
+    assert.equal(failed.status, 502);
+    assert.equal(failed.body.code, "upstream_unavailable");
+  });
+});
+
+test("GET /v1/fcm/stats enforces admin token and returns store stats", async () => {
+  const fcmStore = createFcmStore({ dataFile: null });
+  fcmStore.subscribe({ token: "t".repeat(32), channelIds: ["101", "202"] });
+  const cfg = loadConfig(metricsEnv());
+  const metrics = createMetricsStore({ salt: cfg.metrics.salt, accountSalt: cfg.metrics.accountSalt, dataPath: null });
+  const crashReports = createCrashReportStore();
+  const app = createApp(cfg, { fcmStore, metrics, crashReports, messaging: null, pusherRelay: null });
+
+  try {
+    await withServer(app, async (baseUrl) => {
+      const unauth = await httpRequest(baseUrl, "GET", "/v1/fcm/stats");
+      assert.equal(unauth.status, 401);
+
+      const wrong = await httpRequest(baseUrl, "GET", "/v1/fcm/stats", undefined, {
+        headers: { "X-Admin-Token": "wrong" },
+      });
+      assert.equal(wrong.status, 401);
+
+      const ok = await httpRequest(baseUrl, "GET", "/v1/fcm/stats", undefined, {
+        headers: { Authorization: "Bearer admin-secret" },
+      });
+      assert.equal(ok.status, 200);
+      assert.equal(ok.body.ok, true);
+      assert.equal(ok.body.stats.totalTokens, 1);
+      assert.equal(ok.body.stats.activeChannels, 2);
+    });
+  } finally {
+    metrics.close();
+    crashReports.close();
+    fcmStore.close();
+  }
+});
+
+test("POST /v1/fcm/unsubscribe handles unknown tokens, validation errors, and conditional relay sync", async () => {
+  const fcmStore = createFcmStore({ dataFile: null });
+  let syncCalls = 0;
+  const mockPusherRelay = {
+    syncSubscriptions() {
+      syncCalls++;
+    },
+  };
+  const app = createApp(config(), { fcmStore, messaging: null, pusherRelay: mockPusherRelay });
+  const token = "fcm_unsub_edge_token_1234567890";
+  fcmStore.subscribe({ token, channelIds: ["100"] });
+
+  await withServer(app, async (baseUrl) => {
+    const bad = await httpRequest(baseUrl, "POST", "/v1/fcm/unsubscribe", { token: "short" });
+    assert.equal(bad.status, 400);
+    assert.equal(bad.body.code, "invalid_request");
+
+    const unknown = await httpRequest(baseUrl, "POST", "/v1/fcm/unsubscribe", {
+      token: "unknown_token_123456789012345",
+    });
+    assert.equal(unknown.status, 200);
+    assert.deepEqual(unknown.body, { ok: true, unsubscribed: false });
+    assert.equal(syncCalls, 0, "Unsubscribing a non-existent token must not sync Pusher relay");
+
+    const removed = await httpRequest(baseUrl, "POST", "/v1/fcm/unsubscribe", { token });
+    assert.equal(removed.status, 200);
+    assert.deepEqual(removed.body, { ok: true, unsubscribed: true });
+    assert.equal(syncCalls, 1);
+
+    const repeat = await httpRequest(baseUrl, "POST", "/v1/fcm/unsubscribe", { token });
+    assert.equal(repeat.status, 200);
+    assert.deepEqual(repeat.body, { ok: true, unsubscribed: false });
+    assert.equal(syncCalls, 1);
+  });
+});
+
+test("createPusherRelay lifecycle connects, syncs subscriptions, handles ping/pong, and ignores kick_fcm_test_event", async () => {
+  const fcmStore = createFcmStore({ dataFile: null });
+  const token = "pusher_lifecycle_token_123456789";
+  fcmStore.subscribe({ token, channelIds: ["555"] });
+
+  const serverReceived = [];
+  let serverSocket = null;
+  const wss = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+  await new Promise((resolve) => wss.once("listening", resolve));
+  const { port } = wss.address();
+
+  wss.on("connection", (ws) => {
+    serverSocket = ws;
+    ws.on("message", (raw) => {
+      serverReceived.push(JSON.parse(raw.toString()));
+    });
+  });
+
+  let dispatchedCount = 0;
+  const mockMessaging = {
+    async sendEachForMulticast(payload) {
+      dispatchedCount++;
+      return {
+        successCount: payload.tokens.length,
+        failureCount: 0,
+        responses: payload.tokens.map(() => ({ success: true })),
+      };
+    },
+  };
+
+  const relay = createPusherRelay({
+    fcmStore,
+    messaging: mockMessaging,
+    logger: null,
+    wsUrl: `ws://127.0.0.1:${port}`,
+  });
+
+  try {
+    await waitFor(() => relay.getStatus().state === "connected" && serverReceived.length >= 1);
+    assert.equal(relay.getStatus().subscribedChannels, 1);
+    assert.ok(relay.getStatus().lastHeartbeat);
+    assert.ok(serverReceived.some((m) => m.event === "pusher:subscribe" && m.data?.channel === "channel.555"));
+
+    // Server sends pusher:ping -> relay responds with pusher:pong
+    serverSocket.send(JSON.stringify({ event: "pusher:ping", data: {} }));
+    await waitFor(() => serverReceived.some((m) => m.event === "pusher:pong"));
+
+    // Server sends pusher:connection_established
+    serverSocket.send(
+      JSON.stringify({
+        event: "pusher:connection_established",
+        data: JSON.stringify({ socket_id: "1.1", activity_timeout: 60 }),
+      })
+    );
+
+    // Update subscriptions: replace 555 with 777
+    fcmStore.subscribe({ token, channelIds: ["777"] });
+    relay.syncSubscriptions();
+    await waitFor(() =>
+      serverReceived.some((m) => m.event === "pusher:unsubscribe" && m.data?.channel === "channel.555") &&
+      serverReceived.some((m) => m.event === "pusher:subscribe" && m.data?.channel === "channel.777")
+    );
+    assert.equal(relay.getStatus().subscribedChannels, 1);
+
+    // Removed kick_fcm_test_event must be ignored
+    serverSocket.send(
+      JSON.stringify({
+        event: "kick_fcm_test_event",
+        channel: "channel.777",
+        data: JSON.stringify({ title: "Should not trigger" }),
+      })
+    );
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(dispatchedCount, 0, "kick_fcm_test_event must not trigger push notifications");
+
+    // Real NotifyFollowersStreamHasStarted triggers push once, and duplicate without start_time is deduped
+    const realMsg = JSON.stringify({
+      event: "NotifyFollowersStreamHasStarted",
+      channel: "channel.777",
+      data: JSON.stringify({ title: "Real Live Stream" }),
+    });
+    serverSocket.send(realMsg);
+    await waitFor(() => dispatchedCount === 1);
+    serverSocket.send(realMsg);
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(dispatchedCount, 1, "Retransmitted start-time-less Pusher event must be deduplicated");
+  } finally {
+    relay.close();
+    assert.equal(relay.getStatus().state, "offline");
+    await new Promise((resolve) => wss.close(resolve));
+  }
+});
+
+test("B1.1: /v1/fcm/subscribe caps uncached slug resolutions at 25, negatively caches 404s, and refuses to persist unresolved bogus slugs", async () => {
+  clearChannelResolutionCache();
+  const fcmStore = createFcmStore({ dataFile: null });
+  const fetchedSlugs = [];
+
+  const mockFetch = async (url) => {
+    const match = String(url).match(/\/api\/v2\/channels\/([^/?]+)/);
+    if (match) {
+      const slug = decodeURIComponent(match[1]);
+      fetchedSlugs.push(slug);
+      if (slug === "valid-streamer") {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ id: 9001, user_id: 9002, slug: "valid-streamer" }),
+        };
+      }
+      return { ok: false, status: 404 };
+    }
+    return { ok: false, status: 404 };
+  };
+
+  // Pre-seed one already-cached slug in fcmStore + resolution cache so we verify it doesn't count against the 25 uncached cap
+  const app = createApp(config({ fcm: { pusherRelayEnabled: false } }), {
+    fcmStore,
+    messaging: null,
+    fetch: mockFetch,
+  });
+  channelResolutionCache.set("already-active-slug", {
+    channelId: "8001",
+    userId: "8002",
+    slug: "already-active-slug",
+    expiresAt: Date.now() + 60_000,
+  });
+  fcmStore.subscribe({ token: "existing_seed_token_1234567890", channelIds: ["already-active-slug"] });
+
+  await withServer(app, async (baseUrl) => {
+    const token = "dos_protection_token_1234567890";
+    const fakeSlugs = Array.from({ length: 60 }, (_, i) => `fake-slug-${i + 1}`);
+    const res1 = await httpRequest(baseUrl, "POST", "/v1/fcm/subscribe", {
+      token,
+      channel_ids: ["already-active-slug", "valid-streamer", ...fakeSlugs],
+    });
+    assert.equal(res1.status, 200);
+    await waitFor(() => fetchedSlugs.length === 25);
+    await new Promise((r) => setTimeout(r, 40));
+
+    // Only 25 uncached slugs were queried over the network (valid-streamer + 24 fake slugs)
+    assert.equal(fetchedSlugs.length, 25);
+    assert.ok(fetchedSlugs.includes("valid-streamer"));
+
+    // Valid streamer aliases were added, already-active-slug was kept, and ZERO fake slugs were persisted!
+    assert.deepEqual(fcmStore.getTokensForChannel("valid-streamer"), [token]);
+    assert.deepEqual(fcmStore.getTokensForChannel("9001"), [token]);
+    assert.deepEqual(fcmStore.getTokensForChannel("9002"), [token]);
+    assert.ok(fcmStore.getTokensForChannel("already-active-slug").includes(token));
+    for (const fake of fakeSlugs) {
+      assert.deepEqual(fcmStore.getTokensForChannel(fake), [], `${fake} must not be persisted`);
+    }
+
+    // The 24 queried fake slugs are now in negativeResolutionCache; a repeat request for them makes 0 network calls
+    const countBefore = fetchedSlugs.length;
+    const res2 = await httpRequest(baseUrl, "POST", "/v1/fcm/subscribe", {
+      token,
+      channel_ids: ["valid-streamer", ...fakeSlugs.slice(0, 24)],
+    });
+    assert.equal(res2.status, 200);
+    await new Promise((r) => setTimeout(r, 40));
+    assert.equal(fetchedSlugs.length, countBefore, "Negatively cached 404 slugs and positively cached slugs must not hit upstream");
+    assert.ok(negativeResolutionCache.has("fake-slug-1"));
+  });
+
+  clearChannelResolutionCache();
+});
+
+test("B1.1b: fcmStore normalizes slugs to lowercase, caps channel_ids per token at 500, and poller bounds slug queries per cycle", async () => {
+  clearChannelResolutionCache();
+  const fcmStore = createFcmStore({ dataFile: null, maxChannelsPerToken: 500 });
+  const token = "cap_and_case_token_1234567890";
+
+  const channels = ["MixedCaseStreamer", ...Array.from({ length: 520 }, (_, i) => `ch-${i}`)];
+  const sub = fcmStore.subscribe({ token, channelIds: channels });
+  assert.equal(sub.subscribedChannels, 500);
+  assert.deepEqual(fcmStore.getTokensForChannel("mixedcasestreamer"), [token]);
+  assert.deepEqual(fcmStore.getTokensForChannel("MIXEDCASESTREAMER"), [token]);
+  assert.equal(fcmStore.addAliasesToToken(token, ["extra-alias"]), 0, "Cannot exceed maxChannelsPerToken via addAliasesToToken");
+
+  let slugQueries = 0;
+  const poller = createLiveStreamPoller({
+    fcmStore,
+    messaging: {},
+    config: { kickClientId: "cid", kickClientSecret: "csec" },
+    maxSlugPollsPerCycle: 10,
+    slugPollConcurrency: 5,
+    fetchFn: async (url) => {
+      if (url.includes("/oauth/token")) {
+        return jsonResponse(200, { access_token: "tok", expires_in: 3600 });
+      }
+      if (url.includes("slug=")) {
+        slugQueries++;
+        return jsonResponse(404, {});
+      }
+      return jsonResponse(200, { data: [] });
+    },
+  });
+
+  try {
+    await poller.checkLiveStreams();
+    assert.equal(slugQueries, 10, "Poller must cap slug queries per cycle");
+  } finally {
+    poller.close();
+    clearChannelResolutionCache();
+  }
+});
+
+test("B1.2: HMAC middleware validates nonce length <= 128, signature hex format, and caps seenNonces size", async () => {
+  const cfg = { ...loadConfig(hmacEnv), maxSeenNonces: 3 };
+  const app = createApp(cfg, { fetch: async () => jsonResponse(200, {}) });
+
+  await withServer(app, async (baseUrl) => {
+    const path = "/v1/kick/oauth/introspect";
+    const body = { token: "secret-token" };
+
+    // 1. Oversized nonce (> 128 chars) is rejected with 401
+    const longNonce = "n".repeat(129);
+    const resLongNonce = await signedRequest(baseUrl, "POST", path, body, { nonce: longNonce });
+    assert.equal(resLongNonce.status, 401);
+
+    // 2. Non-hex or wrong-length signature is rejected with 401 without crashing timingSafeEqual
+    for (const badSig of ["not-hex", "z".repeat(64), "a".repeat(63), "a".repeat(65)]) {
+      const headers = signedHeaders({ secret: "hmac-secret", method: "POST", path, bodyObject: body });
+      headers["X-Auth-Signature"] = badSig;
+      const resBadSig = await httpRequest(baseUrl, "POST", path, body, { headers });
+      assert.equal(resBadSig.status, 401);
+    }
+
+    // 3. seenNonces cap (maxSeenNonces = 3): inserting 4 distinct nonces evicts the oldest one
+    for (const n of ["n1", "n2", "n3"]) {
+      assert.equal((await signedRequest(baseUrl, "POST", path, body, { nonce: n })).status, 200);
+    }
+    // Replaying n3 (still in cache) fails with 401
+    assert.equal((await signedRequest(baseUrl, "POST", path, body, { nonce: "n3" })).status, 401);
+    // Inserting n4 evicts oldest (n1)
+    assert.equal((await signedRequest(baseUrl, "POST", path, body, { nonce: "n4" })).status, 200);
+    assert.equal((await signedRequest(baseUrl, "POST", path, body, { nonce: "n2" })).status, 401);
+    assert.equal((await signedRequest(baseUrl, "POST", path, body, { nonce: "n1" })).status, 200);
+  });
+});
+
+test("B1.3: Express 4 async handlers forward rejected promises and thrown errors to 500 error middleware", async () => {
+  const brokenFcmStore = {
+    getActiveChannels: () => [],
+    subscribe: () => { throw new Error("subscribe exploded"); },
+    unsubscribe: () => { throw new Error("unsubscribe exploded"); },
+    stats: () => { throw new Error("fcm stats exploded"); },
+  };
+  const brokenMetrics = {
+    countersEndpoint() {},
+    computeStats: async () => { throw new Error("metrics stats exploded"); },
+    close() {},
+  };
+  const cfg = loadConfig(metricsEnv());
+  const app = createApp(cfg, {
+    fcmStore: brokenFcmStore,
+    metrics: brokenMetrics,
+    messaging: null,
+    pusherRelay: null,
+    crashReports: createCrashReportStore(),
+  });
+
+  try {
+    await withServer(app, async (baseUrl) => {
+      const subRes = await httpRequest(baseUrl, "POST", "/v1/fcm/subscribe", {
+        token: "valid_token_123456789012345",
+        channel_ids: ["100"],
+      });
+      assert.equal(subRes.status, 500);
+      assert.equal(subRes.body.code, "internal_error");
+
+      const unsubRes = await httpRequest(baseUrl, "POST", "/v1/fcm/unsubscribe", {
+        token: "valid_token_123456789012345",
+      });
+      assert.equal(unsubRes.status, 500);
+      assert.equal(unsubRes.body.code, "internal_error");
+
+      const fcmStatsRes = await httpRequest(baseUrl, "GET", "/v1/fcm/stats", undefined, {
+        headers: { Authorization: "Bearer admin-secret" },
+      });
+      assert.equal(fcmStatsRes.status, 500);
+      assert.equal(fcmStatsRes.body.code, "internal_error");
+
+      const statsRes = await httpRequest(baseUrl, "GET", "/v1/metrics/stats", undefined, {
+        headers: { Authorization: "Bearer admin-secret" },
+      });
+      assert.equal(statsRes.status, 500);
+      assert.equal(statsRes.body.code, "internal_error");
+    });
+  } finally {
+    app.locals.crashReports?.close?.();
+  }
+});
+
+test("B1.4: fcmStore.close() and startServer SIGTERM flush pending debounced state to disk", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "graceful-shutdown-"));
+  const fcmFile = join(dir, "fcm.json");
+  const metricsFile = join(dir, "metrics.json");
+
+  const probe = http.createServer();
+  await new Promise((resolve) => probe.listen(0, "127.0.0.1", resolve));
+  const freePort = probe.address().port;
+  await new Promise((resolve) => probe.close(resolve));
+
+  try {
+    const server = startServer(
+      {
+        ...metricsEnv(),
+        PORT: String(freePort),
+        FCM_DATA_FILE: fcmFile,
+        METRICS_DATA_FILE: metricsFile,
+      },
+      { messaging: null, pusherRelay: null, crashReports: createCrashReportStore() }
+    );
+    if (!server.listening) {
+      await new Promise((resolve) => server.once("listening", resolve));
+    }
+    const { port } = server.address();
+    const baseUrl = `http://127.0.0.1:${port}`;
+
+    // Trigger debounced writes (1s for FCM, 2s for metrics) and immediately emit SIGTERM before timers fire
+    const subRes = await httpRequest(baseUrl, "POST", "/v1/fcm/subscribe", {
+      token: "shutdown_flush_token_1234567890",
+      channel_ids: ["12345"],
+    });
+    assert.equal(subRes.status, 200);
+
+    const pingRes = await httpRequest(baseUrl, "POST", "/v1/metrics/ping", makePingBody("3.0.0"));
+    assert.equal(pingRes.status, 204);
+
+    process.emit("SIGTERM");
+    await new Promise((resolve) => server.once("close", resolve));
+
+    const persistedFcm = JSON.parse(readFileSync(fcmFile, "utf8"));
+    assert.equal(persistedFcm.length, 1);
+    assert.equal(persistedFcm[0].token, "shutdown_flush_token_1234567890");
+    assert.deepEqual(persistedFcm[0].channelIds, ["12345"]);
+
+    const persistedMetrics = JSON.parse(readFileSync(metricsFile, "utf8"));
+    assert.equal(persistedMetrics.totalInstalls, 1);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("B1.5: webhook verifies RSA signature before dedupe check, returns 500 on transient error without burning messageId, and refreshes rotated public key", async () => {
+  const keyPair1 = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const pubPem1 = keyPair1.publicKey.export({ type: "spki", format: "pem" });
+  const keyPair2 = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const pubPem2 = keyPair2.publicKey.export({ type: "spki", format: "pem" });
+
+  clearKickPublicKeyCache();
+
+  const fcmStore = createFcmStore({ dataFile: null });
+  const token = "webhook_hardening_token_1234567890";
+  fcmStore.subscribe({ token, channelIds: ["777888", "rotatedstreamer"] });
+
+  let currentPubPem = pubPem1;
+  let pubKeyFetches = 0;
+  let failFcmOnce = false;
+  let pushedCount = 0;
+
+  const mockMessaging = {
+    async sendEachForMulticast(payload) {
+      if (failFcmOnce) {
+        failFcmOnce = false;
+        throw new Error("Transient Firebase 503");
+      }
+      pushedCount++;
+      return {
+        successCount: payload.tokens.length,
+        failureCount: 0,
+        responses: payload.tokens.map(() => ({ success: true })),
+      };
+    },
+  };
+
+  const mockFetch = async (url) => {
+    if (url.includes("/public/v1/public-key")) {
+      pubKeyFetches++;
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ data: { public_key: currentPubPem } }),
+      };
+    }
+    return { ok: false, status: 404 };
+  };
+
+  const app = createApp(config(), {
+    fetch: mockFetch,
+    fcmStore,
+    messaging: mockMessaging,
+  });
+
+  try {
+    await withServer(app, async (baseUrl) => {
+      const messageId = "msg_poison_target_1";
+      const timestamp = new Date().toISOString();
+      const bodyStr = JSON.stringify({
+        broadcaster: { user_id: 777888, channel_slug: "rotatedstreamer" },
+        is_live: true,
+        title: "Hardened Webhook Stream",
+        started_at: "2026-11-20T18:00:00Z",
+      });
+
+      // 1. Unauthenticated attacker tries to poison messageId before Kick delivers it -> gets 401
+      const poisonAttempt = await fetch(`${baseUrl}/v1/events/webhook`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Kick-Event-Message-Id": messageId,
+          "Kick-Event-Message-Timestamp": timestamp,
+          "Kick-Event-Signature": "aW52YWxpZA==",
+          "Kick-Event-Type": "livestream.status.updated",
+        },
+        body: bodyStr,
+      });
+      assert.equal(poisonAttempt.status, 401);
+      assert.equal(pubKeyFetches, 1, "Recent key (<5m) must not be re-fetched on invalid signature");
+
+      // 2. Real signed webhook arrives, but FCM has a transient outage -> returns 500 without marking messageId seen
+      const signWith = (privKey, id, ts, raw) => {
+        const s = createSign("RSA-SHA256");
+        s.update(`${id}.${ts}.${raw}`);
+        return s.sign(privKey, "base64");
+      };
+      const validSig1 = signWith(keyPair1.privateKey, messageId, timestamp, bodyStr);
+
+      failFcmOnce = true;
+      const transientFail = await fetch(`${baseUrl}/v1/events/webhook`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Kick-Event-Message-Id": messageId,
+          "Kick-Event-Message-Timestamp": timestamp,
+          "Kick-Event-Signature": validSig1,
+          "Kick-Event-Type": "livestream.status.updated",
+        },
+        body: bodyStr,
+      });
+      assert.equal(transientFail.status, 500);
+      assert.equal(pushedCount, 0);
+
+      // 3. Kick retries the exact same messageId -> succeeds (200) and dispatches push!
+      const retryOk = await fetch(`${baseUrl}/v1/events/webhook`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Kick-Event-Message-Id": messageId,
+          "Kick-Event-Message-Timestamp": timestamp,
+          "Kick-Event-Signature": validSig1,
+          "Kick-Event-Type": "livestream.status.updated",
+        },
+        body: bodyStr,
+      });
+      assert.equal(retryOk.status, 200);
+      assert.equal((await retryOk.json()).duplicate, undefined);
+      assert.equal(pushedCount, 1);
+
+      // 4. Unauthenticated replay of an already-seen messageId must still get 401 (not 200 duplicate!)
+      const unauthReplay = await fetch(`${baseUrl}/v1/events/webhook`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Kick-Event-Message-Id": messageId,
+          "Kick-Event-Message-Timestamp": timestamp,
+          "Kick-Event-Signature": "aW52YWxpZA==",
+          "Kick-Event-Type": "livestream.status.updated",
+        },
+        body: bodyStr,
+      });
+      assert.equal(unauthReplay.status, 401);
+
+      // 5. Public key rotation: age cached key > 5 min by seeding cache with older timestamp via getKickPublicKey
+      clearKickPublicKeyCache();
+      await getKickPublicKey({ fetchFn: mockFetch, now: Date.now() - 6 * 60 * 1000 });
+      const fetchesBeforeRotation = pubKeyFetches;
+      currentPubPem = pubPem2;
+
+      const rotatedMsgId = "msg_rotated_key_2";
+      const rotatedBody = JSON.stringify({
+        broadcaster: { user_id: 777888, channel_slug: "rotatedstreamer" },
+        is_live: true,
+        title: "Second Stream With Rotated Key",
+        started_at: "2026-11-20T19:00:00Z",
+      });
+      const validSig2 = signWith(keyPair2.privateKey, rotatedMsgId, timestamp, rotatedBody);
+
+      const rotatedRes = await fetch(`${baseUrl}/v1/events/webhook`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Kick-Event-Message-Id": rotatedMsgId,
+          "Kick-Event-Message-Timestamp": timestamp,
+          "Kick-Event-Signature": validSig2,
+          "Kick-Event-Type": "livestream.status.updated",
+        },
+        body: rotatedBody,
+      });
+      assert.equal(rotatedRes.status, 200);
+      assert.equal(pubKeyFetches, fetchesBeforeRotation + 1, "Key older than 5 min is refreshed once on sig mismatch");
+      assert.equal(pushedCount, 2);
+    });
+  } finally {
+    clearKickPublicKeyCache();
+    fcmStore.close();
+  }
+});
+
+test("B1.6: metrics computeStats is immune to Object.prototype keys, kick_user_id enforces .max(64), and crash/dismiss rate-limits before auth", async () => {
+  const store = createMetricsStore({ salt: "proto-safety-salt" });
+  const now = new Date();
+  const epoch = monthStringOf(now);
+
+  for (const [idx, protoKey] of ["toString", "constructor", "valueOf", "__proto__", "hasOwnProperty"].entries()) {
+    store.recordPing(
+      {
+        pidHash: String(idx + 1).repeat(64),
+        version: protoKey,
+        clientEpoch: epoch,
+        os: "35",
+        cc: "DE",
+      },
+      now
+    );
+  }
+  // Also test prototype keys directly in bucket fields
+  store.state.devices[epoch]["9".repeat(64)] = {
+    v: "constructor",
+    d: 1 << (now.getUTCDate() - 1),
+    os: "toString",
+    cc: "constructor",
+    gc: "valueOf",
+  };
+
+  const stats = store.computeStats(now);
+  assert.ok(stats.versions.every((entry) => typeof entry.count === "number" && Number.isFinite(entry.count)));
+  assert.ok(stats.os.every((entry) => typeof entry.count === "number" && Number.isFinite(entry.count)));
+  assert.ok(stats.countries.every((entry) => typeof entry.count === "number" && Number.isFinite(entry.count)));
+  assert.ok(stats.geoCountries.every((entry) => typeof entry.count === "number" && Number.isFinite(entry.count)));
+  const constructorVersion = stats.versions.find((v) => v.version === "constructor");
+  assert.equal(constructorVersion.count, 2);
+  store.close();
+
+  // Verify kick_user_id .max(64) and /v1/metrics/crash/dismiss limiter before requireAdminToken
+  const { app, store: appStore } = appWithMetrics(async () => jsonResponse(200, {}));
+  try {
+    await withServer(app, async (baseUrl) => {
+      const tooLongUserId = await httpRequest(baseUrl, "POST", "/v1/fcm/subscribe", {
+        token: "valid_token_123456789012345",
+        kick_user_id: "u".repeat(65),
+        channel_ids: ["100"],
+      });
+      assert.equal(tooLongUserId.status, 400);
+      assert.equal(tooLongUserId.body.code, "invalid_request");
+
+      let lastStatus = 0;
+      for (let i = 0; i < 11; i++) {
+        const res = await httpRequest(baseUrl, "POST", "/v1/metrics/crash/dismiss", {
+          signature: "a".repeat(64),
+        });
+        lastStatus = res.status;
+        assert.equal(res.status, i < 10 ? 401 : 429);
+      }
+      assert.equal(lastStatus, 429);
+    });
+  } finally {
+    appStore.close();
+    app.locals.crashReports?.close?.();
+  }
+});
+
 
 
 

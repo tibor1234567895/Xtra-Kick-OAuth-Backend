@@ -17,6 +17,7 @@ export const crashReportSchema = z.object({
   crashedAt: z.number().int().min(1).max(8_640_000_000_000_000),
   exceptions: z.array(z.object({
     type: symbol,
+    message: z.string().min(1).max(200).regex(/^[\x20-\x7E]+$/).optional(),
     frames: z.array(z.object({
       class: symbol,
       method: symbol,
@@ -87,7 +88,11 @@ export function createCrashReportStore({ dataPath = null } = {}) {
       throw error;
     }
     const { id, crashedAt, ...details } = report;
-    const signature = createHash("sha256").update(JSON.stringify(details)).digest("hex");
+    const signatureInput = {
+      ...details,
+      exceptions: details.exceptions.map(({ message: _message, ...exception }) => exception),
+    };
+    const signature = createHash("sha256").update(JSON.stringify(signatureInput)).digest("hex");
     const existing = next.reports.find(r => r.signature === signature);
     next.reports = next.reports.filter(r => r.signature !== signature);
     next.reports.push({
