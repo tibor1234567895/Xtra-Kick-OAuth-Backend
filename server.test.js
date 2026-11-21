@@ -1525,8 +1525,8 @@ test("POST /v1/fcm/subscribe resolves non-numeric slugs in the background", asyn
       channel_ids: ["xqc"],
     });
 
-    assert.equal(response.status, 200);
-    assert.equal(response.body.ok, true);
+    assert.equal(response.status, 503);
+    assert.equal(response.body.code, "subscription_pending");
 
     // Wait briefly for the background resolution promise to settle
     await new Promise((r) => setTimeout(r, 60));
@@ -1535,6 +1535,9 @@ test("POST /v1/fcm/subscribe resolves non-numeric slugs in the background", asyn
     assert.deepEqual(fcmStore.getTokensForChannel("668"), [token]);
     assert.deepEqual(fcmStore.getTokensForChannel("676"), [token]);
     assert.deepEqual(fcmStore.getTokensForChannel("xqc"), [token]);
+    const completed = await httpRequest(baseUrl, "POST", "/v1/fcm/subscribe", { token, channel_ids: ["xqc"] });
+    assert.equal(completed.status, 200);
+    assert.equal(completed.body.complete, true);
   });
 });
 
@@ -3747,16 +3750,22 @@ test("createPusherRelay lifecycle connects, syncs subscriptions, handles ping/po
   }
 });
 
-test("B1.1: /v1/fcm/subscribe caps uncached slug resolutions at 25, negatively caches 404s, and refuses to persist unresolved bogus slugs", async () => {
+test("FCM subscription resolves slugs beyond the first 25 with bounded concurrency and caches misses", async () => {
   clearChannelResolutionCache();
   const fcmStore = createFcmStore({ dataFile: null });
   const fetchedSlugs = [];
+  let activeFetches = 0;
+  let maxActiveFetches = 0;
 
   const mockFetch = async (url) => {
     const match = String(url).match(/\/api\/v2\/channels\/([^/?]+)/);
     if (match) {
       const slug = decodeURIComponent(match[1]);
       fetchedSlugs.push(slug);
+      activeFetches++;
+      maxActiveFetches = Math.max(maxActiveFetches, activeFetches);
+      await new Promise((resolve) => setImmediate(resolve));
+      activeFetches--;
       if (slug === "valid-streamer") {
         return {
           ok: true,
@@ -3769,7 +3778,7 @@ test("B1.1: /v1/fcm/subscribe caps uncached slug resolutions at 25, negatively c
     return { ok: false, status: 404 };
   };
 
-  // Pre-seed one already-cached slug in fcmStore + resolution cache so we verify it doesn't count against the 25 uncached cap
+  // Cached subscriptions are kept while uncached slugs are resolved.
   const app = createApp(config({ fcm: { pusherRelayEnabled: false } }), {
     fcmStore,
     messaging: null,
@@ -3788,15 +3797,13 @@ test("B1.1: /v1/fcm/subscribe caps uncached slug resolutions at 25, negatively c
     const fakeSlugs = Array.from({ length: 60 }, (_, i) => `fake-slug-${i + 1}`);
     const res1 = await httpRequest(baseUrl, "POST", "/v1/fcm/subscribe", {
       token,
-      channel_ids: ["already-active-slug", "valid-streamer", ...fakeSlugs],
+      channel_ids: ["already-active-slug", ...fakeSlugs, "valid-streamer"],
     });
-    assert.equal(res1.status, 200);
-    await waitFor(() => fetchedSlugs.length === 25);
-    await new Promise((r) => setTimeout(r, 40));
-
-    // Only 25 uncached slugs were queried over the network (valid-streamer + 24 fake slugs)
-    assert.equal(fetchedSlugs.length, 25);
-    assert.ok(fetchedSlugs.includes("valid-streamer"));
+    assert.equal(res1.status, 503);
+    await waitFor(() => fcmStore.getTokensForChannel("9002").includes(token));
+    assert.equal(fetchedSlugs.length, 61);
+    assert.equal(fetchedSlugs.at(-1), "valid-streamer");
+    assert.ok(maxActiveFetches <= 5);
 
     // Valid streamer aliases were added, already-active-slug was kept, and ZERO fake slugs were persisted!
     assert.deepEqual(fcmStore.getTokensForChannel("valid-streamer"), [token]);
@@ -3807,19 +3814,137 @@ test("B1.1: /v1/fcm/subscribe caps uncached slug resolutions at 25, negatively c
       assert.deepEqual(fcmStore.getTokensForChannel(fake), [], `${fake} must not be persisted`);
     }
 
-    // The 24 queried fake slugs are now in negativeResolutionCache; a repeat request for them makes 0 network calls
+    // A repeat request for the same cached slugs makes no network calls.
     const countBefore = fetchedSlugs.length;
     const res2 = await httpRequest(baseUrl, "POST", "/v1/fcm/subscribe", {
       token,
-      channel_ids: ["valid-streamer", ...fakeSlugs.slice(0, 24)],
+      channel_ids: ["valid-streamer", ...fakeSlugs],
     });
     assert.equal(res2.status, 200);
+    assert.equal(res2.body.complete, true);
     await new Promise((r) => setTimeout(r, 40));
     assert.equal(fetchedSlugs.length, countBefore, "Negatively cached 404 slugs and positively cached slugs must not hit upstream");
     assert.ok(negativeResolutionCache.has("fake-slug-1"));
   });
 
   clearChannelResolutionCache();
+});
+
+test("bulk FCM resolution leaves capacity for ordinary subscriptions and prioritizes verified slugs over aliases", async () => {
+  clearChannelResolutionCache();
+  const slugs = Array.from({ length: 27 }, (_, i) => `bulk-streamer-${i}`);
+  const fcmStore = createFcmStore({ dataFile: null, maxChannelsPerToken: slugs.length });
+  let releaseBulk;
+  const pausedBulk = new Promise((resolve) => { releaseBulk = resolve; });
+  const mockFetch = async (url) => {
+    const slug = String(url).split("/").at(-1);
+    if (slug === slugs[0]) await pausedBulk;
+    const id = 1000 + (slug === "ordinary-streamer" ? 100 : slugs.indexOf(slug));
+    return { ok: true, status: 200, json: async () => ({ id, user_id: id + 2000, slug }) };
+  };
+  const app = createApp(config({ fcm: { pusherRelayEnabled: false } }), { fcmStore, messaging: null, fetch: mockFetch });
+
+  try {
+    await withServer(app, async (baseUrl) => {
+      const subscribe = (token, channel_ids) => httpRequest(baseUrl, "POST", "/v1/fcm/subscribe", { token, channel_ids });
+      const bulkToken = "bulk_registration_token_1234567890";
+      try {
+        assert.equal((await subscribe(bulkToken, slugs)).body.code, "subscription_pending");
+        assert.equal((await subscribe(bulkToken, slugs.slice().reverse())).body.code, "subscription_pending");
+        assert.equal((await subscribe("second_bulk_token_1234567890", slugs.map((slug) => `other-${slug}`))).status, 503);
+        assert.equal((await subscribe("ordinary_token_1234567890", ["ordinary-streamer"])).body.code, "subscription_pending");
+        await waitFor(() => fcmStore.getTokensForChannel("ordinary-streamer").length === 1);
+      } finally {
+        releaseBulk();
+      }
+      await waitFor(() => fcmStore.getTokensForChannel(slugs.at(-1)).includes(bulkToken));
+      assert.deepEqual(fcmStore.getActiveChannels().filter((key) => fcmStore.getTokensForChannel(key).includes(bulkToken)), slugs);
+    });
+  } finally {
+    clearChannelResolutionCache();
+  }
+});
+
+test("FCM only acknowledges a complete slug registration after it can be reopened from disk", async () => {
+  clearChannelResolutionCache();
+  const dir = mkdtempSync(join(tmpdir(), "fcm-complete-"));
+  const dataFile = join(dir, "subscriptions.json");
+  const fcmStore = createFcmStore({ dataFile });
+  const configWithPollingOff = config({ fcm: { pusherRelayEnabled: false } });
+  let successfulLookup = false;
+  const app = createApp(configWithPollingOff, { fcmStore, messaging: null, fetch: async () => (
+    successfulLookup ? jsonResponse(200, { id: 77, user_id: 88, slug: "retryable-channel" }) : jsonResponse(503, {})
+  ) });
+  try {
+    await withServer(app, async (baseUrl) => {
+      const token = "retryable_registration_token_1234567890";
+      const subscribe = () => httpRequest(baseUrl, "POST", "/v1/fcm/subscribe", { token, channel_ids: ["retryable-channel"] });
+      assert.equal((await subscribe()).body.code, "subscription_pending");
+      assert.equal((await subscribe()).body.code, "subscription_pending");
+      successfulLookup = true;
+      assert.equal((await subscribe()).body.code, "subscription_pending");
+      await waitFor(() => fcmStore.getTokensForChannel("retryable-channel").includes(token));
+      const response = await subscribe();
+      assert.equal(response.body.complete, true);
+      const reloaded = createFcmStore({ dataFile });
+      assert.deepEqual(reloaded.getTokensForChannel("retryable-channel"), [token]);
+    });
+  } finally {
+    fcmStore.close();
+    rmSync(dir, { recursive: true, force: true });
+    clearChannelResolutionCache();
+  }
+});
+
+test("FCM pending slug resolution does not inflate 5xx metrics or churn Pusher subscriptions", async () => {
+  clearChannelResolutionCache();
+  const fcmStore = createFcmStore({ dataFile: null });
+  const metrics = createMetricsStore({ salt: "s".repeat(32), dataPath: null });
+  let relaySyncs = 0;
+  let releaseFetch;
+  const pausedFetch = new Promise((resolve) => { releaseFetch = resolve; });
+  const app = createApp(config({ fcm: { pusherRelayEnabled: false } }), {
+    fcmStore,
+    messaging: null,
+    metrics,
+    pusherRelay: {
+      syncSubscriptions() { relaySyncs++; },
+      start() {},
+      close() {},
+      getStatus() { return { connected: true, subscribedCount: 0 }; },
+    },
+    fetch: async () => {
+      await pausedFetch;
+      return jsonResponse(200, { id: 501, user_id: 601, slug: "metrics-safe-slug" });
+    },
+  });
+  try {
+    await withServer(app, async (baseUrl) => {
+      const token = "metrics_safe_token_1234567890123";
+      const subscribe = () => httpRequest(baseUrl, "POST", "/v1/fcm/subscribe", {
+        token,
+        channel_ids: ["metrics-safe-slug"],
+      });
+      const first = await subscribe();
+      assert.equal(first.status, 503);
+      assert.equal(first.body.code, "subscription_pending");
+      assert.equal(relaySyncs, 0);
+
+      const duplicate = await subscribe();
+      assert.equal(duplicate.status, 503);
+      assert.equal(duplicate.body.code, "subscription_pending");
+
+      releaseFetch();
+      await waitFor(() => fcmStore.getTokensForChannel("501").includes(token));
+      assert.equal(relaySyncs, 1);
+
+      const endpointStats = metrics.computeStats().counters.today.endpoints["POST /v1/fcm/subscribe"];
+      assert.equal(endpointStats.ok, 2);
+      assert.equal(endpointStats.r5 || 0, 0);
+    });
+  } finally {
+    clearChannelResolutionCache();
+  }
 });
 
 test("B1.1b: fcmStore normalizes slugs to lowercase, caps channel_ids per token at 500, and poller bounds slug queries per cycle", async () => {

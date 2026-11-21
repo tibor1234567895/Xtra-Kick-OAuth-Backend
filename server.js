@@ -169,7 +169,7 @@ export function createApp(config, deps = {}) {
       const endpoint = KNOWN_ENDPOINTS.has(rawEndpoint) ? rawEndpoint : "OTHER / 404";
       res.on("finish", () => {
         try {
-          metrics.countersEndpoint(endpoint, res.statusCode);
+          metrics.countersEndpoint(endpoint, res.locals.metricsStatus ?? res.statusCode);
         } catch {
           // Counters are best-effort.
         }
@@ -823,11 +823,14 @@ function introspectHandler(config, upstreamFetch) {
   };
 }
 
-export const MAX_UNCACHED_SLUGS_PER_REQUEST = 25;
+const SLUG_RESOLUTION_CONCURRENCY = 5;
+const BULK_SLUG_RESOLUTION_THRESHOLD = 25;
 export const MAX_ACTIVE_RESOLUTIONS = 4;
 
 function fcmSubscribeHandler(fcmStore, pusherRelay, { upstreamFetch, config } = {}) {
   let activeResolutions = 0;
+  let bulkResolutionInProgress = false;
+  const pendingSlugRegistrations = new Map();
   return asyncHandler(async (req, res) => {
     const parsed = fcmSubscribeSchema.safeParse(req.body);
     if (!parsed.success) return validationError(res, parsed);
@@ -835,14 +838,21 @@ function fcmSubscribeHandler(fcmStore, pusherRelay, { upstreamFetch, config } = 
     const rawChannelIds = Array.from(
       new Set(parsed.data.channel_ids.map((id) => id.trim().toLowerCase()).filter(Boolean))
     );
+    const { token, kick_user_id: kickUserId } = parsed.data;
+    const registration = { signature: JSON.stringify([kickUserId, [...rawChannelIds].sort()]) };
+    if (pendingSlugRegistrations.get(token)?.signature === registration.signature) {
+      res.locals.metricsStatus = 202;
+      return res.status(503).json({ ok: false, code: "subscription_pending" });
+    }
     const now = Date.now();
     const numericIds = [];
     const persistedChannelIds = [];
+    const cachedAliases = [];
     const uncachedSlugs = [];
     const pushCachedAliases = (cached) => {
-      if (cached.channelId) persistedChannelIds.push(cached.channelId);
-      if (cached.userId) persistedChannelIds.push(cached.userId);
-      if (cached.slug) persistedChannelIds.push(cached.slug);
+      if (cached.channelId) cachedAliases.push(cached.channelId);
+      if (cached.userId) cachedAliases.push(cached.userId);
+      if (cached.slug) cachedAliases.push(cached.slug);
     };
 
     for (const id of rawChannelIds) {
@@ -868,57 +878,52 @@ function fcmSubscribeHandler(fcmStore, pusherRelay, { upstreamFetch, config } = 
       }
     }
 
-    const uncachedSlugsToResolve = uncachedSlugs.slice(0, MAX_UNCACHED_SLUGS_PER_REQUEST);
     const unknownNumeric = numericIds.filter((id) => {
       const cached = channelResolutionCache.get(id);
       return !cached || cached.expiresAt <= now || cached.channelId !== id;
     });
-    const needsResolution = uncachedSlugsToResolve.length > 0 || unknownNumeric.length > 0;
+    const needsResolution = uncachedSlugs.length > 0 || unknownNumeric.length > 0;
+    const isBulkResolution = uncachedSlugs.length > BULK_SLUG_RESOLUTION_THRESHOLD;
 
-    if (needsResolution && activeResolutions >= MAX_ACTIVE_RESOLUTIONS) {
+    if (needsResolution && (activeResolutions >= MAX_ACTIVE_RESOLUTIONS ||
+        (isBulkResolution && bulkResolutionInProgress))) {
       return res.status(503).json({ ok: false, code: "subscription_busy" });
     }
 
     const result = fcmStore.subscribe({
-      token: parsed.data.token,
-      kickUserId: parsed.data.kick_user_id,
-      channelIds: persistedChannelIds,
+      token,
+      kickUserId,
+      channelIds: uncachedSlugs.length ? persistedChannelIds : [...persistedChannelIds, ...cachedAliases],
     });
     if (result.error) return res.status(503).json({ ok: false, code: result.error });
-    pusherRelay?.syncSubscriptions();
+    if (!uncachedSlugs.length) pusherRelay?.syncSubscriptions();
 
     // In the background, resolve any uncached slugs or numeric keys so resolved
     // channel_ids are subscribed on the Pusher WebSocket and registered to the device token.
-    const token = parsed.data.token;
     const fetchFn = upstreamFetch || globalThis.fetch;
     const logger = req.log || config?.logger;
 
     if (needsResolution || (config?.kickClientId && config?.kickClientSecret && persistedChannelIds.length > 0)) {
       if (needsResolution) activeResolutions++;
+      if (isBulkResolution) bulkResolutionInProgress = true;
+      if (uncachedSlugs.length) pendingSlugRegistrations.set(token, registration);
       (async () => {
+        let syncedRelay = false;
         try {
-          const resolvedIds = [];
-          // 1. Resolve capped non-numeric uncached slugs with controlled concurrency
-          if (uncachedSlugsToResolve.length > 0) {
-            const BATCH_SIZE = 5;
-            for (let i = 0; i < uncachedSlugsToResolve.length; i += BATCH_SIZE) {
-              if (!fcmStore.isCurrentSubscription(token, result.revision)) return;
-              const batch = uncachedSlugsToResolve.slice(i, i + BATCH_SIZE);
-              const results = await Promise.all(
-                batch.map(async (slug) => ({
-                  slug,
-                  resolved: await resolveKickChannel(slug, { fetchFn, logger }),
-                }))
-              );
-              for (const { slug, resolved } of results) {
-                if (resolved) {
-                  if (resolved.channelId) resolvedIds.push(resolved.channelId);
-                  if (resolved.userId) resolvedIds.push(resolved.userId);
-                  if (resolved.slug) resolvedIds.push(resolved.slug);
-                  resolvedIds.push(slug);
-                }
-              }
+          const resolvedIds = uncachedSlugs.length ? cachedAliases : [];
+          for (let i = 0; i < uncachedSlugs.length; i += SLUG_RESOLUTION_CONCURRENCY) {
+            if (!fcmStore.isCurrentSubscription(token, result.revision)) return;
+            const batch = uncachedSlugs.slice(i, i + SLUG_RESOLUTION_CONCURRENCY);
+            const results = await Promise.all(batch.map((slug) => resolveKickChannel(slug, { fetchFn, logger })));
+            const verifiedSlugs = [];
+            for (const [index, resolved] of results.entries()) {
+              if (!resolved) continue;
+              verifiedSlugs.push(resolved.slug || batch[index]);
+              if (resolved.channelId) resolvedIds.push(resolved.channelId);
+              if (resolved.userId) resolvedIds.push(resolved.userId);
+              if (resolved.slug !== batch[index]) resolvedIds.push(batch[index]);
             }
+            fcmStore.addAliasesToToken(token, verifiedSlugs, result.revision);
           }
 
           // 2. Resolve numeric broadcaster user IDs that are not yet known as channelIds
@@ -939,12 +944,10 @@ function fcmSubscribeHandler(fcmStore, pusherRelay, { upstreamFetch, config } = 
             }
           }
 
-          if (resolvedIds.length > 0) {
-            const added = fcmStore.addAliasesToToken(token, resolvedIds, result.revision);
-            if (added > 0) {
-              pusherRelay?.syncSubscriptions();
-              logger?.info({ token: token.slice(-8), resolvedCount: resolvedIds.length, added }, "fcm_slugs_resolved_and_synced");
-            }
+          const added = fcmStore.addAliasesToToken(token, resolvedIds, result.revision);
+          if (added > 0 || uncachedSlugs.length > 0) {
+            syncedRelay = true;
+            pusherRelay?.syncSubscriptions();
           }
 
           if (config?.kickClientId && config?.kickClientSecret) {
@@ -958,15 +961,28 @@ function fcmSubscribeHandler(fcmStore, pusherRelay, { upstreamFetch, config } = 
             }).catch(() => {});
           }
         } catch (err) {
+          if (!syncedRelay && uncachedSlugs.length > 0 && fcmStore.isCurrentSubscription(token, result.revision)) {
+            pusherRelay?.syncSubscriptions();
+          }
           logger?.warn({ err: err.message }, "fcm_background_resolution_failed");
         } finally {
           if (needsResolution) activeResolutions--;
+          if (isBulkResolution) bulkResolutionInProgress = false;
+          if (pendingSlugRegistrations.get(token) === registration) pendingSlugRegistrations.delete(token);
         }
       })().catch(() => {});
     }
 
+    if (uncachedSlugs.length) {
+      res.locals.metricsStatus = 202;
+      return res.status(503).json({ ok: false, code: "subscription_pending" });
+    }
+    if (!(await fcmStore.whenSaved()) || !fcmStore.isCurrentSubscription(token, result.revision)) {
+      return res.status(503).json({ ok: false, code: "subscription_pending" });
+    }
     return res.status(200).json({
       ok: true,
+      complete: true,
       subscribed_channels: result.subscribedChannels,
     });
   });

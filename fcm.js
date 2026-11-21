@@ -251,7 +251,7 @@ export function loadFcmConfig(env = process.env) {
 export function createFcmStore({ dataFile, logger, maxTokens = 100000, maxChannelsPerToken = 500 } = {}) {
   const tokens = new Map(); // token -> { kickUserId, channelIds: Set, updatedAt, lastActiveAt }
   const channelIndex = new Map(); // channelId -> Set<token>
-  let saveTimer = null;
+  let pendingSave = null;
   let nextRevision = 0;
   const deliveryStats = {
     since: new Date().toISOString(),
@@ -297,17 +297,25 @@ export function createFcmStore({ dataFile, logger, maxTokens = 100000, maxChanne
   }
 
   function scheduleSave() {
-    if (!dataFile) return;
-    if (saveTimer) return;
-    saveTimer = setTimeout(() => {
-      saveTimer = null;
-      persist();
-    }, 1000);
-    if (typeof saveTimer.unref === "function") saveTimer.unref();
+    if (!dataFile || pendingSave) return;
+    let finish;
+    const done = new Promise((resolve) => { finish = resolve; });
+    const timer = setTimeout(flushSave, 1000);
+    timer.unref();
+    pendingSave = { timer, finish, done };
+  }
+
+  function flushSave() {
+    const pending = pendingSave;
+    pendingSave = null;
+    if (pending) clearTimeout(pending.timer);
+    const saved = persist();
+    pending?.finish(saved);
+    return saved;
   }
 
   function persist() {
-    if (!dataFile) return;
+    if (!dataFile) return true;
     try {
       const dir = dirname(dataFile);
       if (!existsSync(dir)) {
@@ -326,8 +334,10 @@ export function createFcmStore({ dataFile, logger, maxTokens = 100000, maxChanne
       const tmpFile = `${dataFile}.${Date.now()}.tmp`;
       writeFileSync(tmpFile, JSON.stringify(data), { encoding: "utf8", mode: 0o600 });
       renameSync(tmpFile, dataFile);
+      return true;
     } catch (err) {
       logger?.error({ err: err.message }, "fcm_store_persist_failed");
+      return false;
     }
   }
 
@@ -529,13 +539,11 @@ export function createFcmStore({ dataFile, logger, maxTokens = 100000, maxChanne
       };
     },
 
-    flushSync() {
-      if (saveTimer) {
-        clearTimeout(saveTimer);
-        saveTimer = null;
-      }
-      persist();
+    whenSaved() {
+      return pendingSave?.done ?? true;
     },
+
+    flushSync: flushSave,
 
     close() {
       const syncState = subscriptionSyncStates.get(this);
@@ -543,15 +551,7 @@ export function createFcmStore({ dataFile, logger, maxTokens = 100000, maxChanne
         clearTimeout(syncState.timer);
         syncState.timer = null;
       }
-      if (saveTimer) {
-        clearTimeout(saveTimer);
-        saveTimer = null;
-      }
-      try {
-        persist();
-      } catch {
-        // ignore
-      }
+      flushSave();
     },
   };
 }
