@@ -2757,6 +2757,7 @@ test("ping accepts pe, c, wt and reflects player engines, watch time, and crashe
   store.recordPing({
     pidHash: store.hashPid(pid1),
     version: "2.55.0",
+    build: 225,
     clientEpoch: `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}`,
     pe: "ivs",
     c: 2,
@@ -2766,6 +2767,7 @@ test("ping accepts pe, c, wt and reflects player engines, watch time, and crashe
   store.recordPing({
     pidHash: store.hashPid(pid2),
     version: "2.55.0",
+    build: null,
     clientEpoch: `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}`,
     pe: "exo",
     c: 0,
@@ -2773,6 +2775,10 @@ test("ping accepts pe, c, wt and reflects player engines, watch time, and crashe
   }, now);
 
   const stats = store.computeStats(now);
+  assert.deepEqual(stats.builds, [
+    { label: "2.55.0 (b225)", count: 1 },
+    { label: "2.55.0 (legacy)", count: 1 },
+  ]);
   const ivs = stats.playerEngines.find((p) => p.code === "ivs");
   const exo = stats.playerEngines.find((p) => p.code === "exo");
   assert.equal(ivs.count, 1);
@@ -2937,6 +2943,94 @@ test("crash dismissal route requires admin, validates, and hides a group until i
   });
   store.close();
   app.locals.crashReports.close();
+});
+
+test("crash batch dismiss and persistent minBuild filtering hide older builds until reset", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "crash-min-build-"));
+  const crashPath = join(dir, "crashes.json");
+  const secret = "crash-test-secret";
+  const auth = { headers: { Authorization: "Bearer admin-secret" } };
+  const makeServer = () => {
+    const cfg = loadConfig(metricsEnv({ APP_HMAC_SECRET: secret }));
+    const store = createMetricsStore({
+      salt: cfg.metrics.salt,
+      accountSalt: cfg.metrics.accountSalt,
+      dataPath: null,
+    });
+    const app = createApp(cfg, {
+      fetch: async () => jsonResponse(200, {}),
+      metrics: store,
+      crashReports: createCrashReportStore({ dataPath: crashPath }),
+    });
+    return { app, store };
+  };
+  try {
+    let setup = makeServer();
+    const old1 = makeCrashReport({ id: "11111111-1234-4234-8234-123456789abc", build: 222, sdk: 30 });
+    const old2 = makeCrashReport({ id: "22222222-1234-4234-8234-123456789abc", build: 223, sdk: 33 });
+    const current = makeCrashReport({ id: "33333333-1234-4234-8234-123456789abc", build: 225, sdk: 35 });
+
+    await withServer(setup.app, async baseUrl => {
+      for (const r of [old1, old2, current]) {
+        assert.equal((await httpRequest(baseUrl, "POST", "/v1/metrics/crash", r, {
+          headers: signedHeaders({ secret, method: "POST", path: "/v1/metrics/crash", bodyObject: r }),
+        })).status, 204);
+      }
+
+      // Batch dismiss invalidates bad signatures and accepts valid arrays.
+      assert.equal((await httpRequest(baseUrl, "POST", "/v1/metrics/crash/dismiss", { signatures: [] }, auth)).status, 400);
+      assert.equal((await httpRequest(baseUrl, "POST", "/v1/metrics/crash/dismiss", { signatures: ["bad"] }, auth)).status, 400);
+
+      // min-build requires admin auth and integer validation.
+      assert.equal((await httpRequest(baseUrl, "POST", "/v1/metrics/crash/min-build", { minBuild: 224 })).status, 401);
+      assert.equal((await httpRequest(baseUrl, "POST", "/v1/metrics/crash/min-build", { minBuild: -1 }, auth)).status, 400);
+      assert.equal((await httpRequest(baseUrl, "POST", "/v1/metrics/crash/min-build", { minBuild: 224 }, auth)).status, 204);
+
+      const filtered = await httpRequest(baseUrl, "GET", "/v1/metrics/stats", undefined, auth);
+      assert.equal(filtered.body.crashReportsMinBuild, 224);
+      assert.equal(filtered.body.crashReports.length, 1);
+      assert.equal(filtered.body.crashReports[0].build, 225);
+      assert.equal(filtered.body.crashReportsHidden, 2);
+
+      // New crash arriving on an old build stays hidden below minBuild.
+      const oldRetry = makeCrashReport({ id: "44444444-1234-4234-8234-123456789abc", build: 222, sdk: 31 });
+      assert.equal((await httpRequest(baseUrl, "POST", "/v1/metrics/crash", oldRetry, {
+        headers: signedHeaders({ secret, method: "POST", path: "/v1/metrics/crash", bodyObject: oldRetry }),
+      })).status, 204);
+      const stillFiltered = await httpRequest(baseUrl, "GET", "/v1/metrics/stats", undefined, auth);
+      assert.equal(stillFiltered.body.crashReports.length, 1);
+      assert.equal(stillFiltered.body.crashReportsHidden, 3);
+
+      const allBuilds = await httpRequest(baseUrl, "GET", "/v1/metrics/stats?allBuilds=1", undefined, auth);
+      assert.equal(allBuilds.body.crashReports.length, 4);
+
+      // Batch dismiss remaining signatures on old1 & old2 after resetting minBuild.
+      assert.equal((await httpRequest(baseUrl, "POST", "/v1/metrics/crash/min-build", { minBuild: 0 }, auth)).status, 204);
+      const sigs = allBuilds.body.crashReports.filter(r => r.build < 225).map(r => r.signature);
+      assert.equal(sigs.length, 3);
+      assert.equal((await httpRequest(baseUrl, "POST", "/v1/metrics/crash/dismiss", { signatures: sigs }, auth)).status, 204);
+      const afterBatch = await httpRequest(baseUrl, "GET", "/v1/metrics/stats", undefined, auth);
+      assert.equal(afterBatch.body.crashReports.length, 1);
+      assert.equal(afterBatch.body.crashReports[0].build, 225);
+
+      // Re-apply minBuild=224 and verify persistence across restart.
+      assert.equal((await httpRequest(baseUrl, "POST", "/v1/metrics/crash/min-build", { minBuild: 224 }, auth)).status, 204);
+    });
+    setup.store.close();
+    setup.app.locals.crashReports.close();
+
+    setup = makeServer();
+    await withServer(setup.app, async baseUrl => {
+      const reloaded = await httpRequest(baseUrl, "GET", "/v1/metrics/stats", undefined, auth);
+      assert.equal(reloaded.body.crashReportsMinBuild, 224);
+      assert.equal(reloaded.body.crashReports.length, 1);
+      assert.equal(reloaded.body.crashReports[0].build, 225);
+    });
+    setup.store.close();
+    setup.app.locals.crashReports.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("crash schema rejects unknown fields, unsafe frames, and unbounded traces", () => {
@@ -3228,6 +3322,62 @@ test("dashboard crash details render untrusted strings only as text", () => {
   assert.match(details.children[2].textContent, /Example\.kt:42/);
   render([]);
   assert.match(container.children.at(-1).textContent, /No crash details received/);
+});
+
+test("dashboard crash reports collapse matching normalized stacks across builds and SDKs", () => {
+  const html = readFileSync(new URL("./dashboard.html", import.meta.url), "utf8");
+  function node() {
+    return {
+      children: [], style: {}, textContent: "",
+      append(...children) { this.children.push(...children); },
+      set innerHTML(_value) { throw new Error("Crash details must use textContent"); },
+    };
+  }
+  const container = node();
+  const document = { getElementById: () => container, createElement: node };
+  const start = html.indexOf("function showCrashReports(");
+  const end = html.indexOf("function renderEndpointHealthTable(", start);
+  const render = runInNewContext(html.slice(start, end) + ";showCrashReports", { document });
+  const now = Date.UTC(2026, 10, 21, 5, 0, 0);
+  render([
+    makeCrashReport({
+      signature: "a".repeat(64),
+      build: 222,
+      sdk: 30,
+      abi: "armeabi-v7a",
+      liveEnginePreference: "exo",
+      count: 4,
+      lastSeen: now,
+      exceptions: [{ type: "java.lang.NoClassDefFoundError", frames: [
+        { class: "com.xtrakick.app.Repo", method: "load", file: "r8-map-id-1111aaaa", line: 27 },
+      ] }],
+    }),
+    makeCrashReport({
+      signature: "b".repeat(64),
+      build: 223,
+      sdk: 33,
+      abi: "arm64-v8a",
+      liveEnginePreference: "ivs",
+      count: 6,
+      lastSeen: now + 1000,
+      exceptions: [{
+        type: "java.lang.NoClassDefFoundError",
+        message: "Failed resolution of: Landroid/net/http/HttpEngine;",
+        frames: [{ class: "com.xtrakick.app.Repo", method: "load", file: "r8-map-id-2222bbbb", line: 27 }],
+      }],
+    }),
+  ]);
+  // One note + one merged <details> card.
+  assert.equal(container.children.length, 2);
+  const details = container.children[1];
+  assert.match(details.children[0].textContent, /b223, b222/);
+  assert.match(details.children[0].textContent, /API 33, 30/);
+  assert.match(details.children[0].textContent, /10 report\(s\)/);
+  assert.match(details.children[2].textContent, /Failed resolution of: Landroid\/net\/http\/HttpEngine;/);
+
+  container.children.length = 0;
+  render([], false, 3, 224);
+  assert.match(container.children.at(-1).textContent, /hidden by dismissals or the build filter/i);
 });
 
 test("push dashboard reports observed health, session scope, and Firebase acceptance", () => {

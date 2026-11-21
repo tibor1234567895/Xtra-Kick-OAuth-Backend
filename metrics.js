@@ -369,7 +369,7 @@ export function createMetricsStore(options = {}) {
     return true;
   }
 
-  function recordPing({ pidHash, version, clientEpoch, os, cc, sessions, accountAid, geoCountry, pe, c, wt, si, se }, now = new Date()) {
+  function recordPing({ pidHash, version, build, clientEpoch, os, cc, sessions, accountAid, geoCountry, pe, c, wt, si, se }, now = new Date()) {
     if (typeof pidHash !== "string" || !/^[0-9a-f]{64}$/.test(pidHash)) {
       throw new Error("recordPing: invalid pidHash");
     }
@@ -384,6 +384,7 @@ export function createMetricsStore(options = {}) {
       }
     }
     const safeVersion = String(version || "").slice(0, 32) || "unknown";
+    const safeBuild = Number.isInteger(build) && build >= 1 && build <= 2_147_483_647 ? build : null;
     const safeOs = typeof os === "string" && /^\d{1,3}$/.test(os) ? os.slice(0, 3) : null;
     const safeCc = typeof cc === "string" && /^[A-Za-z]{2}$/.test(cc) ? cc.toUpperCase() : null;
     const safeGeo = typeof geoCountry === "string" && /^[A-Za-z]{2}$/.test(geoCountry) ? geoCountry.toUpperCase() : null;
@@ -420,7 +421,11 @@ export function createMetricsStore(options = {}) {
     const dayBit = 1 << (dayIndexUtc(now) - 1);
     if (existing) {
       existing.d |= dayBit;
-      if (safeVersion) existing.v = safeVersion;
+      if (safeVersion) {
+        if (safeBuild === null && safeVersion !== existing.v) delete existing.b;
+        existing.v = safeVersion;
+      }
+      if (safeBuild !== null) existing.b = safeBuild;
       if (safeOs) existing.os = safeOs;
       if (safeCc) existing.cc = safeCc;
       if (safeGeo) existing.gc = safeGeo;
@@ -460,6 +465,7 @@ export function createMetricsStore(options = {}) {
       return { isNewInstall: false, month: serverEpoch };
     }
     const entry = { v: safeVersion, d: dayBit, t: dayKey(now) };
+    if (safeBuild !== null) entry.b = safeBuild;
     if (safeOs) entry.os = safeOs;
     if (safeCc) entry.cc = safeCc;
     if (safeGeo) entry.gc = safeGeo;
@@ -685,6 +691,7 @@ export function createMetricsStore(options = {}) {
     let newToday = 0;
     let sessionsToday = 0;
     const versions = Object.create(null);
+    const buildCounts = Object.create(null);
     const osCounts = Object.create(null);
     const countryCounts = Object.create(null);
     const geoCountryCounts = Object.create(null);
@@ -699,6 +706,8 @@ export function createMetricsStore(options = {}) {
       }
       const v = entry.v || "unknown";
       versions[v] = (versions[v] || 0) + 1;
+      const buildKey = entry.b ? `${v} (b${entry.b})` : `${v} (legacy)`;
+      buildCounts[buildKey] = (buildCounts[buildKey] || 0) + 1;
       const osKey = entry.os || "unknown";
       osCounts[osKey] = (osCounts[osKey] || 0) + 1;
       const ccKey = entry.cc || "unknown";
@@ -754,6 +763,7 @@ export function createMetricsStore(options = {}) {
       versions: Object.entries(versions)
         .map(([version, count]) => ({ version, count }))
         .sort((a, b) => b.count - a.count),
+      builds: toRanked(buildCounts),
       os: toRanked(osCounts),
       countries: toRanked(countryCounts),
       geoCountries: toRanked(geoCountryCounts),

@@ -754,6 +754,7 @@
       const AUTO_MS = 60_000;
       const ROUTE_STATS = "/v1/metrics/stats";
       const ROUTE_CRASH_DISMISS = "/v1/metrics/crash/dismiss";
+      const ROUTE_CRASH_MIN_BUILD = "/v1/metrics/crash/min-build";
 
       const root = document.getElementById("root");
       const navTabs = document.getElementById("navTabs");
@@ -1090,7 +1091,7 @@
         if (state.activeTab === "overview") {
           drawChart(d);
           bindOverviewControls(d);
-          showCrashReports(d.crashReports, d.crashReportsUnavailable, d.crashReportsHidden);
+          showCrashReports(d.crashReports, d.crashReportsUnavailable, d.crashReportsHidden, d.crashReportsMinBuild);
         } else if (state.activeTab === "ops") {
           bindOpsControls(d);
         }
@@ -1782,23 +1783,35 @@
         `;
       }
 
-      async function dismissCrashReport(signature, btn) {
+      async function dismissCrashReport(signatures, btn) {
+        const list = (Array.isArray(signatures) ? signatures : [signatures]).filter(Boolean);
+        if (!list.length) return;
         if (btn) btn.disabled = true;
         if (state.demo) {
-          if (state.lastData && Array.isArray(state.lastData.crashReports)) {
-            state.lastData.crashReports = state.lastData.crashReports.filter(r => r.signature !== signature);
+          if (state.lastData) {
+            if (!state.demoCrashReports) {
+              state.demoCrashReports = Array.isArray(state.lastData.crashReports) ? state.lastData.crashReports.slice() : [];
+            }
+            const drop = new Set(list);
+            state.demoCrashReports = state.demoCrashReports.filter(r => !drop.has(r.signature));
+            const floor = state.lastData.crashReportsMinBuild || 0;
+            state.lastData.crashReports = state.demoCrashReports.filter(r => (r.build || 0) >= floor);
             render(state.lastData);
           }
           return;
         }
         try {
-          const res = await fetch(ROUTE_CRASH_DISMISS, {
-            method: "POST",
-            headers: { Authorization: "Bearer " + state.token, "Content-Type": "application/json" },
-            body: JSON.stringify({ signature }),
-          });
-          if (res.status === 401) throw new Error("Invalid admin token (401)");
-          if (!res.ok) throw new Error("HTTP " + res.status);
+          for (let i = 0; i < list.length; i += 50) {
+            const chunk = list.slice(i, i + 50);
+            const payload = chunk.length === 1 ? { signature: chunk[0] } : { signatures: chunk };
+            const res = await fetch(ROUTE_CRASH_DISMISS, {
+              method: "POST",
+              headers: { Authorization: "Bearer " + state.token, "Content-Type": "application/json" },
+              body: JSON.stringify(payload),
+            });
+            if (res.status === 401) throw new Error("Invalid admin token (401)");
+            if (!res.ok) throw new Error("HTTP " + res.status);
+          }
           await load();
         } catch (err) {
           if (btn) btn.disabled = false;
@@ -1806,52 +1819,167 @@
         }
       }
 
-      function showCrashReports(reports, unavailable, hiddenCount) {
+      async function setCrashMinBuild(minBuild, btn) {
+        if (btn) btn.disabled = true;
+        if (state.demo) {
+          if (state.lastData) {
+            if (!state.demoCrashReports) {
+              state.demoCrashReports = Array.isArray(state.lastData.crashReports) ? state.lastData.crashReports.slice() : [];
+            }
+            state.lastData.crashReportsMinBuild = minBuild;
+            state.lastData.crashReports = state.demoCrashReports.filter(r => (r.build || 0) >= minBuild);
+            state.lastData.crashReportsHidden = Math.max(0, state.demoCrashReports.length - state.lastData.crashReports.length);
+            render(state.lastData);
+          }
+          return;
+        }
+        try {
+          const res = await fetch(ROUTE_CRASH_MIN_BUILD, {
+            method: "POST",
+            headers: { Authorization: "Bearer " + state.token, "Content-Type": "application/json" },
+            body: JSON.stringify({ minBuild }),
+          });
+          if (res.status === 401) throw new Error("Invalid admin token (401)");
+          if (!res.ok) throw new Error("HTTP " + res.status);
+          await load();
+        } catch (err) {
+          if (btn) btn.disabled = false;
+          setStatus("err", "Min build update failed");
+        }
+      }
+
+      function showCrashReports(reports, unavailable, hiddenCount, minBuild = 0) {
         const container = document.getElementById("crashReports");
         if (!container) return;
         if (unavailable) {
           container.textContent = "Crash report storage is unavailable. Other telemetry is still available.";
           return;
         }
+        const activeMinBuild = Number.isInteger(minBuild) && minBuild > 0 ? minBuild : 0;
         const note = document.createElement("p");
         note.style.cssText = "font-size:11px;color:var(--muted);";
-        note.textContent = `Crash details received in the last 90 days (up to 200 groups${hiddenCount ? `, ${hiddenCount} hidden` : ""}). Reporting is enabled by default and can be disabled in the app. Counts above come from daily pings and may differ. Expand a report to inspect its stack frames. Dismissed groups reappear automatically if the same crash recurs. Diagnostic logs are excluded; exception messages (when present) are sanitized in the app.`;
+        const minBuildSuffix = activeMinBuild > 0 ? `, hiding builds < b${activeMinBuild}` : "";
+        note.textContent = `Crash details received in the last 90 days (up to 200 groups${hiddenCount ? `, ${hiddenCount} hidden` : ""}${minBuildSuffix}). Reporting is enabled by default and can be disabled in the app. Counts above come from daily pings and may differ. Expand a report to inspect its stack frames. Dismissed groups reappear automatically if the same crash recurs. Diagnostic logs are excluded; exception messages (when present) are sanitized in the app.`;
         container.append(note);
+        if (activeMinBuild > 0 && typeof setCrashMinBuild === "function") {
+          const filterBar = document.createElement("div");
+          filterBar.style.cssText = "display:flex;align-items:center;gap:8px;margin:4px 0 8px;font-size:11px;color:var(--muted);";
+          const label = document.createElement("span");
+          label.textContent = `Build filter active: hiding b < ${activeMinBuild}`;
+          const resetBtn = document.createElement("button");
+          resetBtn.type = "button";
+          resetBtn.textContent = "Show all builds";
+          resetBtn.style.cssText = "font-size:11px;padding:2px 8px;";
+          resetBtn.addEventListener?.("click", () => setCrashMinBuild(0, resetBtn));
+          filterBar.append(label, resetBtn);
+          container.append(filterBar);
+        }
         if (!Array.isArray(reports) || !reports.length) {
           const empty = document.createElement("p");
-          empty.textContent = "No crash details received. Reporting requires a supporting app update and enabled crash reporting and usage statistics; older crash counts have no stored stack trace.";
+          empty.textContent = (hiddenCount || activeMinBuild > 0)
+            ? "All stored crash reports are currently hidden by dismissals or the build filter."
+            : "No crash details received. Reporting requires a supporting app update and enabled crash reporting and usage statistics; older crash counts have no stored stack trace.";
           empty.style.cssText = "font-size:12px;color:var(--muted);";
           container.append(empty);
           return;
         }
+
+        function normalizeStackKey(exceptions) {
+          return JSON.stringify((exceptions || []).map(ex => ({
+            t: ex?.type || "",
+            f: (ex?.frames || []).map(fr => ({
+              c: fr?.class || "",
+              m: fr?.method || "",
+              f: /^r8-map-id-[0-9a-f]+$/i.test(fr?.file || "") ? "r8" : (fr?.file || ""),
+              l: fr?.line,
+            })),
+          })));
+        }
+
+        const groupsByKey = new Map();
         for (const report of reports) {
+          const key = normalizeStackKey(report.exceptions);
+          let group = groupsByKey.get(key);
+          if (!group) {
+            const exceptions = report.exceptions || [];
+            group = {
+              signatures: new Set(),
+              totalCount: 0,
+              lastSeen: 0,
+              crashedAt: 0,
+              versions: new Set(),
+              builds: new Set(),
+              sdks: new Set(),
+              abis: new Set(),
+              engines: new Set(),
+              exceptions,
+              hasMessage: exceptions.some(e => Boolean(e?.message)),
+              maxBuild: 0,
+            };
+            groupsByKey.set(key, group);
+          }
+          if (report.signature) group.signatures.add(report.signature);
+          group.totalCount += report.count || 1;
+          group.lastSeen = Math.max(group.lastSeen, report.lastSeen || 0);
+          group.crashedAt = Math.max(group.crashedAt, report.crashedAt || 0);
+          if (report.version) group.versions.add(report.version);
+          if (Number.isInteger(report.build) && report.build > 0) {
+            group.builds.add(report.build);
+            group.maxBuild = Math.max(group.maxBuild, report.build);
+          }
+          if (Number.isInteger(report.sdk) && report.sdk > 0) group.sdks.add(report.sdk);
+          group.abis.add(report.abi || "unknown");
+          group.engines.add(report.liveEnginePreference || "unknown");
+          if (!group.hasMessage && (report.exceptions || []).some(e => Boolean(e?.message))) {
+            group.exceptions = report.exceptions;
+            group.hasMessage = true;
+          }
+        }
+
+        const groups = Array.from(groupsByKey.values()).sort((a, b) => b.lastSeen - a.lastSeen);
+        for (const group of groups) {
+          const signatures = Array.from(group.signatures);
+          const builds = Array.from(group.builds).sort((a, b) => b - a);
+          const sdks = Array.from(group.sdks).sort((a, b) => b - a);
           const details = document.createElement("details");
           details.style.cssText = "border-top:1px solid var(--border-subtle);padding:10px 0;font-size:12px;";
           const summary = document.createElement("summary");
           summary.style.cssText = "cursor:pointer;overflow-wrap:anywhere;";
-          summary.textContent = `${report.exceptions?.[0]?.type || "Exception"} · v${report.version} (${report.build}) · API ${report.sdk} · ${report.count} report(s)`;
+          const versionText = Array.from(group.versions, v => `v${v}`).join("/") || "v?";
+          const buildText = builds.length ? ` (${builds.map(b => `b${b}`).join(", ")})` : "";
+          const sdkText = sdks.length ? `API ${sdks.join(", ")}` : "API ?";
+          summary.textContent = `${group.exceptions?.[0]?.type || "Exception"} · ${versionText}${buildText} · ${sdkText} · ${group.totalCount} report(s)`;
           const received = document.createElement("span");
           received.style.cssText = "display:block;margin-top:4px;font-size:11px;color:var(--muted);";
-          received.textContent = `Last received: ${new Date(report.lastSeen).toLocaleString(undefined, { timeZoneName: "short" })}`;
+          received.textContent = `Last received: ${new Date(group.lastSeen).toLocaleString(undefined, { timeZoneName: "short" })}`;
           summary.append(received);
           const metadata = document.createElement("p");
-          metadata.textContent = `CPU architecture: ${report.abi || "unknown"} · Live engine preference: ${report.liveEnginePreference || "unknown"} · Last crash: ${new Date(report.crashedAt).toISOString()} · Last received: ${new Date(report.lastSeen).toISOString()}`;
+          metadata.textContent = `CPU architecture: ${Array.from(group.abis).join(", ") || "unknown"} · Live engine preference: ${Array.from(group.engines).join(", ") || "unknown"} · Last crash: ${new Date(group.crashedAt).toISOString()} · Last received: ${new Date(group.lastSeen).toISOString()}`;
           const stack = document.createElement("pre");
           stack.style.cssText = "white-space:pre-wrap;overflow-wrap:anywhere;font-size:11px;max-height:320px;overflow:auto;";
-          stack.textContent = (report.exceptions || []).map((exception, index) =>
+          stack.textContent = (group.exceptions || []).map((exception, index) =>
             (index ? "Caused by: " : "") + exception.type + (exception.message ? `: ${exception.message}` : "") + "\n" +
             exception.frames.map(frame => `    at ${frame.class}.${frame.method}(${frame.file}:${frame.line})`).join("\n")
           ).join("\n");
           const actions = document.createElement("div");
-          actions.style.cssText = "margin-top:6px;";
-          if (typeof dismissCrashReport === "function") {
+          actions.style.cssText = "margin-top:6px;display:flex;gap:8px;flex-wrap:wrap;";
+          if (typeof dismissCrashReport === "function" && signatures.length) {
             const dismissBtn = document.createElement("button");
             dismissBtn.type = "button";
-            dismissBtn.textContent = "Dismiss";
+            dismissBtn.textContent = signatures.length > 1 ? `Dismiss (${signatures.length})` : "Dismiss";
             dismissBtn.title = "Hide this crash group. It reappears automatically if the same crash recurs.";
             dismissBtn.style.cssText = "font-size:11px;padding:2px 10px;";
-            dismissBtn.addEventListener?.("click", () => dismissCrashReport(report.signature, dismissBtn));
+            dismissBtn.addEventListener?.("click", () => dismissCrashReport(signatures, dismissBtn));
             actions.append(dismissBtn);
+          }
+          if (typeof setCrashMinBuild === "function" && group.maxBuild > 0) {
+            const hideBuildBtn = document.createElement("button");
+            hideBuildBtn.type = "button";
+            hideBuildBtn.textContent = `Hide builds ≤ b${group.maxBuild}`;
+            hideBuildBtn.title = "Permanently hide crashes from this build and older until reset.";
+            hideBuildBtn.style.cssText = "font-size:11px;padding:2px 10px;";
+            hideBuildBtn.addEventListener?.("click", () => setCrashMinBuild(group.maxBuild + 1, hideBuildBtn));
+            actions.append(hideBuildBtn);
           }
           details.append(summary, metadata, stack, actions);
           container.append(details);
@@ -1988,19 +2116,34 @@
 
       function renderDistTabs(d) {
         const versions = (d.versions || []).slice(0, 6);
+        const allBuilds = d.builds || [];
+        const trackedBuilds = [];
+        const legacyBuilds = [];
+        for (const b of allBuilds) {
+          if (String(b.label || "").endsWith("(legacy)")) legacyBuilds.push(b);
+          else trackedBuilds.push(b);
+        }
+        const builds = trackedBuilds.concat(legacyBuilds).slice(0, 8);
         const os = (d.os || []).slice(0, 6);
         const countryList = state.countryMode === "locale" ? (d.countries || []) : (d.geoCountries || d.countries || []);
         const countries = countryList.slice(0, 8);
 
         const totalV = versions.reduce((a, b) => a + (b.count || 0), 0) || 1;
+        const totalB = builds.reduce((a, b) => a + (b.count || 0), 0) || 1;
         const totalO = os.reduce((a, b) => a + (b.count || 0), 0) || 1;
         const totalC = countries.reduce((a, b) => a + (b.count || 0), 0) || 1;
+        const hasTrackedBuilds = trackedBuilds.length > 0;
 
         return `
           <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
             ${renderDistTable("App versions", "Version", versions, totalV, v => "v" + v.version)}
             ${renderDistTable("Android versions", "API Level", os, totalO, o => o.label === "unknown" ? "unknown" : "API " + o.label)}
           </div>
+          ${hasTrackedBuilds ? `
+            <div style="margin-top:16px;padding-top:12px;border-top:1px solid var(--border-subtle);">
+              ${renderDistTable("Build rollout", "Build", builds, totalB, b => "v" + b.label)}
+            </div>
+          ` : ""}
 
           <div style="margin-top:16px;padding-top:12px;border-top:1px solid var(--border-subtle);">
             <div style="font-size:12px;font-weight:500;color:var(--fg-dim);margin-bottom:8px;">
@@ -2385,6 +2528,11 @@
             { version: "2.51.0", count: 540 },
             { version: "2.50.0", count: 180 },
           ],
+          builds: [
+            { label: "2.54.0 (b225)", count: 5100 },
+            { label: "2.54.0 (b224)", count: 2020 },
+            { label: "2.53.1 (legacy)", count: 3450 },
+          ],
           os: [
             { label: "36", count: 6120 },
             { label: "35", count: 4280 },
@@ -2510,6 +2658,7 @@
           }
         };
 
+        state.demoCrashReports = null;
         state.lastData = demoData;
         setStatus("ok", "Demo Mode");
         render(demoData);

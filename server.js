@@ -117,6 +117,7 @@ export const KNOWN_ENDPOINTS = new Set([
   "POST /v1/metrics/ping",
   "POST /v1/metrics/crash",
   "POST /v1/metrics/crash/dismiss",
+  "POST /v1/metrics/crash/min-build",
   "GET /v1/metrics/stats",
   "GET /v1/metrics/dashboard",
   "GET /v1/metrics/dashboard/v2",
@@ -279,15 +280,23 @@ export function createApp(config, deps = {}) {
     });
     app.get("/v1/metrics/stats", requireAdminToken(config.metrics), statsHandler(metrics, fcmStore, pusherRelay, liveStreamPoller, crashReports, kickWebhookHandler));
     app.post("/v1/metrics/crash/dismiss", createLimiter(10), requireAdminToken(config.metrics), (req, res) => {
-      const signature = typeof req.body?.signature === "string" ? req.body.signature : "";
-      if (!/^[0-9a-f]{64}$/.test(signature)) {
-        return res.status(400).json({ code: "invalid_crash_signature" });
-      }
+      const signatures = Array.isArray(req.body?.signatures)
+        ? req.body.signatures
+        : (typeof req.body?.signature === "string" ? [req.body.signature] : null);
       try {
-        crashReports.dismiss(signature);
+        crashReports.dismissMany(signatures);
         return res.status(204).end();
       } catch (error) {
         if (error.status === 400) return res.status(400).json({ code: "invalid_crash_signature" });
+        return res.status(503).json({ code: "crash_report_unavailable" });
+      }
+    });
+    app.post("/v1/metrics/crash/min-build", createLimiter(10), requireAdminToken(config.metrics), (req, res) => {
+      try {
+        crashReports.setMinBuild(req.body?.minBuild);
+        return res.status(204).end();
+      } catch (error) {
+        if (error.status === 400) return res.status(400).json({ code: "invalid_min_build" });
         return res.status(503).json({ code: "crash_report_unavailable" });
       }
     });
@@ -368,6 +377,7 @@ const introspectSchema = z.object({
 const pingSchema = z.object({
   pid: z.string().regex(/^[0-9a-f]{64}$/),
   v: z.string().min(1).max(32).regex(/^[A-Za-z0-9._\-+ ]*$/),
+  b: z.number().int().min(1).max(2_147_483_647).optional(),
   os: z.string().regex(/^\d{1,3}$/).optional(),
   cc: z.string().regex(/^[A-Za-z]{2}$/).optional(),
   s: z.number().int().min(0).max(100_000).optional(),
@@ -1266,6 +1276,7 @@ function pingHandler(metrics, lookupCountry) {
         {
           pidHash,
           version: parsed.data.v,
+          build: parsed.data.b,
           clientEpoch: month,
           os: parsed.data.os,
           cc: parsed.data.cc,
@@ -1317,8 +1328,10 @@ function statsHandler(metrics, fcmStore, pusherRelay, liveStreamPoller, crashRep
     const payload = await metrics.computeStats(new Date(), days, { fcm, system });
     res.setHeader("Cache-Control", "no-store");
     try {
-      payload.crashReports = crashReports.list();
+      const includeBelowMinBuild = req.query.allBuilds === "1" || req.query.allBuilds === "true";
+      payload.crashReports = crashReports.list(Date.now(), { includeBelowMinBuild });
       payload.crashReportsHidden = Math.max(0, crashReports.count() - payload.crashReports.length);
+      payload.crashReportsMinBuild = crashReports.minBuild();
     } catch {
       payload.crashReports = [];
       payload.crashReportsUnavailable = true;

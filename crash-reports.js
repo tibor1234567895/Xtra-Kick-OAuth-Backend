@@ -28,13 +28,16 @@ export const crashReportSchema = z.object({
 }).strict();
 
 export function createCrashReportStore({ dataPath = null } = {}) {
-  let state = { reports: [], events: [], dismissed: {} };
+  let state = { reports: [], events: [], dismissed: {}, minBuild: 0 };
   let loadFailed = false;
   if (dataPath && existsSync(dataPath)) {
     try {
       const parsed = JSON.parse(readFileSync(dataPath, "utf8"));
       if (!Array.isArray(parsed.reports) || !Array.isArray(parsed.events)) throw new Error("Invalid crash report store");
-      state = { dismissed: {}, ...parsed };
+      const parsedMinBuild = Number.isInteger(parsed.minBuild) && parsed.minBuild >= 0 && parsed.minBuild <= 2_147_483_647
+        ? parsed.minBuild
+        : 0;
+      state = { dismissed: {}, ...parsed, minBuild: parsedMinBuild };
     } catch {
       loadFailed = true;
     }
@@ -67,6 +70,7 @@ export function createCrashReportStore({ dataPath = null } = {}) {
         .map(r => ({ ...r, ...counts.get(r.signature) })),
       events,
       dismissed,
+      minBuild: state.minBuild || 0,
     };
   }
 
@@ -114,15 +118,36 @@ export function createCrashReportStore({ dataPath = null } = {}) {
   // group reappears on its own ("show again if it happens again"). Because the
   // signature covers version and build, the same stack on a new build is a new
   // group and is never affected by an old dismissal.
-  function dismiss(signature, now = Date.now()) {
+  function dismissMany(signatures, now = Date.now()) {
     if (loadFailed) throw new Error("Crash report storage unavailable");
-    if (typeof signature !== "string" || !/^[0-9a-f]{64}$/.test(signature)) {
+    if (!Array.isArray(signatures) || signatures.length < 1 || signatures.length > 50 ||
+        signatures.some(s => typeof s !== "string" || !/^[0-9a-f]{64}$/.test(s))) {
       const error = new Error("Invalid signature");
       error.status = 400;
       throw error;
     }
     const next = pruned(now);
-    next.dismissed = { ...next.dismissed, [signature]: now };
+    const dismissed = { ...next.dismissed };
+    for (const signature of signatures) {
+      dismissed[signature] = now;
+    }
+    next.dismissed = dismissed;
+    save(next);
+  }
+
+  function dismiss(signature, now = Date.now()) {
+    dismissMany([signature], now);
+  }
+
+  function setMinBuild(minBuild, now = Date.now()) {
+    if (loadFailed) throw new Error("Crash report storage unavailable");
+    if (!Number.isInteger(minBuild) || minBuild < 0 || minBuild > 2_147_483_647) {
+      const error = new Error("Invalid minBuild");
+      error.status = 400;
+      throw error;
+    }
+    const next = pruned(now);
+    next.minBuild = minBuild;
     save(next);
   }
 
@@ -134,17 +159,24 @@ export function createCrashReportStore({ dataPath = null } = {}) {
   return {
     record,
     dismiss,
+    dismissMany,
+    setMinBuild,
+    minBuild() {
+      if (loadFailed) throw new Error("Crash report storage unavailable");
+      return state.minBuild || 0;
+    },
     count(now = Date.now()) {
       if (loadFailed) throw new Error("Crash report storage unavailable");
       prune(now);
       return state.reports.length;
     },
-    list(now = Date.now()) {
+    list(now = Date.now(), { includeBelowMinBuild = false } = {}) {
       if (loadFailed) throw new Error("Crash report storage unavailable");
       prune(now);
       const dismissed = state.dismissed || {};
+      const floor = includeBelowMinBuild ? 0 : (state.minBuild || 0);
       return state.reports.slice().reverse()
-        .filter(r => !(dismissed[r.signature] && r.lastSeen <= dismissed[r.signature]));
+        .filter(r => !(dismissed[r.signature] && r.lastSeen <= dismissed[r.signature]) && r.build >= floor);
     },
     close() { clearInterval(timer); },
   };
