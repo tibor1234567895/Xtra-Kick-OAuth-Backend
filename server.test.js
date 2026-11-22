@@ -543,6 +543,10 @@ test("ping silently drops emulator user-agents without inflating installs", asyn
   assert.equal(stats.totalInstalls, 1);
   assert.equal(stats.mau, 1);
   assert.equal(stats.counters.today.ping.filtered_emulator, 1);
+  const todayPoint = stats.dauSeries[stats.dauSeries.length - 1];
+  assert.equal(todayPoint.filteredEmulator, 1);
+  assert.equal(todayPoint.filteredBurst, 0);
+  assert.equal(todayPoint.filtered, 1);
   store.close();
 });
 

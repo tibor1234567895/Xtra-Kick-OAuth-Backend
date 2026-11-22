@@ -30,6 +30,9 @@
         --accent: #38bdf8;
         --accent-soft: rgba(56, 189, 248, 0.12);
         --bar-ret: #334155;
+        --bar-bot-bg: rgba(148, 163, 184, 0.14);
+        --bar-bot-stripe: rgba(148, 163, 184, 0.36);
+        --bar-bot-stroke: rgba(148, 163, 184, 0.45);
         --trend: #f8fafc;
         --good: #4cc38a;
         --good-soft: rgba(76, 195, 138, 0.12);
@@ -54,6 +57,9 @@
         --accent: #0284c7;
         --accent-soft: rgba(2, 132, 199, 0.10);
         --bar-ret: #cbd5e1;
+        --bar-bot-bg: rgba(100, 116, 139, 0.10);
+        --bar-bot-stripe: rgba(100, 116, 139, 0.30);
+        --bar-bot-stroke: rgba(100, 116, 139, 0.42);
         --trend: #0f172a;
         --good: #16a34a;
         --good-soft: rgba(22, 163, 74, 0.10);
@@ -151,6 +157,10 @@
         height: 28px;
         padding: 0 8px;
         font-size: 12px;
+        white-space: nowrap;
+        flex-shrink: 0;
+        width: auto;
+        min-width: max-content;
       }
 
       /* Top Navigation Bar */
@@ -182,6 +192,8 @@
         display: flex;
         align-items: center;
         gap: 12px;
+        white-space: nowrap;
+        flex-shrink: 0;
       }
       .brand-title {
         display: flex;
@@ -229,6 +241,7 @@
         border: 1px solid var(--border);
         border-radius: var(--radius-control);
         padding: 2px;
+        flex-shrink: 0;
       }
       .tab-btn {
         background: transparent;
@@ -239,6 +252,7 @@
         font-weight: 500;
         color: var(--muted);
         cursor: pointer;
+        white-space: nowrap;
         transition: all 140ms var(--ease);
       }
       .tab-btn:hover {
@@ -258,6 +272,7 @@
         align-items: center;
         gap: 8px;
         position: relative;
+        flex-shrink: 0;
       }
 
       /* Token Popover */
@@ -398,6 +413,10 @@
       }
       .legend-item { display: inline-flex; align-items: center; gap: 6px; }
       .legend-swatch { width: 8px; height: 8px; border-radius: 2px; }
+      .swatch-filtered {
+        background: repeating-linear-gradient(-45deg, var(--bar-bot-stripe), var(--bar-bot-stripe) 2px, var(--bar-bot-bg) 2px, var(--bar-bot-bg) 4px);
+        border: 1px dashed var(--bar-bot-stroke);
+      }
 
       .tooltip {
         position: absolute;
@@ -567,7 +586,7 @@
       /* Diagnostic counters */
       .diag-grid {
         display: grid;
-        grid-template-columns: repeat(4, 1fr);
+        grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
         gap: 8px;
         margin-top: 12px;
       }
@@ -638,9 +657,13 @@
         .grid-split { grid-template-columns: 1fr; }
         .diag-grid { grid-template-columns: repeat(2, 1fr); }
       }
-      @media (max-width: 768px) {
+      @media (max-width: 1120px) {
         .topbar { position: sticky; height: auto; }
-        .topbar-inner { padding: 0 16px; height: auto; flex-wrap: wrap; padding-block: 10px; gap: 10px; }
+        .topbar-inner { height: auto; flex-wrap: wrap; padding-block: 10px; gap: 10px; }
+        .container { padding-top: 20px; }
+      }
+      @media (max-width: 768px) {
+        .topbar-inner { padding: 10px 16px; }
         .container { padding: 16px; }
         .kpi-grid { grid-template-columns: 1fr; }
         .chart-legend { flex-wrap: wrap; gap: 12px; }
@@ -790,8 +813,9 @@
         autoTimer: null,
         countdownTimer: null,
         activeTab: storage.get(KV.tab) || "overview",
-        chartSplit: true,
+        chartMode: "all",
         chartTrend: true,
+        chartFiltered: true,
         healthRange: "week",
         countryMode: "geo",
         retExpanded: false,
@@ -1190,14 +1214,23 @@
             <div class="panel-header">
               <div>
                 <h2 class="panel-title">Daily Active Devices</h2>
-                <div class="panel-sub">
+                <div class="panel-sub" id="chartSubtitle">
                   Returning devices vs new installs
                   ${peak ? ` · Peak: <b>${dayLabel(peak.date)} (${fmt(peak.dau)})</b>` : ''}
                 </div>
               </div>
-              <div style="display:flex;align-items:center;gap:8px;">
-                <button class="small ${state.chartSplit ? 'active' : ''}" id="splitBtn" type="button">Stacked</button>
+              <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+                <div class="nav-tabs" id="chartModeGroup" role="group" aria-label="Chart view mode">
+                  <button class="tab-btn ${state.chartMode === 'all' ? 'active' : ''}" data-mode="all" type="button" title="Stacked returning + new installs (0 baseline)">All</button>
+                  <button class="tab-btn ${state.chartMode === 'new' ? 'active' : ''}" data-mode="new" type="button" title="New installs + filtered bots only (0 baseline)">New</button>
+                  <button class="tab-btn ${state.chartMode === 'line' ? 'active' : ''}" data-mode="line" type="button" title="Auto-zoomed DAU line to inspect tight fluctuations">Line</button>
+                </div>
                 <button class="small ${state.chartTrend ? 'active' : ''}" id="trendBtn" type="button">7d Trend</button>
+                ${(() => {
+                  const totalFiltered = series.reduce((a, p) => a + (p.filtered || 0), 0);
+                  const badge = totalFiltered > 0 ? ` <span style="opacity:0.75;font-family:var(--font-mono);font-size:10px;">· ${fmt(totalFiltered)}</span>` : "";
+                  return `<button class="small ${state.chartFiltered ? 'active' : ''}" id="filteredBtn" type="button" title="Toggle blocked emulator &amp; burst pings (excluded from DAU)">Filtered${badge}</button>`;
+                })()}
                 <button class="small" id="csvExportBtn" type="button">CSV</button>
                 <button class="small" id="jsonCopyBtn" type="button">JSON</button>
               </div>
@@ -1209,10 +1242,11 @@
               </div>
               <div class="chart-meta-bar" id="chartMetaBar"></div>
               <div style="display:flex;justify-content:center;margin-top:16px;">
-                <div class="chart-legend">
-                  <span class="legend-item"><span class="legend-swatch" style="background:var(--bar-ret)"></span>Returning</span>
-                  <span class="legend-item"><span class="legend-swatch" style="background:var(--accent)"></span>New installs</span>
+                <div class="chart-legend" id="chartLegend">
+                  <span class="legend-item" id="retLegendItem"><span class="legend-swatch" style="background:var(--bar-ret)"></span>Returning</span>
+                  <span class="legend-item" id="newLegendItem"><span class="legend-swatch" style="background:var(--accent)"></span>New installs</span>
                   <span class="legend-item"><span class="legend-swatch" style="background:var(--trend)"></span>7-day trend</span>
+                  <span class="legend-item" id="filteredLegendItem" style="${state.chartFiltered ? '' : 'opacity:0.4;'}"><span class="legend-swatch swatch-filtered"></span>Filtered (excluded)</span>
                 </div>
               </div>
             </div>
@@ -1275,14 +1309,23 @@
       }
 
       function bindOverviewControls(d) {
-        document.getElementById("splitBtn")?.addEventListener("click", () => {
-          state.chartSplit = !state.chartSplit;
-          document.getElementById("splitBtn")?.classList.toggle("active", state.chartSplit);
+        document.getElementById("chartModeGroup")?.addEventListener("click", (e) => {
+          const btn = e.target.closest("button[data-mode]");
+          if (!btn) return;
+          state.chartMode = btn.dataset.mode;
+          document.querySelectorAll("#chartModeGroup button[data-mode]").forEach(b => {
+            b.classList.toggle("active", b.dataset.mode === state.chartMode);
+          });
           drawChart(d);
         });
         document.getElementById("trendBtn")?.addEventListener("click", () => {
           state.chartTrend = !state.chartTrend;
           document.getElementById("trendBtn")?.classList.toggle("active", state.chartTrend);
+          drawChart(d);
+        });
+        document.getElementById("filteredBtn")?.addEventListener("click", () => {
+          state.chartFiltered = !state.chartFiltered;
+          document.getElementById("filteredBtn")?.classList.toggle("active", state.chartFiltered);
           drawChart(d);
         });
         document.getElementById("csvExportBtn")?.addEventListener("click", exportCsv);
@@ -2286,38 +2329,120 @@
           return;
         }
 
+        const mode = state.chartMode || "all";
+        const isLine = mode === "line";
+        const isNewOnly = mode === "new";
+        const showFiltered = state.chartFiltered && !isLine;
+
+        const retLeg = document.getElementById("retLegendItem");
+        const newLeg = document.getElementById("newLegendItem");
+        const filtLeg = document.getElementById("filteredLegendItem");
+        const filtBtn = document.getElementById("filteredBtn");
+        if (retLeg) retLeg.style.display = mode === "all" ? "" : "none";
+        if (newLeg) {
+          newLeg.innerHTML = `<span class="legend-swatch" style="background:var(--accent)"></span>${isLine ? "Active devices" : "New installs"}`;
+        }
+        if (filtLeg) {
+          filtLeg.style.display = isLine ? "none" : "";
+          filtLeg.style.opacity = showFiltered ? "" : "0.4";
+        }
+        if (filtBtn) {
+          filtBtn.disabled = isLine;
+          filtBtn.style.opacity = isLine ? "0.45" : "";
+        }
+
         const width = Math.max(320, wrap.clientWidth);
         const height = 260;
-        const padL = 40, padR = 12, padT = 16, padB = 24;
+        const padL = 44, padR = 12, padT = 16, padB = 24;
         const plotW = width - padL - padR;
         const plotH = height - padT - padB;
         const yBottom = padT + plotH;
         const n = series.length;
-        const maxVal = Math.max(1, ...series.map(p => p.dau || 0));
-        
-        function niceStep(val) {
-          if (val <= 0) return 100;
-          const raw = val / 4;
-          const p = Math.pow(10, Math.floor(Math.log10(raw)));
-          const f = raw / p;
-          let nf = 10;
-          if (f <= 1.25) nf = 1;
-          else if (f <= 2.5) nf = 2;
-          else if (f <= 5) nf = 5;
-          return nf * p;
+
+        const metricOf = p => (isNewOnly ? (p.new || 0) : (p.dau || 0));
+        let maxReal = 1;
+        let minReal = Infinity;
+        let peakItem = series[0];
+        let peakVal = -1;
+        for (const p of series) {
+          const v = metricOf(p);
+          if (v > maxReal) maxReal = v;
+          if (v > 0 && v < minReal) minReal = v;
+          if (v > peakVal) { peakVal = v; peakItem = p; }
+        }
+        if (minReal === Infinity) minReal = 0;
+
+        const maxVisualFiltered = isNewOnly
+          ? Math.max(10, Math.round(maxReal * 1.15))
+          : Math.max(10, Math.round(maxReal * 0.45));
+        let maxVal = maxReal;
+        if (showFiltered) {
+          for (const p of series) {
+            const combined = metricOf(p) + Math.min(p.filtered || 0, maxVisualFiltered);
+            if (combined > maxVal) maxVal = combined;
+          }
         }
 
-        const step = niceStep(maxVal);
-        const yMax = Math.max(step * 4, Math.ceil((maxVal * 1.05) / step) * step);
+        function niceScale(minV, maxV, anchorZero) {
+          const factors = [1, 2, 2.5, 4, 5, 10];
+          const pickStep = (span, targetTicks) => {
+            const raw = Math.max(1, span) / targetTicks;
+            const p = Math.pow(10, Math.floor(Math.log10(raw)));
+            const f = raw / p;
+            const nf = factors.find(c => f <= c) || 10;
+            return Math.max(1, Math.round(nf * p));
+          };
+
+          if (anchorZero || maxV - minV <= 0) {
+            const targetTop = Math.max(4, maxV * 1.05);
+            const step = pickStep(targetTop, 5);
+            const yMax = Math.ceil(targetTop / step) * step;
+            return { yMin: 0, yMax, step };
+          }
+
+          const span = maxV - minV;
+          const pad = Math.max(1, span * 0.14);
+          const lo = Math.max(0, minV - pad);
+          const hi = maxV + pad;
+          const step = pickStep(hi - lo, 4);
+          const yMin = Math.max(0, Math.floor(lo / step) * step);
+          const yMax = Math.max(yMin + step, Math.ceil(hi / step) * step);
+          return { yMin, yMax, step };
+        }
+
+        const { yMin, yMax, step } = niceScale(minReal, maxVal, !isLine);
+        const ySpan = Math.max(1, yMax - yMin);
         const slot = plotW / n;
         const barW = Math.max(2, Math.min(22, slot * 0.65));
-        const y = v => padT + plotH - (v / yMax) * plotH;
+        const y = v => padT + plotH - ((v - yMin) / ySpan) * plotH;
 
-        let inner = "";
+        const subEl = document.getElementById("chartSubtitle");
+        if (subEl) {
+          const peakTxt = peakItem ? ` · Peak: <b>${dayLabel(peakItem.date)} (${fmt(metricOf(peakItem))})</b>` : "";
+          const label = isLine
+            ? `Daily active devices · Auto-zoomed (${fmt(yMin)}–${fmt(yMax)})`
+            : isNewOnly
+              ? "New installs &amp; blocked pings"
+              : "Returning devices vs new installs";
+          subEl.innerHTML = `${label}${peakTxt}`;
+        }
 
-        const tickCount = Math.round(yMax / step);
+        let inner = `
+          <defs>
+            <pattern id="botHatch" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+              <rect width="6" height="6" fill="var(--bar-bot-bg)"/>
+              <line x1="0" y1="0" x2="0" y2="6" stroke="var(--bar-bot-stripe)" stroke-width="2"/>
+            </pattern>
+            <linearGradient id="lineAreaGrad" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stop-color="var(--accent)" stop-opacity="0.24"/>
+              <stop offset="100%" stop-color="var(--accent)" stop-opacity="0.01"/>
+            </linearGradient>
+          </defs>
+        `;
+
+        const tickCount = Math.round(ySpan / step);
         for (let i = 0; i <= tickCount; i++) {
-          const gv = step * i;
+          const gv = yMin + step * i;
           const gy = y(gv).toFixed(1);
           inner += `
             <line x1="${padL}" y1="${gy}" x2="${width - padR}" y2="${gy}" stroke="var(--border-subtle)" stroke-width="1"/>
@@ -2325,32 +2450,80 @@
           `;
         }
 
-        series.forEach((p, i) => {
-          const dau = p.dau || 0;
-          if (dau <= 0) return;
-          const cx = padL + slot * i + slot / 2;
-          const x0 = cx - barW / 2;
-          const totalH = (dau / yMax) * plotH;
-          const newH = state.chartSplit ? ((p.new || 0) / yMax) * plotH : 0;
-          const retH = totalH - newH;
-          const yTop = yBottom - totalH;
-          const isPeak = dau === maxVal;
-
-          const retFill = state.chartSplit ? "var(--bar-ret)" : "var(--accent)";
-          inner += `<rect id="bar-ret-${i}" x="${x0.toFixed(1)}" y="${(yTop + newH).toFixed(1)}" width="${barW.toFixed(1)}" height="${Math.max(retH, 1.5).toFixed(1)}" fill="${retFill}" rx="1"${isPeak ? ' stroke="var(--trend)" stroke-width="1.2"' : ''}/>`;
-
-          if (state.chartSplit && newH > 0.5) {
-            inner += `<rect id="bar-new-${i}" x="${x0.toFixed(1)}" y="${yTop.toFixed(1)}" width="${barW.toFixed(1)}" height="${newH.toFixed(1)}" fill="var(--accent)" rx="1"/>`;
+        const primaryPts = [];
+        if (isLine) {
+          const lineCoords = [];
+          series.forEach((p, i) => {
+            const v = p.dau || 0;
+            const cx = padL + slot * i + slot / 2;
+            const cy = y(v);
+            primaryPts[i] = cy;
+            lineCoords.push(`${cx.toFixed(1)},${cy.toFixed(1)}`);
+          });
+          if (lineCoords.length) {
+            const firstX = (padL + slot / 2).toFixed(1);
+            const lastX = (padL + slot * (n - 1) + slot / 2).toFixed(1);
+            const areaPath = `M ${firstX},${yBottom.toFixed(1)} L ${lineCoords.join(" L ")} L ${lastX},${yBottom.toFixed(1)} Z`;
+            inner += `<path d="${areaPath}" fill="url(#lineAreaGrad)"/>`;
+            inner += `<polyline points="${lineCoords.join(" ")}" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`;
+            if (n <= 45) {
+              series.forEach((p, i) => {
+                const cx = padL + slot * i + slot / 2;
+                const cy = primaryPts[i];
+                const isPeak = (p.dau || 0) === maxReal && maxReal > 0;
+                inner += `<circle cx="${cx.toFixed(1)}" cy="${cy.toFixed(1)}" r="${isPeak ? 3.5 : 2}" fill="${isPeak ? 'var(--trend)' : 'var(--accent)'}" stroke="var(--surface)" stroke-width="1"/>`;
+              });
+            }
           }
-        });
+        } else {
+          series.forEach((p, i) => {
+            const val = metricOf(p);
+            const filtered = p.filtered || 0;
+            if (val <= 0 && (!showFiltered || filtered <= 0)) return;
+            const cx = padL + slot * i + slot / 2;
+            const x0 = cx - barW / 2;
+            const totalH = (val / ySpan) * plotH;
+            const yTop = yBottom - totalH;
+            const isPeak = val > 0 && val === maxReal;
+
+            if (val > 0) {
+              if (isNewOnly) {
+                inner += `<rect id="bar-new-${i}" x="${x0.toFixed(1)}" y="${yTop.toFixed(1)}" width="${barW.toFixed(1)}" height="${Math.max(totalH, 1.5).toFixed(1)}" fill="var(--accent)" rx="1"${isPeak ? ' stroke="var(--trend)" stroke-width="1.2"' : ''}/>`;
+              } else {
+                const newH = ((p.new || 0) / ySpan) * plotH;
+                const retH = totalH - newH;
+                inner += `<rect id="bar-ret-${i}" x="${x0.toFixed(1)}" y="${(yTop + newH).toFixed(1)}" width="${barW.toFixed(1)}" height="${Math.max(retH, 1.5).toFixed(1)}" fill="var(--bar-ret)" rx="1"${isPeak ? ' stroke="var(--trend)" stroke-width="1.2"' : ''}/>`;
+                if (newH > 0.5) {
+                  inner += `<rect id="bar-new-${i}" x="${x0.toFixed(1)}" y="${yTop.toFixed(1)}" width="${barW.toFixed(1)}" height="${newH.toFixed(1)}" fill="var(--accent)" rx="1"/>`;
+                }
+              }
+            }
+
+            if (showFiltered && filtered > 0) {
+              const isClamped = filtered > maxVisualFiltered;
+              const visualFiltered = Math.min(filtered, maxVisualFiltered);
+              const rawBotH = (visualFiltered / ySpan) * plotH;
+              const gap = val > 0 ? 2 : 0;
+              const availH = Math.max(0, yTop - gap - padT);
+              const botH = Math.min(availH, Math.max(rawBotH, 2.5));
+              if (botH >= 1.5) {
+                const botY = yTop - gap - botH;
+                inner += `<rect id="bar-bot-${i}" x="${x0.toFixed(1)}" y="${botY.toFixed(1)}" width="${barW.toFixed(1)}" height="${botH.toFixed(1)}" fill="url(#botHatch)" stroke="var(--bar-bot-stroke)" stroke-width="0.9" stroke-dasharray="2 2" rx="1"/>`;
+                if (isClamped) {
+                  inner += `<line x1="${x0.toFixed(1)}" y1="${botY.toFixed(1)}" x2="${(x0 + barW).toFixed(1)}" y2="${botY.toFixed(1)}" stroke="var(--muted)" stroke-width="1.8"/>`;
+                }
+              }
+            }
+          });
+        }
 
         const trendPts = [];
         if (state.chartTrend && n >= 4) {
           const pts = [];
           let runningSum = 0;
           for (let i = 0; i < n; i++) {
-            runningSum += series[i].dau || 0;
-            if (i >= 7) runningSum -= series[i - 7].dau || 0;
+            runningSum += metricOf(series[i]);
+            if (i >= 7) runningSum -= metricOf(series[i - 7]);
             const winLen = Math.min(i + 1, 7);
             const avg = runningSum / winLen;
             if (avg > 0) {
@@ -2359,7 +2532,7 @@
             }
           }
           if (pts.length) {
-            inner += `<polyline points="${pts.join(' ')}" fill="none" stroke="var(--trend)" stroke-width="1.8" stroke-linejoin="round" opacity="0.9"/>`;
+            inner += `<polyline points="${pts.join(' ')}" fill="none" stroke="var(--trend)" stroke-width="1.8" stroke-linejoin="round" opacity="${isLine ? '0.65' : '0.9'}"${isLine ? ' stroke-dasharray="4 3"' : ''}/>`;
           }
         }
 
@@ -2395,11 +2568,24 @@
             const p = series[idx];
             const newPct = p.dau > 0 ? Math.round(((p.new || 0) / p.dau) * 100) : 0;
 
+            const filteredTotal = p.filtered || 0;
+            const emu = p.filteredEmulator || 0;
+            const burst = p.filteredBurst || 0;
+            const breakdownParts = [];
+            if (emu > 0) breakdownParts.push(`${fmt(emu)} emulator`);
+            if (burst > 0) breakdownParts.push(`${fmt(burst)} burst`);
+            const filteredHtml = filteredTotal > 0 ? `
+              <div style="border-top:1px solid var(--border);margin:6px 0 4px;"></div>
+              <div class="tooltip-row" style="color:var(--fg-dim);"><span><span class="swatch-filtered" style="display:inline-block;width:6px;height:6px;border-radius:1px;margin-right:6px;"></span>Filtered (excluded)</span><b>${fmt(filteredTotal)}</b></div>
+              ${breakdownParts.length ? `<div style="font-size:10px;color:var(--muted);text-align:right;margin-top:-2px;">${breakdownParts.join(" · ")}</div>` : ""}
+            ` : "";
+
             tip.innerHTML = `
               <div class="tooltip-title">${dayLabel(p.date, true)} · ${p.date}</div>
               <div class="tooltip-row"><span>Active devices</span><b>${fmt(p.dau || 0)}</b></div>
               <div class="tooltip-row"><span><span style="display:inline-block;width:6px;height:6px;border-radius:1px;background:var(--bar-ret);margin-right:6px;"></span>Returning</span><b>${fmt(p.returning || 0)}</b></div>
               <div class="tooltip-row"><span><span style="display:inline-block;width:6px;height:6px;border-radius:1px;background:var(--accent);margin-right:6px;"></span>New installs</span><b>${fmt(p.new || 0)} (${newPct}%)</b></div>
+              ${filteredHtml}
             `;
             tip.classList.add("show");
 
@@ -2408,9 +2594,10 @@
             cross.setAttribute("x2", xPos);
             cross.style.opacity = "0.4";
 
-            if (trendPts[idx] !== undefined && crossDot) {
+            const dotY = isLine ? primaryPts[idx] : trendPts[idx];
+            if (dotY !== undefined && crossDot) {
               crossDot.setAttribute("cx", xPos);
-              crossDot.setAttribute("cy", trendPts[idx]);
+              crossDot.setAttribute("cy", dotY);
               crossDot.style.opacity = "1";
             }
 
@@ -2452,8 +2639,8 @@
       function exportCsv() {
         const d = state.lastData;
         if (!d || !Array.isArray(d.dauSeries)) return;
-        const lines = ["date,dau,new,returning"];
-        for (const p of d.dauSeries) lines.push(`${p.date},${p.dau},${p.new},${p.returning}`);
+        const lines = ["date,dau,new,returning,filtered,filtered_emulator,filtered_burst"];
+        for (const p of d.dauSeries) lines.push(`${p.date},${p.dau},${p.new},${p.returning},${p.filtered || 0},${p.filteredEmulator || 0},${p.filteredBurst || 0}`);
         downloadFile(`xtra-dau-${d.currentMonth || 'data'}.csv`, "text/csv", lines.join("\n"));
       }
 
@@ -2492,7 +2679,21 @@
           const dau = Math.round(trend * weekly * (0.94 + rnd() * 0.12));
           const spike = rnd() > 0.92 ? Math.round(80 + rnd() * 150) : 0;
           const nw = Math.min(dau, Math.round(50 + rnd() * 80) + spike);
-          series.push({ date: d.toISOString().slice(0, 10), dau, new: nw, returning: dau - nw });
+          // Realistic blocked bot/sandbox spikes (plus a release-day burst 2 days ago)
+          let filteredEmulator = rnd() > 0.55 ? Math.round(8 + rnd() * 35) : 0;
+          let filteredBurst = rnd() > 0.78 ? Math.round(25 + rnd() * 90) : 0;
+          if (i === 2) { filteredEmulator = 165; filteredBurst = 410; }
+          else if (i === 3) { filteredEmulator = 110; filteredBurst = 195; }
+          else if (i === 1) { filteredEmulator = 48; filteredBurst = 35; }
+          series.push({
+            date: d.toISOString().slice(0, 10),
+            dau,
+            new: nw,
+            returning: dau - nw,
+            filteredEmulator,
+            filteredBurst,
+            filtered: filteredEmulator + filteredBurst,
+          });
         }
 
         const last = series[series.length - 1];
@@ -2642,7 +2843,11 @@
                 "GET /healthz": { ok: 520, r4: 0, r5: 0, limited: 0 },
               },
               oauth: { exchange_ok: 382, refresh_ok: 964, invalid_grant: 3 },
-              ping: { ok: 1540 },
+              ping: {
+                ok: 1540,
+                filtered_emulator: last.filteredEmulator || 0,
+                filtered_burst: last.filteredBurst || 0,
+              },
               account: { recorded: 92 },
             },
             week: {
@@ -2656,7 +2861,11 @@
                 "GET /healthz": { ok: 3850, r4: 0, r5: 0, limited: 0 },
               },
               oauth: { exchange_ok: 2680, refresh_ok: 6840, invalid_grant: 36 },
-              ping: { ok: 10420 },
+              ping: {
+                ok: 10420,
+                filtered_emulator: series.slice(-7).reduce((a, p) => a + (p.filteredEmulator || 0), 0),
+                filtered_burst: series.slice(-7).reduce((a, p) => a + (p.filteredBurst || 0), 0),
+              },
               account: { recorded: 540 },
             }
           }

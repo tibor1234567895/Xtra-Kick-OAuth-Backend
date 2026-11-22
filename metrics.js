@@ -578,11 +578,18 @@ export function createMetricsStore(options = {}) {
       const day = dayIndexUtc(d);
       const dau = dayCountsByMonth[m] ? dayCountsByMonth[m][day] : 0;
       const fresh = newCountsByMonth[m] ? newCountsByMonth[m][day] : 0;
+      const dateStr = d.toISOString().slice(0, 10);
+      const pingBucket = stateRef.counters && stateRef.counters[dateStr] && stateRef.counters[dateStr].ping;
+      const filteredEmulator = (pingBucket && pingBucket.filtered_emulator) || 0;
+      const filteredBurst = (pingBucket && pingBucket.filtered_burst) || 0;
       series.push({
-        date: d.toISOString().slice(0, 10),
+        date: dateStr,
         dau,
         new: fresh,
         returning: Math.max(0, dau - fresh),
+        filteredEmulator,
+        filteredBurst,
+        filtered: filteredEmulator + filteredBurst,
       });
     }
     return series;
