@@ -10,7 +10,7 @@ import { setImmediate as settle } from "node:timers/promises";
 import pino from "pino";
 import { WebSocketServer } from "ws";
 import { backfillStoredSubscriptions, computeHmacSignature, createApp, createCountryLookup, loadConfig, redactPaths, startServer } from "./server.js";
-import { createMetricsStore } from "./metrics.js";
+import { createMetricsStore, createNewInstallBurstLimiter, isEmulatorUserAgent, normalizeBurstKey } from "./metrics.js";
 import { CRASH_RETENTION_MS, MAX_CRASH_GROUPS, MAX_CRASH_EVENTS, crashReportSchema, createCrashReportStore } from "./crash-reports.js";
 import {
   clearChannelResolutionCache,
@@ -518,6 +518,124 @@ test("ping counts playback starts by engine and rejects out-of-range values", as
   const stats = store.computeStats();
   assert.deepEqual(stats.counters.today.engineSessions, { ivs: 3, exo: 2 });
   store.close();
+});
+
+test("ping silently drops emulator user-agents without inflating installs", async () => {
+  const { app, store } = appWithMetrics(async () => jsonResponse(200, {}));
+
+  await withServer(app, async (baseUrl) => {
+    const emu = await httpRequest(baseUrl, "POST", "/v1/metrics/ping", makePingBody(), {
+      headers: { "user-agent": "Dalvik/2.1.0 (Linux; U; Android 14; sdk_gphone64_x86_64 Build/UE1A.230829.036)" },
+    });
+    assert.equal(emu.status, 204);
+
+    const real = await httpRequest(
+      baseUrl,
+      "POST",
+      "/v1/metrics/ping",
+      { pid: "b".repeat(64), v: "1.0.0" },
+      { headers: { "user-agent": "Dalvik/2.1.0 (Linux; U; Android 15; CPH2449 Build/UKQ1.230924.001)" } }
+    );
+    assert.equal(real.status, 204);
+  });
+
+  const stats = store.computeStats();
+  assert.equal(stats.totalInstalls, 1);
+  assert.equal(stats.mau, 1);
+  assert.equal(stats.counters.today.ping.filtered_emulator, 1);
+  store.close();
+});
+
+test("ping caps burst of unseen PIDs per IP while allowing returning devices", async () => {
+  const { app, store } = appWithMetrics(async () => jsonResponse(200, {}));
+
+  await withServer(app, async (baseUrl) => {
+    const p1 = await httpRequest(baseUrl, "POST", "/v1/metrics/ping", { pid: "1".repeat(64), v: "1.0.0" });
+    const p2 = await httpRequest(baseUrl, "POST", "/v1/metrics/ping", { pid: "2".repeat(64), v: "1.0.0" });
+    const p3 = await httpRequest(baseUrl, "POST", "/v1/metrics/ping", { pid: "3".repeat(64), v: "1.0.0" });
+    const p4 = await httpRequest(baseUrl, "POST", "/v1/metrics/ping", { pid: "4".repeat(64), v: "1.0.0" });
+    const p5 = await httpRequest(baseUrl, "POST", "/v1/metrics/ping", { pid: "5".repeat(64), v: "1.0.0" });
+    assert.equal(p1.status, 204);
+    assert.equal(p2.status, 204);
+    assert.equal(p3.status, 204);
+    assert.equal(p4.status, 204);
+    assert.equal(p5.status, 204);
+
+    // Returning ping from already-known PID must still pass even after burst cap trips.
+    const returning = await httpRequest(baseUrl, "POST", "/v1/metrics/ping", {
+      pid: "1".repeat(64),
+      v: "1.0.1",
+      si: 2,
+    });
+    assert.equal(returning.status, 204);
+  });
+
+  const stats = store.computeStats();
+  assert.equal(stats.totalInstalls, 3);
+  assert.equal(stats.mau, 3);
+  assert.equal(stats.counters.today.ping.filtered_burst, 2);
+  assert.deepEqual(stats.counters.today.engineSessions, { ivs: 2 });
+  store.close();
+});
+
+test("known-account reinstall is recognized as known PID and never dropped by burst limiter", async () => {
+  const { app, store } = appWithMetrics(async () => jsonResponse(200, {}));
+  const sub = "user-42";
+  const ah = createHash("sha256").update(sub).digest("hex");
+  store.recordAccount({ sub });
+
+  await withServer(app, async (baseUrl) => {
+    // Reinstall by a known account: not counted as a new install, does not consume burst slots.
+    const reinstall = await httpRequest(baseUrl, "POST", "/v1/metrics/ping", { pid: "9".repeat(64), v: "1.0.0", ah });
+    assert.equal(reinstall.status, 204);
+
+    // Fill burst cap with 3 unrelated new installs from the same IP.
+    for (const ch of ["1", "2", "3"]) {
+      const res = await httpRequest(baseUrl, "POST", "/v1/metrics/ping", { pid: ch.repeat(64), v: "1.0.0" });
+      assert.equal(res.status, 204);
+    }
+
+    // Returning ping from the known-account device must STILL pass after burst cap is tripped.
+    const followUp = await httpRequest(baseUrl, "POST", "/v1/metrics/ping", {
+      pid: "9".repeat(64),
+      v: "1.0.1",
+      si: 4,
+    });
+    assert.equal(followUp.status, 204);
+  });
+
+  const stats = store.computeStats();
+  assert.equal(stats.totalInstalls, 3);
+  assert.equal(stats.mau, 4);
+  assert.equal(stats.counters.today.ping.filtered_burst || 0, 0);
+  assert.deepEqual(stats.counters.today.engineSessions, { ivs: 4 });
+  store.close();
+});
+
+test("emulator UA matcher and burst limiter handle IPv4-mapped, IPv6 /64, window expiry, and LRU", () => {
+  assert.equal(isEmulatorUserAgent(undefined), false);
+  assert.equal(isEmulatorUserAgent("Dalvik/2.1.0 (Linux; U; Android 13; generic_x86_64 Build/TE1A)"), true);
+  assert.equal(isEmulatorUserAgent("Dalvik/2.1.0 (Linux; U; Android 14; Android SDK built for x86 Build/UE1A)"), true);
+  assert.equal(isEmulatorUserAgent("Dalvik/2.1.0 (Linux; U; Android 14; Cuttlefish x86_64 Build/UP1A)"), true);
+  assert.equal(isEmulatorUserAgent("Dalvik/2.1.0 (Linux; U; Android 14; vbox86p Build/UP1A)"), true);
+
+  assert.equal(normalizeBurstKey("::ffff:203.0.113.5"), "203.0.113.5");
+  assert.equal(normalizeBurstKey("2001:db8:1:2::1"), normalizeBurstKey("2001:db8:1:2::99"));
+
+  const limiter = createNewInstallBurstLimiter({ maxPerIp: 2, windowMs: 1_000, maxTrackedIps: 2 });
+  assert.equal(limiter.isBlocked("::ffff:198.51.100.1", 100), false);
+  limiter.record("::ffff:198.51.100.1", 100);
+  limiter.record("198.51.100.1", 200);
+  assert.equal(limiter.isBlocked("198.51.100.1", 300), true);
+
+  // Add second IP, refresh active attacker via isBlocked, then add third IP: attacker stays blocked.
+  limiter.record("198.51.100.2", 310);
+  assert.equal(limiter.isBlocked("198.51.100.1", 320), true);
+  limiter.record("198.51.100.3", 330);
+  assert.equal(limiter.isBlocked("198.51.100.1", 340), true);
+
+  // After window expires, IP is unblocked.
+  assert.equal(limiter.isBlocked("198.51.100.1", 1_300), false);
 });
 
 test("metrics device cap returns 429 without adding another device", () => {

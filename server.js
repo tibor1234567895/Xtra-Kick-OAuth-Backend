@@ -12,6 +12,8 @@ import geoip from "geoip-country";
 import { crashReportSchema, createCrashReportStore } from "./crash-reports.js";
 import {
   createMetricsStore,
+  createNewInstallBurstLimiter,
+  isEmulatorUserAgent,
   loadMetricsConfig,
   requireAdminToken,
 } from "./metrics.js";
@@ -1274,21 +1276,34 @@ export function createCountryLookup(metricsConfig) {
 }
 
 function pingHandler(metrics, lookupCountry) {
+  const burstLimiter = createNewInstallBurstLimiter();
+  const countPing = (code) => {
+    try {
+      metrics.countersPing(code);
+    } catch {
+      // Counters are best-effort.
+    }
+  };
   return async (req, res) => {
     const parsed = pingSchema.safeParse(req.body);
     if (!parsed.success) {
-      try {
-        metrics.countersPing("invalid");
-      } catch {
-        // Counters are best-effort.
-      }
+      countPing("invalid");
       return validationError(res, parsed);
+    }
+    if (isEmulatorUserAgent(req.get("user-agent"))) {
+      countPing("filtered_emulator");
+      return res.status(204).end();
     }
     try {
       const pidHash = metrics.hashPid(parsed.data.pid);
       const now = new Date();
+      const knownPid = metrics.isKnownPid(pidHash);
+      if (!knownPid && burstLimiter.isBlocked(req.ip, now.getTime())) {
+        countPing("filtered_burst");
+        return res.status(204).end();
+      }
       const month = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}`;
-      metrics.recordPing(
+      const result = metrics.recordPing(
         {
           pidHash,
           version: parsed.data.v,
@@ -1307,14 +1322,13 @@ function pingHandler(metrics, lookupCountry) {
         },
         now
       );
+      if (!knownPid && result.isNewInstall) {
+        burstLimiter.record(req.ip, now.getTime());
+      }
       res.setHeader("X-Playback-Starts-Accepted", "1");
       return res.status(204).end();
     } catch (error) {
-      try {
-        metrics.countersPing(error.code === "metrics_capacity_reached" ? "capacity" : "epoch");
-      } catch {
-        // Counters are best-effort.
-      }
+      countPing(error.code === "metrics_capacity_reached" ? "capacity" : "epoch");
       req.log.warn({ err: { message: error.message, code: error.code } }, "ping rejected");
       return res.status(error.status || 400).json({ code: error.code || "invalid_request", message: error.message });
     }

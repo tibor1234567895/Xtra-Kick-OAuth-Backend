@@ -2071,6 +2071,10 @@
               <div class="diag-val">${fmt(account.recorded || 0)}</div>
               <div class="diag-label">Accounts captured</div>
             </div>
+            <div class="diag-card">
+              <div class="diag-val">${fmt((ping.filtered_emulator || 0) + (ping.filtered_burst || 0))}</div>
+              <div class="diag-label">Filtered bot pings</div>
+            </div>
           </div>
         `;
       }

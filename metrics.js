@@ -536,6 +536,15 @@ export function createMetricsStore(options = {}) {
     return hashWithSalt(salt, rawPid);
   }
 
+  function isKnownPid(pidHash) {
+    if (typeof pidHash !== "string" || pidHash.length < EVERSEEN_PREFIX_CHARS) return false;
+    if (everSeenSet.has(pidHash.slice(0, EVERSEEN_PREFIX_CHARS))) return true;
+    for (const bucket of Object.values(state.devices)) {
+      if (bucket && Object.hasOwn(bucket, pidHash)) return true;
+    }
+    return false;
+  }
+
   function buildDauSeries(stateRef, now, days) {
     const today = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
     const dayCountsByMonth = {};
@@ -808,6 +817,7 @@ export function createMetricsStore(options = {}) {
     recordUpstreamLatency,
     hashSub,
     hashPid,
+    isKnownPid,
     computeStats,
     countersEndpoint,
     countersHmacRejected,
@@ -841,6 +851,83 @@ export function requireAdminToken(metricsConfig) {
 
 export function generateSalt(byteCount = 32) {
   return randomBytes(byteCount).toString("hex");
+}
+
+const EMULATOR_UA_PATTERN =
+  /\b(sdk_gphone(?:64)?(?:_[a-z0-9_]+)?|generic_x86(?:_64)?|android sdk built for|vbox86p?|cuttlefish|cutf_cvm|vsoc_x86(?:_64)?)\b/i;
+
+export function isEmulatorUserAgent(userAgent) {
+  return typeof userAgent === "string" && EMULATOR_UA_PATTERN.test(userAgent);
+}
+
+// Normalizes IPv4-mapped IPv6 addresses to IPv4 and collapses native IPv6
+// addresses to their /64 prefix so a single cloud VM cannot rotate host bits
+// within its /64 allocation to bypass the burst limiter.
+export function normalizeBurstKey(rawIp) {
+  const ip = String(rawIp || "").trim().replace(/^::ffff:/i, "").toLowerCase();
+  if (!ip) return "";
+  if (!ip.includes(":")) return ip;
+  const noZone = ip.split("%")[0];
+  const [leftRaw, rightRaw] = noZone.split("::");
+  const left = leftRaw ? leftRaw.split(":").filter(Boolean) : [];
+  const right = rightRaw ? rightRaw.split(":").filter(Boolean) : [];
+  const missing = Math.max(0, 8 - left.length - right.length);
+  const full = noZone.includes("::")
+    ? [...left, ...Array(missing).fill("0"), ...right]
+    : left;
+  if (full.length !== 8) return noZone;
+  return `${full.slice(0, 4).map((h) => h.padStart(4, "0")).join(":")}::/64`;
+}
+
+// Transient in-memory sliding window that caps brand-new unseen PIDs per IP
+// (or IPv6 /64) without ever persisting raw IP addresses. Returning devices
+// bypass this check so households, CGNAT, and VPN exit nodes are unaffected.
+export function createNewInstallBurstLimiter({
+  maxPerIp = 3,
+  windowMs = 60 * 60 * 1000,
+  maxTrackedIps = 10_000,
+} = {}) {
+  const recentByIp = new Map();
+
+  function pruneAndGet(key, nowMs) {
+    const cutoff = nowMs - windowMs;
+    const existing = recentByIp.get(key);
+    return existing ? existing.filter((ts) => ts > cutoff) : [];
+  }
+
+  function touch(key, recent) {
+    recentByIp.delete(key);
+    recentByIp.set(key, recent);
+    if (recentByIp.size > maxTrackedIps) {
+      const oldestKey = recentByIp.keys().next().value;
+      if (oldestKey !== undefined) recentByIp.delete(oldestKey);
+    }
+  }
+
+  return {
+    isBlocked(rawIp, nowMs = Date.now()) {
+      const key = normalizeBurstKey(rawIp);
+      if (!key) return false;
+      const recent = pruneAndGet(key, nowMs);
+      if (recent.length >= maxPerIp) {
+        touch(key, recent);
+        return true;
+      }
+      if (recent.length === 0) {
+        recentByIp.delete(key);
+      } else {
+        recentByIp.set(key, recent);
+      }
+      return false;
+    },
+    record(rawIp, nowMs = Date.now()) {
+      const key = normalizeBurstKey(rawIp);
+      if (!key) return;
+      const recent = pruneAndGet(key, nowMs);
+      recent.push(nowMs);
+      touch(key, recent);
+    },
+  };
 }
 
 export { safeEqual, hashWithSalt };
