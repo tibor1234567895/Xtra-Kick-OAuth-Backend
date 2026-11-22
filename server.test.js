@@ -562,8 +562,12 @@ test("ping caps burst of unseen PIDs per IP while allowing returning devices", a
     assert.equal(p1.status, 204);
     assert.equal(p2.status, 204);
     assert.equal(p3.status, 204);
-    assert.equal(p4.status, 204);
-    assert.equal(p5.status, 204);
+    for (const deferred of [p4, p5]) {
+      assert.equal(deferred.status, 429);
+      assert.equal(deferred.body.code, "install_burst");
+      assert.ok(Number(deferred.headers["retry-after"]) > 0);
+      assert.equal(deferred.headers["x-playback-starts-accepted"], undefined);
+    }
 
     // Returning ping from already-known PID must still pass even after burst cap trips.
     const returning = await httpRequest(baseUrl, "POST", "/v1/metrics/ping", {
@@ -627,19 +631,19 @@ test("emulator UA matcher and burst limiter handle IPv4-mapped, IPv6 /64, window
   assert.equal(normalizeBurstKey("2001:db8:1:2::1"), normalizeBurstKey("2001:db8:1:2::99"));
 
   const limiter = createNewInstallBurstLimiter({ maxPerIp: 2, windowMs: 1_000, maxTrackedIps: 2 });
-  assert.equal(limiter.isBlocked("::ffff:198.51.100.1", 100), false);
+  assert.equal(limiter.retryAfterMs("::ffff:198.51.100.1", 100), 0);
   limiter.record("::ffff:198.51.100.1", 100);
   limiter.record("198.51.100.1", 200);
-  assert.equal(limiter.isBlocked("198.51.100.1", 300), true);
+  assert.equal(limiter.retryAfterMs("198.51.100.1", 300), 800);
 
-  // Add second IP, refresh active attacker via isBlocked, then add third IP: attacker stays blocked.
+  // Active rate limits survive LRU eviction of idle keys.
   limiter.record("198.51.100.2", 310);
-  assert.equal(limiter.isBlocked("198.51.100.1", 320), true);
+  assert.equal(limiter.retryAfterMs("198.51.100.1", 320), 780);
   limiter.record("198.51.100.3", 330);
-  assert.equal(limiter.isBlocked("198.51.100.1", 340), true);
+  assert.equal(limiter.retryAfterMs("198.51.100.1", 340), 760);
 
   // After window expires, IP is unblocked.
-  assert.equal(limiter.isBlocked("198.51.100.1", 1_300), false);
+  assert.equal(limiter.retryAfterMs("198.51.100.1", 1_300), 0);
 });
 
 test("metrics device cap returns 429 without adding another device", () => {
@@ -2943,7 +2947,7 @@ test("upstream latency percentiles compute correctly", () => {
   assert.equal(stats.upstreamLatency.max, 1000);
 });
 
-test("telemetry coverage calculates ratio of ping accounts vs oauth accounts", () => {
+test("OAuth accounts and account-tagged pings are counted separately", () => {
   const store = createMetricsStore({ salt: "salt-cov-test" });
   const now = new Date();
   const epoch = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}`;
@@ -2977,7 +2981,77 @@ test("telemetry coverage calculates ratio of ping accounts vs oauth accounts", (
   const stats = store.computeStats(now);
   assert.equal(stats.accountsMau, 4);
   assert.equal(stats.pingAccountsMau, 3);
-  assert.equal(stats.telemetryCoverage, 0.75);
+  assert.equal(stats.signedInPingDevicesMau, 3);
+  assert.equal(stats.telemetryCoverage, null);
+});
+
+test("metrics counts signed-in devices separately from accounts", () => {
+  const store = createMetricsStore({ dataPath: null, salt: "test-salt-signed-in" });
+  const now = new Date("2026-11-22T12:00:00Z");
+  const epoch = "2026-11";
+
+  store.recordAccount({ sub: "user-1" }, now);
+  store.recordAccount({ sub: "user-2" }, now);
+  store.recordAccount({ sub: "user-3" }, now);
+  store.recordAccount({ sub: "user-4" }, now);
+
+  // Two devices ping with signedIn=true (no accountAid), one signs in on a later ping, one is anonymous.
+  const pid1 = store.hashPid("1111111111111111111111111111111111111111111111111111111111111111");
+  const pid2 = store.hashPid("2222222222222222222222222222222222222222222222222222222222222222");
+  const pid3 = store.hashPid("3333333333333333333333333333333333333333333333333333333333333333");
+  const pid4 = store.hashPid("4444444444444444444444444444444444444444444444444444444444444444");
+
+  store.recordPing({ pidHash: pid1, version: "2.55.0", clientEpoch: epoch, signedIn: true }, now);
+  store.recordPing({ pidHash: pid2, version: "2.55.0", clientEpoch: epoch, signedIn: true }, now);
+  store.recordPing({ pidHash: pid3, version: "2.55.0", clientEpoch: epoch }, now);
+  store.recordPing({ pidHash: pid3, version: "2.55.0", clientEpoch: epoch, signedIn: true }, now);
+  // Signing out later in the month keeps the monthly signed-in flag.
+  store.recordPing({ pidHash: pid3, version: "2.55.0", clientEpoch: epoch, signedIn: false }, now);
+  store.recordPing({ pidHash: pid4, version: "2.55.0", clientEpoch: epoch }, now);
+
+  const stats = store.computeStats(now);
+  assert.equal(stats.accountsMau, 4);
+  assert.equal(stats.pingAccountsMau, 0);
+  assert.equal(stats.signedInPingDevicesMau, 3);
+  assert.equal(stats.telemetryCoverage, null);
+});
+
+test("metrics: buildsDau and buildsWau split rollout by active window across month boundaries", () => {
+  const store = createMetricsStore({ dataPath: null, salt: "test-salt-builds-window" });
+  const prevMonthDay = new Date("2026-11-30T12:00:00Z");
+  const earlierThisMonth = new Date("2026-12-01T12:00:00Z");
+  const today = new Date("2026-12-03T12:00:00Z");
+
+  const pidA = store.hashPid("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+  const pidB = store.hashPid("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+  const pidC = store.hashPid("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc");
+
+  // pidA was on b224 in Nov, upgraded to b225 today -> should appear once as b225 in DAU, WAU, and MAU.
+  store.recordPing({ pidHash: pidA, version: "2.55.0", build: 224, clientEpoch: "2026-11" }, prevMonthDay);
+  store.recordPing({ pidHash: pidA, version: "2.55.0", build: 225, clientEpoch: "2026-12" }, today);
+  // pidB was active 2 days ago on b224 -> in WAU and MAU, not DAU.
+  store.recordPing({ pidHash: pidB, version: "2.55.0", build: 224, clientEpoch: "2026-12" }, earlierThisMonth);
+  // pidC was active on Nov 30 only (legacy) -> in WAU (within 7d), not DAU or Dec MAU.
+  store.recordPing({ pidHash: pidC, version: "2.54.0", clientEpoch: "2026-11" }, prevMonthDay);
+
+  const stats = store.computeStats(today);
+  assert.deepEqual(stats.buildsDau, [{ label: "2.55.0 (b225)", count: 1 }]);
+  assert.equal(stats.wau, 3);
+  assert.deepEqual(
+    new Map(stats.buildsWau.map((b) => [b.label, b.count])),
+    new Map([
+      ["2.55.0 (b225)", 1],
+      ["2.55.0 (b224)", 1],
+      ["2.54.0 (legacy)", 1],
+    ]),
+  );
+  assert.deepEqual(
+    new Map(stats.builds.map((b) => [b.label, b.count])),
+    new Map([
+      ["2.55.0 (b225)", 1],
+      ["2.55.0 (b224)", 1],
+    ]),
+  );
 });
 
 function makeCrashReport(overrides = {}) {
@@ -3068,6 +3142,50 @@ test("crash dismissal route requires admin, validates, and hides a group until i
   });
   store.close();
   app.locals.crashReports.close();
+});
+
+test("crash permanent mute hides recurring signature on same build while letting new crashes and newer builds through", () => {
+  const dir = mkdtempSync(join(tmpdir(), "crash-mute-"));
+  const crashPath = join(dir, "crashes.json");
+  const now = Date.parse("2026-11-22T12:00:00Z");
+  try {
+    const store = createCrashReportStore({ dataPath: crashPath });
+    store.record(makeCrashReport({ id: "11111111-1111-4111-8111-111111111111", build: 223, crashedAt: now }), now);
+    const [initial] = store.list(now);
+    assert.ok(initial);
+
+    // Permanently mute that exact signature on b223.
+    store.dismissMany([initial.signature], now + 1000, { permanent: true });
+    assert.equal(store.list(now + 1000).length, 0);
+
+    // Same crash recurring later on b223 stays muted.
+    store.record(makeCrashReport({ id: "22222222-2222-4222-8222-222222222222", build: 223, crashedAt: now + 5000 }), now + 5000);
+    assert.equal(store.list(now + 5000).length, 0);
+
+    // A different crash on b223 still shows up.
+    store.record(makeCrashReport({
+      id: "33333333-3333-4333-8333-333333333333",
+      build: 223,
+      crashedAt: now + 6000,
+      exceptions: [{ type: "java.lang.NullPointerException", frames: [{ class: "com.xtrakick.app.Chat", method: "send", file: "Chat.kt", line: 42 }] }],
+    }), now + 6000);
+    // The same original crash on a newer build (b225) also shows up.
+    store.record(makeCrashReport({ id: "44444444-4444-4444-8444-444444444444", build: 225, crashedAt: now + 7000 }), now + 7000);
+    store.close();
+
+    // Persists across reload.
+    const reloaded = createCrashReportStore({ dataPath: crashPath });
+    const visible = reloaded.list(now + 8000);
+    assert.equal(visible.length, 2);
+    assert.ok(visible.every((r) => r.signature !== initial.signature));
+    const afterRetention = now + CRASH_RETENTION_MS + 86_400_000;
+    assert.equal(reloaded.list(afterRetention).length, 0);
+    reloaded.record(makeCrashReport({ id: "55555555-5555-4555-8555-555555555555", build: 223, crashedAt: afterRetention }), afterRetention);
+    assert.equal(reloaded.list(afterRetention).length, 0);
+    reloaded.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("crash batch dismiss and persistent minBuild filtering hide older builds until reset", async () => {
@@ -3569,6 +3687,33 @@ test("dashboard disables the date range only for session-scoped push counters", 
   assert.match(root.innerHTML, /Telemetry period 2026-11/);
 });
 
+test("dashboard Line mode plots zero-activity days inside the chart", () => {
+  const html = readFileSync(new URL("./dashboard.html", import.meta.url), "utf8");
+  const start = html.indexOf("function drawChart(");
+  const end = html.indexOf("\n      }", start) + "\n      }".length;
+  const svg = { style: {}, setAttribute() {}, querySelectorAll: () => [] };
+  const document = { getElementById: id => ({ mainChart: svg, chartWrap: { clientWidth: 500 } }[id]) };
+  const draw = runInNewContext(html.slice(start, end) + ";drawChart", {
+    document, state: { chartMode: "line" }, fmt: String, dayLabel: String,
+  });
+  draw({ dauSeries: [96, 0, 101].map((dau, i) => ({ date: `2026-11-${19 + i}`, dau })) });
+  const points = svg.innerHTML.match(/<polyline points="([^"]+)"/)[1].split(" ");
+  assert.equal(points.length, 3);
+  assert.equal(Number(points[1].split(",")[1]), 236);
+});
+
+test("dashboard build shares use all devices in the selected window", () => {
+  const html = readFileSync(new URL("./dashboard.html", import.meta.url), "utf8");
+  const start = html.indexOf("function renderDistTable(");
+  const end = html.indexOf("function renderRetentionMatrix(", start);
+  const render = runInNewContext(html.slice(start, end) + ";renderDistTabs", {
+    state: { buildWindow: "wau" }, fmt: String, escapeHtml: String,
+  });
+  const buildsWau = Array.from({ length: 10 }, (_, i) => ({ label: `2.55 (b${i})`, count: 10 }));
+  const markup = render({ builds: buildsWau, buildsWau });
+  assert.deepEqual(Array.from(markup.matchAll(/>(\d+)%<\/td>/g), m => m[1]), Array(8).fill("10"));
+});
+
 test("dashboard counts HMAC rejections within 4xx and rate limits as failed requests", () => {
   const html = readFileSync(new URL("./dashboard.html", import.meta.url), "utf8");
   const start = html.indexOf("function renderEndpointHealthTable(");
@@ -4043,14 +4188,17 @@ test("FCM pending slug resolution does not inflate 5xx metrics or churn Pusher s
   try {
     await withServer(app, async (baseUrl) => {
       const token = "metrics_safe_token_1234567890123";
+      fcmStore.subscribe({ token, channelIds: ["existing-slug", "901"] });
+      channelResolutionCache.set("existing-slug", { channelId: "901", slug: "existing-slug", expiresAt: Date.now() + 60_000 });
       const subscribe = () => httpRequest(baseUrl, "POST", "/v1/fcm/subscribe", {
         token,
-        channel_ids: ["metrics-safe-slug"],
+        channel_ids: ["existing-slug", "metrics-safe-slug"],
       });
       const first = await subscribe();
       assert.equal(first.status, 503);
       assert.equal(first.body.code, "subscription_pending");
       assert.equal(relaySyncs, 0);
+      assert.deepEqual(fcmStore.getTokensForChannel("901"), [token]);
 
       const duplicate = await subscribe();
       assert.equal(duplicate.status, 503);
@@ -4059,6 +4207,7 @@ test("FCM pending slug resolution does not inflate 5xx metrics or churn Pusher s
       releaseFetch();
       await waitFor(() => fcmStore.getTokensForChannel("501").includes(token));
       assert.equal(relaySyncs, 1);
+      assert.deepEqual(fcmStore.getTokensForChannel("901"), [token]);
 
       const endpointStats = metrics.computeStats().counters.today.endpoints["POST /v1/fcm/subscribe"];
       assert.equal(endpointStats.ok, 2);

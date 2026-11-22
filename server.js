@@ -286,10 +286,11 @@ export function createApp(config, deps = {}) {
         ? req.body.signatures
         : (typeof req.body?.signature === "string" ? [req.body.signature] : null);
       try {
-        crashReports.dismissMany(signatures);
+        crashReports.dismissMany(signatures, Date.now(), { permanent: req.body?.permanent === true });
         return res.status(204).end();
       } catch (error) {
         if (error.status === 400) return res.status(400).json({ code: "invalid_crash_signature" });
+        if (error.status === 409) return res.status(409).json({ code: "crash_mute_capacity" });
         return res.status(503).json({ code: "crash_report_unavailable" });
       }
     });
@@ -389,6 +390,7 @@ const pingSchema = z.object({
   wt: z.enum(["0", "1", "2", "3"]).optional(),
   si: z.number().int().min(0).max(100_000).optional(),
   se: z.number().int().min(0).max(100_000).optional(),
+  li: z.boolean().optional(),
 });
 
 function createLimiter(max) {
@@ -884,7 +886,8 @@ function fcmSubscribeHandler(fcmStore, pusherRelay, { upstreamFetch, config } = 
       const cached = channelResolutionCache.get(id);
       return !cached || cached.expiresAt <= now || cached.channelId !== id;
     });
-    const needsResolution = uncachedSlugs.length > 0 || unknownNumeric.length > 0;
+    const hasUncachedSlugs = uncachedSlugs.length > 0;
+    const needsResolution = hasUncachedSlugs || unknownNumeric.length > 0;
     const isBulkResolution = uncachedSlugs.length > BULK_SLUG_RESOLUTION_THRESHOLD;
 
     if (needsResolution && (activeResolutions >= MAX_ACTIVE_RESOLUTIONS ||
@@ -895,10 +898,10 @@ function fcmSubscribeHandler(fcmStore, pusherRelay, { upstreamFetch, config } = 
     const result = fcmStore.subscribe({
       token,
       kickUserId,
-      channelIds: uncachedSlugs.length ? persistedChannelIds : [...persistedChannelIds, ...cachedAliases],
+      channelIds: [...persistedChannelIds, ...cachedAliases],
     });
     if (result.error) return res.status(503).json({ ok: false, code: result.error });
-    if (!uncachedSlugs.length) pusherRelay?.syncSubscriptions();
+    if (!hasUncachedSlugs) pusherRelay?.syncSubscriptions();
 
     // In the background, resolve any uncached slugs or numeric keys so resolved
     // channel_ids are subscribed on the Pusher WebSocket and registered to the device token.
@@ -908,16 +911,16 @@ function fcmSubscribeHandler(fcmStore, pusherRelay, { upstreamFetch, config } = 
     if (needsResolution || (config?.kickClientId && config?.kickClientSecret && persistedChannelIds.length > 0)) {
       if (needsResolution) activeResolutions++;
       if (isBulkResolution) bulkResolutionInProgress = true;
-      if (uncachedSlugs.length) pendingSlugRegistrations.set(token, registration);
+      if (hasUncachedSlugs) pendingSlugRegistrations.set(token, registration);
       (async () => {
         let syncedRelay = false;
         try {
-          const resolvedIds = uncachedSlugs.length ? cachedAliases : [];
+          const verifiedSlugs = [];
+          const resolvedIds = [];
           for (let i = 0; i < uncachedSlugs.length; i += SLUG_RESOLUTION_CONCURRENCY) {
             if (!fcmStore.isCurrentSubscription(token, result.revision)) return;
             const batch = uncachedSlugs.slice(i, i + SLUG_RESOLUTION_CONCURRENCY);
             const results = await Promise.all(batch.map((slug) => resolveKickChannel(slug, { fetchFn, logger })));
-            const verifiedSlugs = [];
             for (const [index, resolved] of results.entries()) {
               if (!resolved) continue;
               verifiedSlugs.push(resolved.slug || batch[index]);
@@ -925,7 +928,6 @@ function fcmSubscribeHandler(fcmStore, pusherRelay, { upstreamFetch, config } = 
               if (resolved.userId) resolvedIds.push(resolved.userId);
               if (resolved.slug !== batch[index]) resolvedIds.push(batch[index]);
             }
-            fcmStore.addAliasesToToken(token, verifiedSlugs, result.revision);
           }
 
           // 2. Resolve numeric broadcaster user IDs that are not yet known as channelIds
@@ -946,8 +948,15 @@ function fcmSubscribeHandler(fcmStore, pusherRelay, { upstreamFetch, config } = 
             }
           }
 
-          const added = fcmStore.addAliasesToToken(token, resolvedIds, result.revision);
-          if (added > 0 || uncachedSlugs.length > 0) {
+          if (!fcmStore.isCurrentSubscription(token, result.revision)) return;
+          if (hasUncachedSlugs) {
+            // Retain known aliases during lookup, then prioritize verified requested slugs in the final set.
+            fcmStore.subscribe({ token, kickUserId, channelIds: [
+              ...persistedChannelIds, ...verifiedSlugs, ...cachedAliases, ...resolvedIds,
+            ] });
+          }
+          const shouldSyncRelay = hasUncachedSlugs || fcmStore.addAliasesToToken(token, resolvedIds, result.revision) > 0;
+          if (shouldSyncRelay) {
             syncedRelay = true;
             pusherRelay?.syncSubscriptions();
           }
@@ -963,7 +972,7 @@ function fcmSubscribeHandler(fcmStore, pusherRelay, { upstreamFetch, config } = 
             }).catch(() => {});
           }
         } catch (err) {
-          if (!syncedRelay && uncachedSlugs.length > 0 && fcmStore.isCurrentSubscription(token, result.revision)) {
+          if (!syncedRelay && hasUncachedSlugs && fcmStore.isCurrentSubscription(token, result.revision)) {
             pusherRelay?.syncSubscriptions();
           }
           logger?.warn({ err: err.message }, "fcm_background_resolution_failed");
@@ -975,7 +984,7 @@ function fcmSubscribeHandler(fcmStore, pusherRelay, { upstreamFetch, config } = 
       })().catch(() => {});
     }
 
-    if (uncachedSlugs.length) {
+    if (hasUncachedSlugs) {
       res.locals.metricsStatus = 202;
       return res.status(503).json({ ok: false, code: "subscription_pending" });
     }
@@ -1298,9 +1307,11 @@ function pingHandler(metrics, lookupCountry) {
       const pidHash = metrics.hashPid(parsed.data.pid);
       const now = new Date();
       const knownPid = metrics.isKnownPid(pidHash);
-      if (!knownPid && burstLimiter.isBlocked(req.ip, now.getTime())) {
+      const retryAfterMs = knownPid ? 0 : burstLimiter.retryAfterMs(req.ip, now.getTime());
+      if (retryAfterMs > 0) {
         countPing("filtered_burst");
-        return res.status(204).end();
+        return res.set("Retry-After", String(Math.ceil(retryAfterMs / 1000)))
+          .status(429).json({ code: "install_burst" });
       }
       const month = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}`;
       const result = metrics.recordPing(
@@ -1319,6 +1330,7 @@ function pingHandler(metrics, lookupCountry) {
           wt: parsed.data.wt,
           si: parsed.data.si,
           se: parsed.data.se,
+          signedIn: parsed.data.li,
         },
         now
       );

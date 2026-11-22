@@ -369,7 +369,7 @@ export function createMetricsStore(options = {}) {
     return true;
   }
 
-  function recordPing({ pidHash, version, build, clientEpoch, os, cc, sessions, accountAid, geoCountry, pe, c, wt, si, se }, now = new Date()) {
+  function recordPing({ pidHash, version, build, clientEpoch, os, cc, sessions, accountAid, geoCountry, pe, c, wt, si, se, signedIn }, now = new Date()) {
     if (typeof pidHash !== "string" || !/^[0-9a-f]{64}$/.test(pidHash)) {
       throw new Error("recordPing: invalid pidHash");
     }
@@ -419,8 +419,10 @@ export function createMetricsStore(options = {}) {
       monthCounts.pingAccounts.set(serverEpoch, monthCounts.pingAccounts.get(serverEpoch) + 1);
     }
     const dayBit = 1 << (dayIndexUtc(now) - 1);
+    const isSignedIn = signedIn === true || Boolean(aidHash);
     if (existing) {
       existing.d |= dayBit;
+      if (isSignedIn) existing.li = 1;
       if (safeVersion) {
         if (safeBuild === null && safeVersion !== existing.v) delete existing.b;
         existing.v = safeVersion;
@@ -465,6 +467,7 @@ export function createMetricsStore(options = {}) {
       return { isNewInstall: false, month: serverEpoch };
     }
     const entry = { v: safeVersion, d: dayBit, t: dayKey(now) };
+    if (isSignedIn) entry.li = 1;
     if (safeBuild !== null) entry.b = safeBuild;
     if (safeOs) entry.os = safeOs;
     if (safeCc) entry.cc = safeCc;
@@ -595,6 +598,11 @@ export function createMetricsStore(options = {}) {
     return series;
   }
 
+  function formatBuildKey(entry) {
+    const v = entry.v || "unknown";
+    return entry.b ? `${v} (b${entry.b})` : `${v} (legacy)`;
+  }
+
   function computeWeeklyActive(now, windowDays) {
     const masksByMonth = new Map();
     for (let offset = 0; offset < windowDays; offset += 1) {
@@ -605,14 +613,20 @@ export function createMetricsStore(options = {}) {
       masksByMonth.set(month, (masksByMonth.get(month) || 0) | dayBit);
     }
     const active = new Set();
+    const buildCounts = Object.create(null);
+    // masksByMonth iterates newest month first, so devices spanning a month boundary
+    // keep their latest build label and are counted once.
     for (const [month, mask] of masksByMonth) {
       const bucket = state.devices[month];
       if (!bucket) continue;
       for (const [hash, entry] of Object.entries(bucket)) {
-        if (entry && (entry.d & mask) !== 0) active.add(hash);
+        if (!entry || (entry.d & mask) === 0 || active.has(hash)) continue;
+        active.add(hash);
+        const buildKey = formatBuildKey(entry);
+        buildCounts[buildKey] = (buildCounts[buildKey] || 0) + 1;
       }
     }
-    return active.size;
+    return { count: active.size, buildCounts };
   }
 
   function rollupCounters(now, days) {
@@ -706,8 +720,10 @@ export function createMetricsStore(options = {}) {
     let dauToday = 0;
     let newToday = 0;
     let sessionsToday = 0;
+    let signedInPingDevicesMau = 0;
     const versions = Object.create(null);
     const buildCounts = Object.create(null);
+    const buildCountsDau = Object.create(null);
     const osCounts = Object.create(null);
     const countryCounts = Object.create(null);
     const geoCountryCounts = Object.create(null);
@@ -715,14 +731,15 @@ export function createMetricsStore(options = {}) {
     const watchTime = { "0": 0, "1": 0, "2": 0, "3": 0 };
     for (const entry of Object.values(devicesBucket)) {
       if (!entry) continue;
+      const v = entry.v || "unknown";
+      const buildKey = formatBuildKey(entry);
       if ((entry.d & todayBit) !== 0) {
         dauToday += 1;
         if (((entry.n || 0) & todayBit) !== 0) newToday += 1;
         sessionsToday += clampInt(entry.s, 0, 100_000, 0);
+        buildCountsDau[buildKey] = (buildCountsDau[buildKey] || 0) + 1;
       }
-      const v = entry.v || "unknown";
       versions[v] = (versions[v] || 0) + 1;
-      const buildKey = entry.b ? `${v} (b${entry.b})` : `${v} (legacy)`;
       buildCounts[buildKey] = (buildCounts[buildKey] || 0) + 1;
       const osKey = entry.os || "unknown";
       osCounts[osKey] = (osCounts[osKey] || 0) + 1;
@@ -733,6 +750,7 @@ export function createMetricsStore(options = {}) {
       if (entry.pe && Object.hasOwn(playerEngines, entry.pe)) {
         playerEngines[entry.pe]++;
       }
+      if (entry.li === 1) signedInPingDevicesMau += 1;
       if (entry.wt && Object.hasOwn(watchTime, entry.wt)) {
         watchTime[entry.wt]++;
       }
@@ -740,9 +758,6 @@ export function createMetricsStore(options = {}) {
     const mau = Object.keys(devicesBucket).length;
     const accountsMau = Object.keys(accountsBucket).length;
     const pingAccountsMau = Object.keys(pingAccountsBucket).length;
-    const telemetryCoverage = accountsMau > 0
-      ? Math.min(1, Math.round((pingAccountsMau / accountsMau) * 1000) / 1000)
-      : null;
     const dauSeries = buildDauSeries(state, now, seriesDays);
     const toRanked = (counts) =>
       Object.entries(counts)
@@ -762,24 +777,29 @@ export function createMetricsStore(options = {}) {
       maxDevicesPerMonth,
     };
 
+    const weekly = computeWeeklyActive(now, 7);
+
     return {
       generatedAt: now.toISOString(),
       currentMonth: month,
       totalInstalls: state.totalInstalls,
       baselineDate: state.baselineDate,
       mau,
-      wau: computeWeeklyActive(now, 7),
+      wau: weekly.count,
       dauToday,
       newToday,
       sessionsToday,
       stickiness: mau > 0 ? Math.round((dauToday / mau) * 1000) / 1000 : 0,
       accountsMau,
       pingAccountsMau,
-      telemetryCoverage,
+      signedInPingDevicesMau,
+      telemetryCoverage: null,
       versions: Object.entries(versions)
         .map(([version, count]) => ({ version, count }))
         .sort((a, b) => b.count - a.count),
       builds: toRanked(buildCounts),
+      buildsDau: toRanked(buildCountsDau),
+      buildsWau: toRanked(weekly.buildCounts),
       os: toRanked(osCounts),
       countries: toRanked(countryCounts),
       geoCountries: toRanked(geoCountryCounts),
@@ -912,20 +932,20 @@ export function createNewInstallBurstLimiter({
   }
 
   return {
-    isBlocked(rawIp, nowMs = Date.now()) {
+    retryAfterMs(rawIp, nowMs = Date.now()) {
       const key = normalizeBurstKey(rawIp);
-      if (!key) return false;
+      if (!key) return 0;
       const recent = pruneAndGet(key, nowMs);
       if (recent.length >= maxPerIp) {
         touch(key, recent);
-        return true;
+        return recent[recent.length - maxPerIp] + windowMs - nowMs;
       }
       if (recent.length === 0) {
         recentByIp.delete(key);
       } else {
         recentByIp.set(key, recent);
       }
-      return false;
+      return 0;
     },
     record(rawIp, nowMs = Date.now()) {
       const key = normalizeBurstKey(rawIp);

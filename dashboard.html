@@ -818,6 +818,7 @@
         chartFiltered: true,
         healthRange: "week",
         countryMode: "geo",
+        buildWindow: "wau",
         retExpanded: false,
       };
 
@@ -1338,6 +1339,12 @@
           state.countryMode = "locale";
           render(d);
         });
+        for (const [id, win] of [["buildDauBtn", "dau"], ["buildWauBtn", "wau"], ["buildMauBtn", "mau"]]) {
+          document.getElementById(id)?.addEventListener("click", () => {
+            state.buildWindow = win;
+            render(d);
+          });
+        }
         document.getElementById("retMoreBtn")?.addEventListener("click", () => {
           state.retExpanded = !state.retExpanded;
           render(d);
@@ -1546,8 +1553,6 @@
       /* ================= TAB 3: API & UPSTREAM OPS ================= */
       function renderOpsTab(d) {
         const latency = d.upstreamLatency || {};
-        const coverage = typeof d.telemetryCoverage === "number" ? Math.round(d.telemetryCoverage * 1000) / 10 : null;
-        const optOutRate = coverage !== null ? Math.max(0, Math.round((100 - coverage) * 10) / 10) : null;
         const activeCounters = (d.counters && d.counters[state.healthRange] && d.counters[state.healthRange].endpoints) || {};
         let total5xx = 0;
         for (const e of Object.values(activeCounters)) {
@@ -1578,9 +1583,9 @@
             </div>
 
             <div class="kpi-card">
-              <div class="kpi-label">Fleet Telemetry Coverage</div>
-              <div class="kpi-val secondary" style="color:var(--accent);">${coverage !== null ? coverage + '%' : '—'}</div>
-              <div class="kpi-foot">${optOutRate !== null ? `Est. ~${optOutRate}% opt-out / adblock rate` : 'Passive OAuth reconciliation'}</div>
+              <div class="kpi-label">OAuth Accounts This Month</div>
+              <div class="kpi-val secondary" style="color:var(--accent);">${typeof d.accountsMau === 'number' ? fmt(d.accountsMau) : '—'}</div>
+              <div class="kpi-foot">${typeof d.signedInPingDevicesMau === 'number' ? `${fmt(d.signedInPingDevicesMau)} signed-in devices reported activity` : 'Signed-in device count unavailable'}</div>
             </div>
           </div>
 
@@ -1826,7 +1831,7 @@
         `;
       }
 
-      async function dismissCrashReport(signatures, btn) {
+      async function dismissCrashReport(signatures, btn, { permanent = false } = {}) {
         const list = (Array.isArray(signatures) ? signatures : [signatures]).filter(Boolean);
         if (!list.length) return;
         if (btn) btn.disabled = true;
@@ -1847,6 +1852,7 @@
           for (let i = 0; i < list.length; i += 50) {
             const chunk = list.slice(i, i + 50);
             const payload = chunk.length === 1 ? { signature: chunk[0] } : { signatures: chunk };
+            if (permanent) payload.permanent = true;
             const res = await fetch(ROUTE_CRASH_DISMISS, {
               method: "POST",
               headers: { Authorization: "Bearer " + state.token, "Content-Type": "application/json" },
@@ -2014,6 +2020,14 @@
             dismissBtn.style.cssText = "font-size:11px;padding:2px 10px;";
             dismissBtn.addEventListener?.("click", () => dismissCrashReport(signatures, dismissBtn));
             actions.append(dismissBtn);
+
+            const muteBtn = document.createElement("button");
+            muteBtn.type = "button";
+            muteBtn.textContent = "Mute permanently";
+            muteBtn.title = "Permanently hide this exact crash signature on this build. New crashes on this build or the same crash on a newer build still appear.";
+            muteBtn.style.cssText = "font-size:11px;padding:2px 10px;";
+            muteBtn.addEventListener?.("click", () => dismissCrashReport(signatures, muteBtn, { permanent: true }));
+            actions.append(muteBtn);
           }
           if (typeof setCrashMinBuild === "function" && group.maxBuild > 0) {
             const hideBuildBtn = document.createElement("button");
@@ -2122,13 +2136,16 @@
         `;
       }
 
-      function renderDistTable(title, colName, items, total, labelFn) {
+      function renderDistTable(title, colName, items, total, labelFn, headerRight = "") {
+        const header = headerRight
+          ? `<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px;"><div style="font-size:12px;font-weight:500;color:var(--fg-dim);">${title}</div>${headerRight}</div>`
+          : `<div style="font-size:12px;font-weight:500;color:var(--fg-dim);margin-bottom:8px;">${title}</div>`;
         if (!items.length) {
-          return `<div><div style="font-size:12px;font-weight:500;color:var(--fg-dim);margin-bottom:8px;">${title}</div><div style="color:var(--muted);font-size:12px;padding:6px 0;">No data.</div></div>`;
+          return `<div>${header}<div style="color:var(--muted);font-size:12px;padding:6px 0;">No data.</div></div>`;
         }
         return `
           <div>
-            <div style="font-size:12px;font-weight:500;color:var(--fg-dim);margin-bottom:8px;">${title}</div>
+            ${header}
             <table>
               <thead>
                 <tr>
@@ -2163,7 +2180,13 @@
 
       function renderDistTabs(d) {
         const versions = (d.versions || []).slice(0, 6);
-        const allBuilds = d.builds || [];
+        const hasBuildWindows = Array.isArray(d.buildsDau) || Array.isArray(d.buildsWau);
+        const activeBuildWindow = hasBuildWindows ? state.buildWindow : "mau";
+        const allBuilds = activeBuildWindow === "dau"
+          ? (d.buildsDau || [])
+          : activeBuildWindow === "wau"
+            ? (d.buildsWau || d.builds || [])
+            : (d.builds || []);
         const trackedBuilds = [];
         const legacyBuilds = [];
         for (const b of allBuilds) {
@@ -2176,10 +2199,17 @@
         const countries = countryList.slice(0, 8);
 
         const totalV = versions.reduce((a, b) => a + (b.count || 0), 0) || 1;
-        const totalB = builds.reduce((a, b) => a + (b.count || 0), 0) || 1;
+        const totalB = allBuilds.reduce((a, b) => a + (b.count || 0), 0) || 1;
         const totalO = os.reduce((a, b) => a + (b.count || 0), 0) || 1;
         const totalC = countries.reduce((a, b) => a + (b.count || 0), 0) || 1;
-        const hasTrackedBuilds = trackedBuilds.length > 0;
+        const hasTrackedBuilds = (d.builds || []).some(b => !String(b.label || "").endsWith("(legacy)"));
+        const buildToggle = hasBuildWindows ? `
+          <div style="display:inline-flex;border:1px solid var(--border);border-radius:var(--radius-control);overflow:hidden;">
+            <button class="small ${activeBuildWindow === 'dau' ? 'active' : ''}" id="buildDauBtn" style="border:none;border-radius:0;padding:2px 8px;font-size:11px;">Today</button>
+            <button class="small ${activeBuildWindow === 'wau' ? 'active' : ''}" id="buildWauBtn" style="border:none;border-radius:0;border-left:1px solid var(--border);padding:2px 8px;font-size:11px;">7d</button>
+            <button class="small ${activeBuildWindow === 'mau' ? 'active' : ''}" id="buildMauBtn" style="border:none;border-radius:0;border-left:1px solid var(--border);padding:2px 8px;font-size:11px;">Month</button>
+          </div>
+        ` : "";
 
         return `
           <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
@@ -2188,7 +2218,7 @@
           </div>
           ${hasTrackedBuilds ? `
             <div style="margin-top:16px;padding-top:12px;border-top:1px solid var(--border-subtle);">
-              ${renderDistTable("Build rollout", "Build", builds, totalB, b => "v" + b.label)}
+              ${renderDistTable("Build rollout", "Build", builds, totalB, b => "v" + b.label, buildToggle)}
             </div>
           ` : ""}
 
@@ -2367,7 +2397,7 @@
         for (const p of series) {
           const v = metricOf(p);
           if (v > maxReal) maxReal = v;
-          if (v > 0 && v < minReal) minReal = v;
+          if (v < minReal) minReal = v;
           if (v > peakVal) { peakVal = v; peakItem = p; }
         }
         if (minReal === Infinity) minReal = 0;
@@ -2725,7 +2755,7 @@
           stickiness: Math.round((last.dau / mau) * 1000) / 1000,
           accountsMau,
           pingAccountsMau: Math.round(accountsMau * 0.942),
-          telemetryCoverage: 0.942,
+          signedInPingDevicesMau: Math.round(mau * 0.7),
           versions: [
             { version: "2.54.0", count: 7120 },
             { version: "2.53.1", count: 3450 },
@@ -2737,6 +2767,16 @@
             { label: "2.54.0 (b225)", count: 5100 },
             { label: "2.54.0 (b224)", count: 2020 },
             { label: "2.53.1 (legacy)", count: 3450 },
+          ],
+          buildsDau: [
+            { label: "2.54.0 (b225)", count: 2240 },
+            { label: "2.54.0 (b224)", count: 480 },
+            { label: "2.53.1 (legacy)", count: 290 },
+          ],
+          buildsWau: [
+            { label: "2.54.0 (b225)", count: 4120 },
+            { label: "2.54.0 (b224)", count: 1210 },
+            { label: "2.53.1 (legacy)", count: 1090 },
           ],
           os: [
             { label: "36", count: 6120 },
