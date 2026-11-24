@@ -1004,8 +1004,12 @@ function fcmUnsubscribeHandler(fcmStore, pusherRelay) {
     const parsed = fcmUnsubscribeSchema.safeParse(req.body);
     if (!parsed.success) return validationError(res, parsed);
 
-    const removed = fcmStore.unsubscribe({ token: parsed.data.token });
+    const token = parsed.data.token;
+    const removed = fcmStore.unsubscribe({ token });
     if (removed) pusherRelay?.syncSubscriptions();
+    if (!(await fcmStore.whenSaved()) || fcmStore.hasToken(token)) {
+      return res.status(503).json({ ok: false, code: "subscription_pending" });
+    }
     return res.status(200).json({ ok: true, unsubscribed: removed });
   });
 }
@@ -1391,7 +1395,11 @@ function dashboardHandler(metricsConfig) {
       const html = readFileSync(metricsConfig.dashPath, "utf8");
       res.setHeader("Content-Type", "text/html; charset=utf-8");
       res.setHeader("Cache-Control", "no-store");
-      res.setHeader("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'");
+      res.setHeader(
+        "Content-Security-Policy",
+        "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; " +
+          "connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+      );
       return res.status(200).send(html);
     } catch (error) {
       return res.status(500).json({ code: "internal_error", message: "Dashboard unavailable" });

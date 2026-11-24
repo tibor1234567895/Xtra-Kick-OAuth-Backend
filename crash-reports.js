@@ -18,7 +18,9 @@ export const crashReportSchema = z.object({
   crashedAt: z.number().int().min(1).max(8_640_000_000_000_000),
   exceptions: z.array(z.object({
     type: symbol,
-    message: z.string().min(1).max(200).regex(/^[\x20-\x7E]+$/).optional(),
+    // Keep the stack from older clients even when its optional message contains markup characters.
+    message: z.string().min(1).max(200).regex(/^[\x20-\x7E]+$/).optional()
+      .transform(message => message && /[<>`]/.test(message) ? undefined : message),
     frames: z.array(z.object({
       class: symbol,
       method: symbol,

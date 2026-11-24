@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { createHash, createSign, generateKeyPairSync } from "node:crypto";
 import { test } from "node:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { runInNewContext, Script } from "node:vm";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -3924,6 +3924,40 @@ test("POST /v1/fcm/unsubscribe handles unknown tokens, validation errors, and co
   });
 });
 
+test("FCM unsubscribe retries a failed save even after the token was removed from memory", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "fcm-unsubscribe-save-"));
+  const folder = join(dir, "current");
+  const backup = join(dir, "backup");
+  const dataFile = join(folder, "subscriptions.json");
+  const token = "fcm_unsub_retry_token_1234567890";
+  const fcmStore = createFcmStore({ dataFile });
+  const app = createApp(config({ fcm: { pusherRelayEnabled: false } }), { fcmStore, messaging: null });
+  try {
+    fcmStore.subscribe({ token, channelIds: ["42"] });
+    assert.equal(fcmStore.flushSync(), true);
+    renameSync(folder, backup);
+    writeFileSync(folder, "block the store directory");
+
+    await withServer(app, async (baseUrl) => {
+      const request = () => httpRequest(baseUrl, "POST", "/v1/fcm/unsubscribe", { token });
+      const failed = await request();
+      assert.equal(failed.status, 503);
+      assert.equal(fcmStore.hasToken(token), false);
+      const saved = createFcmStore({ dataFile: join(backup, "subscriptions.json") });
+      assert.deepEqual(saved.getTokensForChannel("42"), [token]);
+
+      unlinkSync(folder);
+      renameSync(backup, folder);
+      const retried = await request();
+      assert.equal(retried.status, 200);
+      assert.equal(createFcmStore({ dataFile }).hasToken(token), false);
+    });
+  } finally {
+    fcmStore.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("createPusherRelay lifecycle connects, syncs subscriptions, handles ping/pong, and ignores kick_fcm_test_event", async () => {
   const fcmStore = createFcmStore({ dataFile: null });
   const token = "pusher_lifecycle_token_123456789";
@@ -4630,3 +4664,60 @@ test("B1.6: metrics computeStats is immune to Object.prototype keys, kick_user_i
 
 
 
+
+test("crash endpoint accepts older clients' stacks and omits unsafe optional messages", async () => {
+  const secret = "crash-test-secret";
+  const path = "/v1/metrics/crash";
+  const { app, store } = appWithMetrics(async () => jsonResponse(200, {}), { APP_HMAC_SECRET: secret });
+  const base = makeCrashReport();
+  try {
+    await withServer(app, async baseUrl => {
+      const quotedMessage = "Didn't find class \"com.example.Player\"";
+      for (const [id, message, expectedMessage, count] of [
+        [base.id, quotedMessage, quotedMessage, 1],
+        ["22345678-1234-4234-8234-123456789abc", "<b>Class not found</b>", undefined, 2],
+      ]) {
+        const report = {
+          ...base,
+          id,
+          exceptions: [{ ...base.exceptions[0], type: "java.lang.ClassNotFoundException", message }],
+        };
+        const headers = signedHeaders({ secret, method: "POST", path, bodyObject: report });
+        assert.equal((await httpRequest(baseUrl, "POST", path, report, { headers })).status, 204);
+        const stats = await httpRequest(baseUrl, "GET", "/v1/metrics/stats", undefined, {
+          headers: { Authorization: "Bearer admin-secret" },
+        });
+        assert.equal(stats.body.crashReports.length, 1);
+        assert.equal(stats.body.crashReports[0].count, count);
+        assert.equal(stats.body.crashReports[0].exceptions[0].frames[0].line, 42);
+        assert.equal(stats.body.crashReports[0].exceptions[0].message, expectedMessage);
+      }
+    });
+  } finally {
+    store.close();
+    app.locals.crashReports.close();
+  }
+});
+
+test("dashboard response carries a hardened CSP", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "dash-"));
+  try {
+    const dashFile = join(dir, "dashboard.html");
+    writeFileSync(dashFile, "<html><body>ok</body></html>");
+    const app = appWithFetch(async () => { throw new Error("no upstream expected"); }, {
+      METRICS_SALT: "s".repeat(16),
+      METRICS_DASHBOARD_FILE: dashFile,
+    });
+    await withServer(app, async (baseUrl) => {
+      const res = await fetch(`${baseUrl}/v1/metrics/dashboard`);
+      assert.equal(res.status, 200);
+      const csp = res.headers.get("content-security-policy") || "";
+      assert.match(csp, /frame-ancestors 'none'/);
+      assert.match(csp, /base-uri 'none'/);
+      assert.match(csp, /form-action 'none'/);
+      assert.match(csp, /connect-src 'self'/);
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

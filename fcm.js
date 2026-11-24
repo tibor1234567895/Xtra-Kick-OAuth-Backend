@@ -252,6 +252,7 @@ export function createFcmStore({ dataFile, logger, maxTokens = 100000, maxChanne
   const tokens = new Map(); // token -> { kickUserId, channelIds: Set, updatedAt, lastActiveAt }
   const channelIndex = new Map(); // channelId -> Set<token>
   let pendingSave = null;
+  let saveFailed = false;
   let nextRevision = 0;
   const deliveryStats = {
     since: new Date().toISOString(),
@@ -310,6 +311,7 @@ export function createFcmStore({ dataFile, logger, maxTokens = 100000, maxChanne
     pendingSave = null;
     if (pending) clearTimeout(pending.timer);
     const saved = persist();
+    saveFailed = !saved;
     pending?.finish(saved);
     return saved;
   }
@@ -413,6 +415,10 @@ export function createFcmStore({ dataFile, logger, maxTokens = 100000, maxChanne
     hasChannel(channelId) {
       const normalized = String(channelId).trim().toLowerCase();
       return Boolean(normalized && channelIndex.has(normalized));
+    },
+
+    hasToken(token) {
+      return tokens.has(String(token).trim());
     },
 
     isCurrentSubscription(token, revision) {
@@ -540,6 +546,7 @@ export function createFcmStore({ dataFile, logger, maxTokens = 100000, maxChanne
     },
 
     whenSaved() {
+      if (saveFailed) scheduleSave();
       return pendingSave?.done ?? true;
     },
 
