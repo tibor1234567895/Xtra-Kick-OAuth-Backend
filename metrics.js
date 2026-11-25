@@ -45,6 +45,8 @@ export const SCHEMA_VERSION = 2;
 export const COUNTER_DAYS = 35;
 export const EVERSEEN_PREFIX_CHARS = 16;
 export const INSTALL_REVOKE_DAYS = 7;
+export const MAX_RECENT_CRASH_BUILDS = 32;
+export const CRASH_BUILD_PATTERN = /^(\d{4}-\d{2}-\d{2})\|([A-Za-z0-9._+ -]{1,32})\|([1-9]\d{0,9})$/;
 
 export function loadMetricsConfig(env = process.env) {
   const salt = (env.METRICS_SALT || "").trim();
@@ -219,26 +221,37 @@ export function createMetricsStore(options = {}) {
 
   function flushSync() {
     if (!dataPath) return;
-    ensureDir(dataPath);
-    const tmp = `${dataPath}.tmp`;
-    writeFileSync(tmp, JSON.stringify(state), { encoding: "utf8", mode: 0o600 });
-    renameSync(tmp, dataPath);
-    pendingFlush = null;
+    const scheduled = pendingFlush;
+    try {
+      ensureDir(dataPath);
+      const tmp = `${dataPath}.tmp`;
+      writeFileSync(tmp, JSON.stringify(state), { encoding: "utf8", mode: 0o600 });
+      renameSync(tmp, dataPath);
+      scheduled?.resolve(true);
+    } catch (error) {
+      scheduled?.resolve(false);
+      throw error;
+    } finally {
+      if (scheduled) clearTimeout(scheduled.timer);
+      pendingFlush = null;
+    }
   }
 
   function scheduleFlush() {
-    if (!dataPath) return;
-    if (pendingFlush) return;
-    pendingFlush = setTimeout(() => {
+    if (!dataPath) return Promise.resolve(true);
+    if (pendingFlush) return pendingFlush.done;
+    let resolve;
+    const done = new Promise((complete) => { resolve = complete; });
+    const timer = setTimeout(() => {
       try {
         flushSync();
       } catch {
         // Swallow: counters are best-effort.
-      } finally {
-        pendingFlush = null;
       }
     }, 2_000);
-    if (typeof pendingFlush.unref === "function") pendingFlush.unref();
+    timer.unref();
+    pendingFlush = { timer, done, resolve };
+    return done;
   }
 
   function prune(retention = retentionMonths) {
@@ -286,10 +299,10 @@ export function createMetricsStore(options = {}) {
     const key = dayKey(now);
     noteTraffic(now);
     if (!state.counters[key]) {
-      state.counters[key] = { endpoints: {}, oauth: {}, ping: {}, account: {}, crashes: {}, engineSessions: {} };
+      state.counters[key] = { endpoints: {}, oauth: {}, ping: {}, account: {}, crashes: {}, engineSessions: {}, watchTime: {} };
     }
     const bucket = state.counters[key];
-    for (const part of ["endpoints", "oauth", "ping", "account", "crashes", "engineSessions"]) {
+    for (const part of ["endpoints", "oauth", "ping", "account", "crashes", "engineSessions", "watchTime"]) {
       if (!bucket[part] || typeof bucket[part] !== "object") bucket[part] = {};
     }
     return { key, bucket };
@@ -369,7 +382,24 @@ export function createMetricsStore(options = {}) {
     return true;
   }
 
-  function recordPing({ pidHash, version, build, clientEpoch, os, cc, sessions, accountAid, geoCountry, pe, c, wt, si, se, signedIn }, now = new Date()) {
+  function recordPlaybackErrorBatch(pidHash, batch, now) {
+    if (!batch || !/^[0-9a-f]{32}$/.test(batch.id) || !Number.isInteger(batch.count) || batch.count < 1 || batch.count > 100_000) return false;
+    const date = new Date(`${batch.date}T00:00:00Z`);
+    if (!Number.isFinite(date.getTime()) || dayKey(date) !== batch.date || batch.date > dayKey(now)) return false;
+    const cutoff = dayKey(new Date(now.getTime() - COUNTER_DAYS * 86_400_000));
+    if (batch.date < cutoff) return true; // The batch and its original counter are both outside retention.
+    const { bucket } = counterBucket(date);
+    const receipts = bucket.playbackErrorReceipts ??= { count: 0, ids: {} };
+    const key = hashWithSalt(pidHash, batch.id);
+    if (Object.hasOwn(receipts.ids, key)) return true;
+    if (receipts.count >= maxDevicesPerMonth) return false;
+    receipts.ids[key] = true;
+    receipts.count += 1;
+    bumpPlain(bucket.engineSessions, "errors", batch.count);
+    return true;
+  }
+
+  function recordPing({ pidHash, version, build, clientEpoch, os, cc, sessions, accountAid, geoCountry, pe, c, cb, wt, si, se, pb, abi, lang, signedIn }, now = new Date()) {
     if (typeof pidHash !== "string" || !/^[0-9a-f]{64}$/.test(pidHash)) {
       throw new Error("recordPing: invalid pidHash");
     }
@@ -388,12 +418,51 @@ export function createMetricsStore(options = {}) {
     const safeOs = typeof os === "string" && /^\d{1,3}$/.test(os) ? os.slice(0, 3) : null;
     const safeCc = typeof cc === "string" && /^[A-Za-z]{2}$/.test(cc) ? cc.toUpperCase() : null;
     const safeGeo = typeof geoCountry === "string" && /^[A-Za-z]{2}$/.test(geoCountry) ? geoCountry.toUpperCase() : null;
+    const safeAbi = typeof abi === "string" && /^[A-Za-z0-9._-]{1,16}$/.test(abi) ? abi : null;
+    const safeLang = typeof lang === "string" && /^[A-Za-z]{2,3}$/.test(lang) ? lang.toLowerCase() : null;
     const safeSessions = clampInt(sessions, 0, 100_000, null);
     const safePe = (pe === "ivs" || pe === "exo") ? pe : null;
     const safeWt = (wt === "0" || wt === "1" || wt === "2" || wt === "3") ? wt : null;
     const safeCrashes = clampInt(c, 0, 10_000, 0);
     const safeIvsStarts = clampInt(si, 0, 100_000, 0);
     const safeExoStarts = clampInt(se, 0, 100_000, 0);
+    const today = dayKey(now);
+    const dayBit = 1 << (dayIndexUtc(now) - 1);
+    const recordDailyCounters = (entry) => {
+      const firstWatchSample = safeWt && ((entry.wd || 0) & dayBit) === 0;
+      if (safeCrashes <= 0 && safeIvsStarts <= 0 && safeExoStarts <= 0 && !firstWatchSample) return;
+      const { bucket } = counterBucket(now);
+      if (safeCrashes > 0) bumpPlain(bucket.crashes, "total", safeCrashes);
+      if (safeIvsStarts > 0) bumpPlain(bucket.engineSessions, "ivs", safeIvsStarts);
+      if (safeExoStarts > 0) bumpPlain(bucket.engineSessions, "exo", safeExoStarts);
+      if (firstWatchSample) {
+        entry.wd = (entry.wd || 0) | dayBit;
+        bumpPlain(bucket.watchTime, safeWt, 1);
+      }
+    };
+    const recordBuildCoverage = (entry) => {
+      if (!Array.isArray(cb)) return;
+      // One activity sample per device per UTC day. Crash records also cover builds
+      // that crashed before they could send a ping, including before an upgrade.
+      if (safeBuild !== null && ((entry.bd || 0) & dayBit) === 0) {
+        const key = formatBuildKey({ v: safeVersion, b: safeBuild });
+        const builds = entry.ba ??= {};
+        builds[key] = (builds[key] || 0) | dayBit;
+        entry.bd = (entry.bd || 0) | dayBit;
+      }
+      if (cb.length === 0) return;
+      const oldest = dayKey(new Date(now.getTime() - 30 * 86_400_000));
+      const records = new Set(entry.bc || []);
+      for (const record of cb.slice(0, MAX_RECENT_CRASH_BUILDS)) {
+        if (typeof record !== "string") continue;
+        const match = CRASH_BUILD_PATTERN.exec(record);
+        if (!match || match[1] < oldest || match[1] > today || Number(match[3]) > 2_147_483_647) continue;
+        const date = new Date(`${match[1]}T00:00:00Z`);
+        if (Number.isFinite(date.getTime()) && dayKey(date) === match[1]) records.add(record);
+      }
+      entry.bc = [...records].filter((record) => record.slice(0, 10) >= oldest)
+        .sort().reverse().slice(0, MAX_RECENT_CRASH_BUILDS);
+    };
     const aidHash = accountAid ? hashWithSalt(accSalt, accountAid) : null;
     const aidPrefix = aidHash ? aidHash.slice(0, EVERSEEN_PREFIX_CHARS) : null;
     const accountKnown = aidPrefix !== null && accountEverSeenSet.has(aidPrefix);
@@ -414,11 +483,11 @@ export function createMetricsStore(options = {}) {
       throw error;
     }
     noteTraffic(now);
+    const playbackErrorBatchAccepted = recordPlaybackErrorBatch(pidHash, pb, now);
     if (pingMonth && !pingMonth[aidHash]) {
       pingMonth[aidHash] = true;
       monthCounts.pingAccounts.set(serverEpoch, monthCounts.pingAccounts.get(serverEpoch) + 1);
     }
-    const dayBit = 1 << (dayIndexUtc(now) - 1);
     const isSignedIn = signedIn === true || Boolean(aidHash);
     if (existing) {
       existing.d |= dayBit;
@@ -431,21 +500,15 @@ export function createMetricsStore(options = {}) {
       if (safeOs) existing.os = safeOs;
       if (safeCc) existing.cc = safeCc;
       if (safeGeo) existing.gc = safeGeo;
+      if (safeAbi) existing.abi = safeAbi;
+      if (safeLang) existing.lang = safeLang;
       if (safePe) existing.pe = safePe;
-      if (safeWt) existing.wt = safeWt;
+      if (safeWt && (!existing.wt || Number(safeWt) > Number(existing.wt))) {
+        existing.wt = safeWt;
+      }
       if (safeSessions !== null) existing.s = safeSessions;
-      if (safeCrashes > 0) {
-        const { bucket } = counterBucket(now);
-        bumpPlain(bucket.crashes, "total", safeCrashes);
-      }
-      if (safeIvsStarts > 0) {
-        const { bucket } = counterBucket(now);
-        bumpPlain(bucket.engineSessions, "ivs", safeIvsStarts);
-      }
-      if (safeExoStarts > 0) {
-        const { bucket } = counterBucket(now);
-        bumpPlain(bucket.engineSessions, "exo", safeExoStarts);
-      }
+      recordDailyCounters(existing);
+      recordBuildCoverage(existing);
       // Reinstall revocation: a recently counted install whose account turns
       // out to be a pre-existing one (device was not logged in on first ping)
       // gives its install count back.
@@ -464,29 +527,21 @@ export function createMetricsStore(options = {}) {
         existing.am = 1;
       }
       scheduleFlush();
-      return { isNewInstall: false, month: serverEpoch };
+      return { isNewInstall: false, month: serverEpoch, playbackErrorBatchAccepted };
     }
-    const entry = { v: safeVersion, d: dayBit, t: dayKey(now) };
+    const entry = { v: safeVersion, d: dayBit, t: today };
     if (isSignedIn) entry.li = 1;
     if (safeBuild !== null) entry.b = safeBuild;
     if (safeOs) entry.os = safeOs;
     if (safeCc) entry.cc = safeCc;
     if (safeGeo) entry.gc = safeGeo;
+    if (safeAbi) entry.abi = safeAbi;
+    if (safeLang) entry.lang = safeLang;
     if (safePe) entry.pe = safePe;
     if (safeWt) entry.wt = safeWt;
     if (safeSessions !== null) entry.s = safeSessions;
-    if (safeCrashes > 0) {
-      const { bucket } = counterBucket(now);
-      bumpPlain(bucket.crashes, "total", safeCrashes);
-    }
-    if (safeIvsStarts > 0) {
-      const { bucket } = counterBucket(now);
-      bumpPlain(bucket.engineSessions, "ivs", safeIvsStarts);
-    }
-    if (safeExoStarts > 0) {
-      const { bucket } = counterBucket(now);
-      bumpPlain(bucket.engineSessions, "exo", safeExoStarts);
-    }
+    recordDailyCounters(entry);
+    recordBuildCoverage(entry);
     if (accountKnown) {
       // A device whose account is already known is a reinstall or an
       // additional device of an existing user, not a new install.
@@ -505,7 +560,7 @@ export function createMetricsStore(options = {}) {
     month[pidHash] = entry;
     monthCounts.devices.set(serverEpoch, monthCounts.devices.get(serverEpoch) + 1);
     scheduleFlush();
-    return { isNewInstall: Boolean(entry.n), month: serverEpoch };
+    return { isNewInstall: Boolean(entry.n), month: serverEpoch, playbackErrorBatchAccepted };
   }
 
   function recordAccount({ sub }, now = new Date()) {
@@ -603,7 +658,7 @@ export function createMetricsStore(options = {}) {
     return entry.b ? `${v} (b${entry.b})` : `${v} (legacy)`;
   }
 
-  function computeWeeklyActive(now, windowDays) {
+  function dayMasksByMonth(now, windowDays) {
     const masksByMonth = new Map();
     for (let offset = 0; offset < windowDays; offset += 1) {
       const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
@@ -612,6 +667,10 @@ export function createMetricsStore(options = {}) {
       const dayBit = 1 << (dayIndexUtc(d) - 1);
       masksByMonth.set(month, (masksByMonth.get(month) || 0) | dayBit);
     }
+    return masksByMonth;
+  }
+
+  function computeWeeklyActive(masksByMonth) {
     const active = new Set();
     const buildCounts = Object.create(null);
     // masksByMonth iterates newest month first, so devices spanning a month boundary
@@ -629,8 +688,47 @@ export function createMetricsStore(options = {}) {
     return { count: active.size, buildCounts };
   }
 
+  function computeBuildCrashHealth(now, weekMasks, todayBit) {
+    const month = monthKey(now);
+    const today = dayKey(now);
+    const weekStart = dayKey(new Date(now.getTime() - 6 * 86_400_000));
+    const windows = { dau: new Map(), wau: new Map(), mau: new Map() };
+    function add(window, build, pid, crashed) {
+      const builds = windows[window];
+      if (!builds.has(build)) builds.set(build, { devices: new Set(), crashed: new Set() });
+      const counts = builds.get(build);
+      counts.devices.add(pid);
+      if (crashed) counts.crashed.add(pid);
+    }
+    for (const [entryMonth, weekMask] of weekMasks) {
+      for (const [pid, entry] of Object.entries(state.devices[entryMonth] || {})) {
+        if (!entry) continue;
+        if (entry.ba) {
+          for (const [build, mask] of Object.entries(entry.ba)) {
+            if (entryMonth === month && mask) add("mau", build, pid, false);
+            if (entryMonth === month && (mask & todayBit)) add("dau", build, pid, false);
+            if (mask & weekMask) add("wau", build, pid, false);
+          }
+        }
+        for (const record of entry.bc || []) {
+          const [day, version, code] = record.split("|");
+          if (day > today || (day < weekStart && !day.startsWith(`${month}-`))) continue;
+          const build = formatBuildKey({ v: version, b: Number(code) });
+          if (day.startsWith(`${month}-`)) add("mau", build, pid, true);
+          if (day === today) add("dau", build, pid, true);
+          if (day >= weekStart) add("wau", build, pid, true);
+        }
+      }
+    }
+    return Object.fromEntries(Object.entries(windows).map(([window, builds]) => [window,
+      Object.fromEntries([...builds].map(([build, counts]) => [build, {
+        devices: counts.devices.size, crashed: counts.crashed.size,
+      }])),
+    ]));
+  }
+
   function rollupCounters(now, days) {
-    const rollup = { endpoints: {}, oauth: {}, ping: {}, account: {}, crashes: {}, engineSessions: {} };
+    const rollup = { endpoints: {}, oauth: {}, ping: {}, account: {}, crashes: {}, engineSessions: {}, watchTime: {} };
     for (let offset = 0; offset < days; offset += 1) {
       const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
       d.setUTCDate(d.getUTCDate() - offset);
@@ -725,6 +823,8 @@ export function createMetricsStore(options = {}) {
     const buildCounts = Object.create(null);
     const buildCountsDau = Object.create(null);
     const osCounts = Object.create(null);
+    const abiCounts = Object.create(null);
+    const langCounts = Object.create(null);
     const countryCounts = Object.create(null);
     const geoCountryCounts = Object.create(null);
     const playerEngines = { ivs: 0, exo: 0 };
@@ -743,6 +843,8 @@ export function createMetricsStore(options = {}) {
       buildCounts[buildKey] = (buildCounts[buildKey] || 0) + 1;
       const osKey = entry.os || "unknown";
       osCounts[osKey] = (osCounts[osKey] || 0) + 1;
+      if (entry.abi) abiCounts[entry.abi] = (abiCounts[entry.abi] || 0) + 1;
+      if (entry.lang) langCounts[entry.lang] = (langCounts[entry.lang] || 0) + 1;
       const ccKey = entry.cc || "unknown";
       countryCounts[ccKey] = (countryCounts[ccKey] || 0) + 1;
       const gcKey = entry.gc || "unknown";
@@ -777,7 +879,8 @@ export function createMetricsStore(options = {}) {
       maxDevicesPerMonth,
     };
 
-    const weekly = computeWeeklyActive(now, 7);
+    const weekMasks = dayMasksByMonth(now, 7);
+    const weekly = computeWeeklyActive(weekMasks);
 
     return {
       generatedAt: now.toISOString(),
@@ -800,7 +903,10 @@ export function createMetricsStore(options = {}) {
       builds: toRanked(buildCounts),
       buildsDau: toRanked(buildCountsDau),
       buildsWau: toRanked(weekly.buildCounts),
+      buildCrashHealth: computeBuildCrashHealth(now, weekMasks, todayBit),
       os: toRanked(osCounts),
+      abis: toRanked(abiCounts),
+      languages: toRanked(langCounts),
       countries: toRanked(countryCounts),
       geoCountries: toRanked(geoCountryCounts),
       playerEngines: [
@@ -827,10 +933,6 @@ export function createMetricsStore(options = {}) {
   }
 
   function close() {
-    if (pendingFlush) {
-      clearTimeout(pendingFlush);
-      pendingFlush = null;
-    }
     try {
       flushSync();
     } catch {
@@ -853,6 +955,7 @@ export function createMetricsStore(options = {}) {
     countersAccount,
     prune,
     flushSync,
+    waitForFlush: scheduleFlush,
     close,
     get state() {
       return state;

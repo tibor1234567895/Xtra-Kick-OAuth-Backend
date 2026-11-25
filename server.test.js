@@ -502,22 +502,68 @@ test("ping rejects malformed payloads", async () => {
   store.close();
 });
 
-test("ping counts playback starts by engine and rejects out-of-range values", async () => {
+test("ping acknowledges playback starts and errors and validates telemetry fields", async () => {
   const { app, store } = appWithMetrics(async () => jsonResponse(200, {}));
+  const today = new Date().toISOString().slice(0, 10);
+  const batch = { id: "a".repeat(32), date: today, count: 4 };
 
-  const ok = await withServer(app, (baseUrl) =>
-    httpRequest(baseUrl, "POST", "/v1/metrics/ping", { ...makePingBody(), si: 3, se: 2 })
-  );
-  assert.equal(ok.status, 204);
-  assert.equal(ok.headers["x-playback-starts-accepted"], "1");
-  const bad = await withServer(app, (baseUrl) =>
-    httpRequest(baseUrl, "POST", "/v1/metrics/ping", { ...makePingBody("1.0.1"), si: 200_000 })
-  );
-  assert.equal(bad.status, 400);
+  await withServer(app, async (baseUrl) => {
+    const ok = await httpRequest(baseUrl, "POST", "/v1/metrics/ping", {
+      ...makePingBody(), b: 230, si: 3, se: 2, pb: batch, cb: [`${today}|1.0.0|229`],
+    });
+    assert.equal(ok.status, 204);
+    assert.equal(ok.headers["x-playback-starts-accepted"], "1");
+    assert.equal(ok.headers["x-playback-errors-accepted"], batch.id);
+    const retry = await httpRequest(baseUrl, "POST", "/v1/metrics/ping", { ...makePingBody(), pb: batch });
+    assert.equal(retry.status, 204);
+    assert.equal(retry.headers["x-playback-errors-accepted"], batch.id);
+    for (const fields of [
+      { si: 200_000 },
+      { pb: { ...batch, count: -1 } },
+      { pb: { ...batch, date: "2026-02-30" } },
+      { pb: { ...batch, id: "invalid" } },
+      { cb: ["invalid"] },
+      { cb: Array(33).fill(`${today}|1.0.0|229`) },
+    ]) {
+      const bad = await httpRequest(baseUrl, "POST", "/v1/metrics/ping", { ...makePingBody(), ...fields });
+      assert.equal(bad.status, 400);
+      assert.equal(bad.headers["x-playback-errors-accepted"], undefined);
+    }
+  });
 
   const stats = store.computeStats();
-  assert.deepEqual(stats.counters.today.engineSessions, { ivs: 3, exo: 2 });
+  assert.deepEqual(stats.counters.today.engineSessions, { ivs: 3, exo: 2, errors: 4 });
+  assert.deepEqual(stats.buildCrashHealth.dau["1.0.0 (b229)"], { devices: 1, crashed: 1 });
   store.close();
+});
+
+test("ping acknowledges a playback batch only after the batch and its receipt persist", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "kick-metrics-playback-"));
+  const blocked = join(dir, "blocked");
+  writeFileSync(blocked, "obstructing the metrics directory");
+  const options = { salt: "playback-receipt-test", dataPath: join(blocked, "metrics.json") };
+  const store = createMetricsStore(options);
+  const app = createApp(loadConfig(metricsEnv()), { metrics: store, crashReports: createCrashReportStore() });
+  const batch = { id: "b".repeat(32), date: new Date().toISOString().slice(0, 10), count: 2 };
+  const ping = { ...makePingBody(), pb: batch };
+  try {
+    await withServer(app, async (baseUrl) => {
+      const failed = await httpRequest(baseUrl, "POST", "/v1/metrics/ping", ping);
+      assert.equal(failed.status, 204);
+      assert.equal(failed.headers["x-playback-errors-accepted"], undefined);
+
+      unlinkSync(blocked);
+      const recovered = await httpRequest(baseUrl, "POST", "/v1/metrics/ping", ping);
+      assert.equal(recovered.status, 204);
+      assert.equal(recovered.headers["x-playback-errors-accepted"], batch.id);
+      const reopened = createMetricsStore(options);
+      assert.equal(reopened.computeStats().counters.today.engineSessions.errors, 2);
+      reopened.close();
+    });
+  } finally {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("ping silently drops emulator user-agents without inflating installs", async () => {
@@ -528,6 +574,7 @@ test("ping silently drops emulator user-agents without inflating installs", asyn
       headers: { "user-agent": "Dalvik/2.1.0 (Linux; U; Android 14; sdk_gphone64_x86_64 Build/UE1A.230829.036)" },
     });
     assert.equal(emu.status, 204);
+    assert.equal(emu.headers["x-playback-errors-accepted"], undefined);
 
     const real = await httpRequest(
       baseUrl,
@@ -3714,6 +3761,28 @@ test("dashboard build shares use all devices in the selected window", () => {
   assert.deepEqual(Array.from(markup.matchAll(/>(\d+)%<\/td>/g), m => m[1]), Array(8).fill("10"));
 });
 
+test("dashboard shows crash coverage gaps and playback error counts", () => {
+  const html = readFileSync(new URL("./dashboard.html", import.meta.url), "utf8");
+  const render = runInNewContext(
+    html.slice(html.indexOf("function renderDistTable("), html.indexOf("function renderRetentionMatrix(")) +
+    html.slice(html.indexOf("function renderPlaybackDiagnostics("), html.indexOf("async function dismissCrashReport(")) +
+    ";({ renderDistTabs, renderPlaybackDiagnostics })",
+    { state: { buildWindow: "wau" }, fmt: String, escapeHtml: String },
+  );
+  const buildsWau = [{ label: "2.55 (b229)", count: 10 }];
+  const builds = render.renderDistTabs({ builds: buildsWau, buildsWau, buildCrashHealth: {
+    wau: { "2.55 (b228)": { devices: 2, crashed: 1 } },
+  } });
+  assert.match(builds, /v2\.55 \(b228\)/);
+  assert.match(builds, /1 of 2 covered devices reported crashes[^>]*>50\.0%/);
+  assert.match(builds, /No build crash coverage[^>]*>—/);
+
+  const stats = { engineSessions: { ivs: 1, errors: 3 } };
+  const playback = render.renderPlaybackDiagnostics({ counters: { today: stats, week: stats } });
+  assert.match(playback, /Playback errors<\/td>\s*<td[^>]+>3<\/td>\s*<td[^>]+>3<\/td>/);
+  assert.doesNotMatch(playback, /300\.0%/);
+});
+
 test("dashboard counts HMAC rejections within 4xx and rate limits as failed requests", () => {
   const html = readFileSync(new URL("./dashboard.html", import.meta.url), "utf8");
   const start = html.indexOf("function renderEndpointHealthTable(");
@@ -4720,4 +4789,113 @@ test("dashboard response carries a hardened CSP", async () => {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("metrics: daily watch-time buckets, playback errors, ABI, and language", () => {
+  const store = createMetricsStore({ salt: "telemetry-v3-test" });
+  const now = new Date();
+  const day1 = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 24, 12));
+  const day2 = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 25, 12));
+  const pidA = "a".repeat(64);
+  const pidB = "b".repeat(64);
+
+  store.recordPing({
+    pidHash: pidA, version: "2.55.0", build: 228,
+    wt: "3", c: 1, si: 5, abi: "arm64-v8a", lang: "TR",
+    pb: { id: "1".repeat(32), date: day1.toISOString().slice(0, 10), count: 2 },
+  }, day1);
+
+  store.recordPing({
+    pidHash: pidA, version: "2.55.0", build: 228,
+    wt: "0", c: 0, si: 1, abi: "arm64-v8a", lang: "tr",
+  }, day2);
+
+  store.recordPing({
+    pidHash: pidB, version: "2.55.0", build: 228,
+    wt: "2", c: 0, se: 3, abi: "armeabi-v7a", lang: "en",
+    pb: { id: "2".repeat(32), date: day2.toISOString().slice(0, 10), count: 1 },
+  }, day2);
+  store.recordPing({ pidHash: pidB, version: "2.55.0", build: 228, wt: "2" }, day2);
+
+  const stats = store.computeStats(day2);
+  assert.deepEqual(stats.buildCrashHealth, { dau: {}, wau: {}, mau: {} });
+
+  assert.equal(stats.watchTime.find((w) => w.code === "3").count, 1);
+  assert.equal(stats.watchTime.find((w) => w.code === "2").count, 1);
+  assert.equal(stats.watchTime.find((w) => w.code === "0").count, 0);
+  assert.deepEqual(stats.counters.today.watchTime, { "0": 1, "2": 1 });
+  assert.deepEqual(stats.counters.week.watchTime, { "0": 1, "2": 1, "3": 1 });
+
+  assert.equal(stats.counters.today.engineSessions.errors, 1);
+  assert.equal(stats.counters.week.engineSessions.errors, 3);
+
+  assert.deepEqual(stats.abis, [
+    { label: "arm64-v8a", count: 1 },
+    { label: "armeabi-v7a", count: 1 },
+  ]);
+  assert.deepEqual(stats.languages, [
+    { label: "tr", count: 1 },
+    { label: "en", count: 1 },
+  ]);
+  store.close();
+});
+
+test("playback receipts survive restart and do not recount a lost acknowledgement after UTC month rollover", () => {
+  const dir = mkdtempSync(join(tmpdir(), "kick-metrics-receipt-rollover-"));
+  const options = { salt: "receipt-rollover-test", dataPath: join(dir, "metrics.json") };
+  const now = new Date();
+  const rollover = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+  const before = new Date(rollover.getTime() - 1);
+  const batch = { id: "1".repeat(32), date: before.toISOString().slice(0, 10), count: 2 };
+  const ping = { pidHash: "a".repeat(64), version: "2.55.0", pb: batch };
+  try {
+    const store = createMetricsStore(options);
+    assert.equal(store.recordPing(ping, before).playbackErrorBatchAccepted, true);
+    store.close();
+
+    const reopened = createMetricsStore(options);
+    assert.equal(reopened.recordPing(ping, rollover).playbackErrorBatchAccepted, true);
+    let stats = reopened.computeStats(rollover);
+    assert.equal(stats.counters.today.engineSessions.errors, undefined);
+    assert.equal(stats.counters.week.engineSessions.errors, 2);
+
+    const nextDayBatch = { id: "2".repeat(32), date: rollover.toISOString().slice(0, 10), count: 1 };
+    assert.equal(reopened.recordPing({ ...ping, pb: nextDayBatch }, rollover).playbackErrorBatchAccepted, true);
+    stats = reopened.computeStats(rollover);
+    assert.equal(stats.counters.today.engineSessions.errors, 1);
+    assert.equal(stats.counters.week.engineSessions.errors, 3);
+
+    const expired = new Date(rollover.getTime() + 36 * 86_400_000);
+    assert.equal(reopened.recordPing(ping, expired).playbackErrorBatchAccepted, true);
+    assert.equal(reopened.computeStats(expired).counters.week.engineSessions.errors, undefined);
+    reopened.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("build crash coverage keeps the original build after upgrade and deduplicates a device across months", () => {
+  const store = createMetricsStore({ salt: "build-health-test" });
+  const now = new Date();
+  const lastOfMonth = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 0, 12));
+  const firstOfMonth = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1, 12));
+  const nextDay = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 2, 12));
+  const day = (date) => date.toISOString().slice(0, 10);
+  const oldCrash = `${day(lastOfMonth)}|2.55.0|228`;
+  const firstDayCrash = `${day(firstOfMonth)}|2.55.0|228`;
+  const device = { pidHash: "a".repeat(64), version: "2.55.0" };
+  const cleanDevice = { pidHash: "b".repeat(64), version: "2.55.0", build: 228, cb: [] };
+
+  store.recordPing({ ...device, build: 228, cb: [oldCrash] }, lastOfMonth);
+  store.recordPing(cleanDevice, lastOfMonth);
+  store.recordPing({ ...device, build: 229, cb: [oldCrash, firstDayCrash] }, firstOfMonth);
+  store.recordPing(cleanDevice, firstOfMonth);
+  store.recordPing({ ...device, build: 229, cb: [oldCrash, firstDayCrash], c: 2 }, nextDay);
+
+  const { dau, wau, mau } = store.computeStats(nextDay).buildCrashHealth;
+  assert.deepEqual(dau, { "2.55.0 (b229)": { devices: 1, crashed: 0 } });
+  assert.deepEqual(wau, { "2.55.0 (b228)": { devices: 2, crashed: 1 }, "2.55.0 (b229)": { devices: 1, crashed: 0 } });
+  assert.deepEqual(mau, wau);
+  assert.deepEqual(store.computeStats(firstOfMonth).buildCrashHealth.dau["2.55.0 (b228)"], { devices: 2, crashed: 1 });
+  store.close();
 });

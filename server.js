@@ -11,6 +11,8 @@ import { z } from "zod";
 import geoip from "geoip-country";
 import { crashReportSchema, createCrashReportStore } from "./crash-reports.js";
 import {
+  CRASH_BUILD_PATTERN,
+  MAX_RECENT_CRASH_BUILDS,
   createMetricsStore,
   createNewInstallBurstLimiter,
   isEmulatorUserAgent,
@@ -387,9 +389,17 @@ const pingSchema = z.object({
   ah: z.string().regex(/^[0-9a-f]{64}$/).optional(),
   pe: z.enum(["ivs", "exo"]).optional(),
   c: z.number().int().min(0).max(10_000).optional(),
+  cb: z.array(z.string().regex(CRASH_BUILD_PATTERN)).max(MAX_RECENT_CRASH_BUILDS).optional(),
   wt: z.enum(["0", "1", "2", "3"]).optional(),
   si: z.number().int().min(0).max(100_000).optional(),
   se: z.number().int().min(0).max(100_000).optional(),
+  pb: z.object({
+    id: z.string().regex(/^[0-9a-f]{32}$/),
+    date: z.iso.date(),
+    count: z.number().int().min(1).max(100_000),
+  }).optional(),
+  abi: z.string().regex(/^[A-Za-z0-9._-]{1,16}$/).optional(),
+  lang: z.string().regex(/^[A-Za-z]{2,3}$/).optional(),
   li: z.boolean().optional(),
 });
 
@@ -1331,15 +1341,27 @@ function pingHandler(metrics, lookupCountry) {
           geoCountry: lookupCountry(req.ip),
           pe: parsed.data.pe,
           c: parsed.data.c,
+          cb: parsed.data.cb,
           wt: parsed.data.wt,
           si: parsed.data.si,
           se: parsed.data.se,
+          pb: parsed.data.pb,
+          abi: parsed.data.abi,
+          lang: parsed.data.lang,
           signedIn: parsed.data.li,
         },
         now
       );
       if (!knownPid && result.isNewInstall) {
         burstLimiter.record(req.ip, now.getTime());
+      }
+      if (result.playbackErrorBatchAccepted) {
+        if (await metrics.waitForFlush()) {
+          res.setHeader("X-Playback-Errors-Accepted", parsed.data.pb.id);
+        } else {
+          countPing("storage");
+          req.log.warn("playback error batch persistence failed");
+        }
       }
       res.setHeader("X-Playback-Starts-Accepted", "1");
       return res.status(204).end();

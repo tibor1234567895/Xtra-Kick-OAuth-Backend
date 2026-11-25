@@ -992,9 +992,25 @@
       function fmt(n) { return typeof n === "number" && !isNaN(n) ? n.toLocaleString("en-US") : "—"; }
 
       let regionNames = null;
+      let languageNames = null;
       try {
-        if (window.Intl && Intl.DisplayNames) regionNames = new Intl.DisplayNames(["en"], { type: "region" });
+        if (window.Intl && Intl.DisplayNames) {
+          regionNames = new Intl.DisplayNames(["en"], { type: "region" });
+          languageNames = new Intl.DisplayNames(["en"], { type: "language" });
+        }
       } catch { }
+
+      function languageLabel(code) {
+        const clean = String(code || "").trim().toLowerCase();
+        if (!clean || clean === "unknown") return "Unknown";
+        if (languageNames && /^[a-z]{2,3}$/.test(clean)) {
+          try {
+            const name = languageNames.of(clean);
+            if (name && name.toLowerCase() !== clean) return `${clean.toUpperCase()} · ${name}`;
+          } catch { }
+        }
+        return clean.toUpperCase();
+      }
 
       function countryLabel(code) {
         if (!code || code === "unknown") return "Unknown";
@@ -1739,15 +1755,26 @@
 
       function renderPlaybackDiagnostics(d) {
         const engines = Array.isArray(d.playerEngines) ? d.playerEngines : [];
-        const watch = Array.isArray(d.watchTime) ? d.watchTime : [];
+        const weekWatch = d.counters?.week?.watchTime || {};
+        const weekWatchTotal = (weekWatch["0"] || 0) + (weekWatch["1"] || 0) + (weekWatch["2"] || 0) + (weekWatch["3"] || 0);
+        const watch = weekWatchTotal > 0
+          ? [
+              { label: "< 15 min", code: "0", count: weekWatch["0"] || 0 },
+              { label: "15 min – 1 hr", code: "1", count: weekWatch["1"] || 0 },
+              { label: "1 hr – 3 hr", code: "2", count: weekWatch["2"] || 0 },
+              { label: "3 hr or more", code: "3", count: weekWatch["3"] || 0 },
+            ]
+          : (Array.isArray(d.watchTime) ? d.watchTime : []);
+        const watchSubtitle = weekWatchTotal > 0 ? "7d daily pings" : "monthly peak per device";
         const totalEng = engines.reduce((a, b) => a + (b.count || 0), 0) || 1;
         const totalWatch = watch.reduce((a, b) => a + (b.count || 0), 0) || 1;
         const crashesToday = d.counters?.today?.crashes?.total || 0;
         const crashesWeek = d.counters?.week?.crashes?.total || 0;
         const engineStartsToday = (d.counters?.today?.engineSessions) || {};
         const engineStartsWeek = (d.counters?.week?.engineSessions) || {};
-        const hasEngineStarts = (engineStartsToday.ivs || 0) + (engineStartsToday.exo || 0) +
-          (engineStartsWeek.ivs || 0) + (engineStartsWeek.exo || 0) > 0;
+        const errorsToday = engineStartsToday.errors || 0;
+        const errorsWeek = engineStartsWeek.errors || 0;
+        const hasPlaybackEvents = (engineStartsWeek.ivs || 0) + (engineStartsWeek.exo || 0) + errorsWeek > 0;
 
         return `
           <div>
@@ -1772,7 +1799,7 @@
 
           <div style="margin-top:20px;padding-top:16px;border-top:1px solid var(--border-subtle);">
             <div style="font-size:12px;font-weight:500;color:var(--fg-dim);margin-bottom:8px;">Playback Starts by Engine (actual usage)</div>
-            ${hasEngineStarts ? `
+            ${hasPlaybackEvents ? `
               <table style="width:100%;font-size:12px;">
                 <thead>
                   <tr>
@@ -1792,13 +1819,21 @@
                     <td class="num">${fmt(engineStartsToday.exo || 0)}</td>
                     <td class="num">${fmt(engineStartsWeek.exo || 0)}</td>
                   </tr>
+                  <tr>
+                    <td style="color:${errorsToday > 0 || errorsWeek > 0 ? 'var(--warn)' : 'var(--muted)'};">Playback errors</td>
+                    <td class="num" style="color:${errorsToday > 0 ? 'var(--warn)' : 'var(--muted)'};">${fmt(errorsToday)}</td>
+                    <td class="num" style="color:${errorsWeek > 0 ? 'var(--warn)' : 'var(--muted)'};">${fmt(errorsWeek)}</td>
+                  </tr>
                 </tbody>
               </table>
             ` : `<div style="color:var(--muted);font-size:12px;padding:6px 0;">No playback-start telemetry yet. Requires app 2.55.0 or newer; the engine preference above only reflects user settings.</div>`}
           </div>
 
           <div style="margin-top:20px;padding-top:16px;border-top:1px solid var(--border-subtle);">
-            <div style="font-size:12px;font-weight:500;color:var(--fg-dim);margin-bottom:8px;">Watch Time Distribution</div>
+            <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px;">
+              <div style="font-size:12px;font-weight:500;color:var(--fg-dim);">Watch Time Distribution</div>
+              <div style="font-size:11px;color:var(--muted);">${watchSubtitle}</div>
+            </div>
             ${watch.length ? `
               <div style="display:flex;flex-direction:column;gap:8px;">
                 ${watch.map(w => {
@@ -2136,7 +2171,7 @@
         `;
       }
 
-      function renderDistTable(title, colName, items, total, labelFn, headerRight = "") {
+      function renderDistTable(title, colName, items, total, labelFn, headerRight = "", extraCol = null) {
         const header = headerRight
           ? `<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px;"><div style="font-size:12px;font-weight:500;color:var(--fg-dim);">${title}</div>${headerRight}</div>`
           : `<div style="font-size:12px;font-weight:500;color:var(--fg-dim);margin-bottom:8px;">${title}</div>`;
@@ -2153,6 +2188,7 @@
                   <th class="num" style="padding:4px 6px;">Devices</th>
                   <th style="padding:4px 6px;width:64px;"></th>
                   <th class="num" style="padding:4px 6px;width:30px;">Share</th>
+                  ${extraCol ? `<th class="num" style="padding:4px 6px;white-space:nowrap;">${escapeHtml(extraCol.header)}</th>` : ""}
                 </tr>
               </thead>
               <tbody>
@@ -2169,6 +2205,7 @@
                         </div>
                       </td>
                       <td class="num" style="font-size:11px;color:var(--muted);width:30px;padding:4px 6px;">${pct}%</td>
+                      ${extraCol ? extraCol.cell(item) : ""}
                     </tr>
                   `;
                 }).join("")}
@@ -2187,22 +2224,44 @@
           : activeBuildWindow === "wau"
             ? (d.buildsWau || d.builds || [])
             : (d.builds || []);
+        const buildHealth = d.buildCrashHealth?.[activeBuildWindow] || {};
+        const buildCrashCol = d.buildCrashHealth ? {
+          header: "Crash-free",
+          cell: (b) => {
+            const health = buildHealth[b.label];
+            if (!health?.devices) return `<td class="num" title="No build crash coverage">—</td>`;
+            const { crashed, devices: total } = health;
+            const rate = Math.max(0, ((total - crashed) / total) * 100);
+            const label = rate === 100 ? "100%" : rate.toFixed(1) + "%";
+            const color = rate < 95 ? "var(--bad)" : (rate < 99 ? "var(--warn)" : "var(--ok)");
+            const tip = `${fmt(crashed)} of ${fmt(total)} covered devices reported crashes`;
+            return `<td class="num" style="font-family:var(--font-mono);font-size:11px;color:${color};padding:4px 6px;white-space:nowrap;" title="${escapeHtml(tip)}">${label}</td>`;
+          },
+        } : null;
         const trackedBuilds = [];
         const legacyBuilds = [];
         for (const b of allBuilds) {
           if (String(b.label || "").endsWith("(legacy)")) legacyBuilds.push(b);
           else trackedBuilds.push(b);
         }
-        const builds = trackedBuilds.concat(legacyBuilds).slice(0, 8);
+        const activeBuilds = new Set(allBuilds.map(b => b.label));
+        const pastCrashBuilds = Object.entries(buildHealth)
+          .filter(([label, health]) => health.crashed > 0 && !activeBuilds.has(label))
+          .map(([label]) => ({ label, count: 0 }));
+        const builds = pastCrashBuilds.concat(trackedBuilds, legacyBuilds).slice(0, 8);
         const os = (d.os || []).slice(0, 6);
+        const abis = (d.abis || []).slice(0, 4);
+        const languages = (d.languages || []).slice(0, 6);
         const countryList = state.countryMode === "locale" ? (d.countries || []) : (d.geoCountries || d.countries || []);
         const countries = countryList.slice(0, 8);
 
         const totalV = versions.reduce((a, b) => a + (b.count || 0), 0) || 1;
         const totalB = allBuilds.reduce((a, b) => a + (b.count || 0), 0) || 1;
         const totalO = os.reduce((a, b) => a + (b.count || 0), 0) || 1;
+        const totalA = abis.reduce((a, b) => a + (b.count || 0), 0) || 1;
+        const totalL = languages.reduce((a, b) => a + (b.count || 0), 0) || 1;
         const totalC = countries.reduce((a, b) => a + (b.count || 0), 0) || 1;
-        const hasTrackedBuilds = (d.builds || []).some(b => !String(b.label || "").endsWith("(legacy)"));
+        const hasTrackedBuilds = pastCrashBuilds.length > 0 || (d.builds || []).some(b => !String(b.label || "").endsWith("(legacy)"));
         const buildToggle = hasBuildWindows ? `
           <div style="display:inline-flex;border:1px solid var(--border);border-radius:var(--radius-control);overflow:hidden;">
             <button class="small ${activeBuildWindow === 'dau' ? 'active' : ''}" id="buildDauBtn" style="border:none;border-radius:0;padding:2px 8px;font-size:11px;">Today</button>
@@ -2218,7 +2277,13 @@
           </div>
           ${hasTrackedBuilds ? `
             <div style="margin-top:16px;padding-top:12px;border-top:1px solid var(--border-subtle);">
-              ${renderDistTable("Build rollout", "Build", builds, totalB, b => "v" + b.label, buildToggle)}
+              ${renderDistTable("Build rollout", "Build", builds, totalB, b => "v" + b.label, buildToggle, buildCrashCol)}
+            </div>
+          ` : ""}
+          ${(abis.length || languages.length) ? `
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:16px;padding-top:12px;border-top:1px solid var(--border-subtle);">
+              ${renderDistTable("CPU architecture", "ABI", abis, totalA, a => a.label)}
+              ${renderDistTable("App language", "Locale", languages, totalL, l => languageLabel(l.label))}
             </div>
           ` : ""}
 
