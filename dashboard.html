@@ -2247,8 +2247,32 @@
         const activeBuilds = new Set(allBuilds.map(b => b.label));
         const pastCrashBuilds = Object.entries(buildHealth)
           .filter(([label, health]) => health.crashed > 0 && !activeBuilds.has(label))
+          .sort((a, b) => b[1].crashed - a[1].crashed)
+          .slice(0, 2)
           .map(([label]) => ({ label, count: 0 }));
-        const builds = pastCrashBuilds.concat(trackedBuilds, legacyBuilds).slice(0, 8);
+        const buildKey = (b) => {
+          const label = String(b.label || "");
+          const match = /^(.*) \(b(\d+)\)$/.exec(label);
+          const versionText = (label.match(/^\d+(?:\.\d+)*/) || [""])[0];
+          return {
+            build: match ? BigInt(match[2]) : -1n,
+            version: versionText ? versionText.split(".").map(part => BigInt(part)) : [],
+          };
+        };
+        const sortByNewestBuild = (items) => items
+          .map(build => ({ build, key: buildKey(build) }))
+          .sort((a, b) => {
+            if (a.key.build !== b.key.build) return a.key.build > b.key.build ? -1 : 1;
+            for (let i = 0; i < Math.max(a.key.version.length, b.key.version.length); i++) {
+              const left = a.key.version[i] ?? 0n, right = b.key.version[i] ?? 0n;
+              if (left !== right) return left > right ? -1 : 1;
+            }
+            return 0;
+          })
+          .map(({ build }) => build);
+        const builds = pastCrashBuilds
+          .concat(sortByNewestBuild(trackedBuilds), sortByNewestBuild(legacyBuilds))
+          .slice(0, 8);
         const os = (d.os || []).slice(0, 6);
         const abis = (d.abis || []).slice(0, 4);
         const languages = (d.languages || []).slice(0, 6);

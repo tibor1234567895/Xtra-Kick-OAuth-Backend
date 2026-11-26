@@ -3761,6 +3761,92 @@ test("dashboard build shares use all devices in the selected window", () => {
   assert.deepEqual(Array.from(markup.matchAll(/>(\d+)%<\/td>/g), m => m[1]), Array(8).fill("10"));
 });
 
+test("dashboard build rollout lists newest builds first with legacy last", () => {
+  const html = readFileSync(new URL("./dashboard.html", import.meta.url), "utf8");
+  const start = html.indexOf("function renderDistTable(");
+  const end = html.indexOf("function renderRetentionMatrix(", start);
+  const makeRender = (buildWindow) => runInNewContext(html.slice(start, end) + ";renderDistTabs", {
+    state: { buildWindow }, fmt: String, escapeHtml: String,
+  });
+  const labelsIn = (markup) => Array.from(
+    markup.slice(markup.indexOf("Build rollout")).matchAll(/>v([^<]+)<\/td>/g), m => m[1],
+  );
+
+  const buildsWau = [
+    { label: "2.55.0 (legacy)", count: 101 },
+    { label: "2.54.0 (legacy)", count: 51 },
+    { label: "2.55.0 (b227)", count: 53 },
+    { label: "2.55.0 (b228)", count: 47 },
+    { label: "2.55.0 (b225)", count: 31 },
+    { label: "2.55.0 (b229)", count: 23 },
+    { label: "2.55.0 (b226)", count: 10 },
+  ];
+  assert.deepEqual(labelsIn(makeRender("wau")({ builds: buildsWau, buildsWau })), [
+    "2.55.0 (b229)", "2.55.0 (b228)", "2.55.0 (b227)", "2.55.0 (b226)", "2.55.0 (b225)",
+    "2.55.0 (legacy)", "2.54.0 (legacy)",
+  ]);
+
+  // Build number is the recency key even when the version string is older or has a suffix.
+  const suffixed = [
+    { label: "2.55.0 (b229)", count: 3 },
+    { label: "2.56.0-TEST (b240)", count: 2 },
+    { label: "2.54.0 (b230)", count: 1 },
+  ];
+  assert.deepEqual(labelsIn(makeRender("dau")({ builds: suffixed, buildsDau: suffixed })), [
+    "2.56.0-TEST (b240)", "2.54.0 (b230)", "2.55.0 (b229)",
+  ]);
+
+  // Equal build numbers fall back to numeric version comparison without losing precision.
+  const tiedBuilds = [
+    { label: "9007199254740992.0 (b7)", count: 2 },
+    { label: "9007199254740993.0 (b7)", count: 1 },
+  ];
+  assert.deepEqual(labelsIn(makeRender("mau")({ builds: tiedBuilds })), [
+    "9007199254740993.0 (b7)", "9007199254740992.0 (b7)",
+  ]);
+
+  // Legacy rows have no build number, so they are ordered by version descending.
+  const outOfOrderLegacy = [
+    { label: "2.54.0 (legacy)", count: 99 },
+    { label: "2.55.0 (legacy)", count: 1 },
+    { label: "2.55.0 (b1)", count: 2 },
+  ];
+  assert.deepEqual(labelsIn(makeRender("wau")({ builds: outOfOrderLegacy, buildsWau: outOfOrderLegacy })), [
+    "2.55.0 (b1)", "2.55.0 (legacy)", "2.54.0 (legacy)",
+  ]);
+
+  // Alert rows are capped so crashes cannot crowd out every active build.
+  const many = Array.from({ length: 10 }, (_, i) => ({ label: `2.55 (b${i})`, count: 10 }))
+    .concat([{ label: "2.54 (legacy)", count: 99 }]);
+  assert.deepEqual(labelsIn(makeRender("wau")({ builds: many, buildsWau: many })), [
+    "2.55 (b9)", "2.55 (b8)", "2.55 (b7)", "2.55 (b6)",
+    "2.55 (b5)", "2.55 (b4)", "2.55 (b3)", "2.55 (b2)",
+  ]);
+  const alerted = [
+    { label: "2.55 (b10)", count: 4 },
+    { label: "2.55 (b11)", count: 3 },
+  ];
+  assert.deepEqual(labelsIn(makeRender("dau")({
+    builds: alerted,
+    buildsDau: alerted,
+    buildCrashHealth: { dau: { "2.50 (b5)": { devices: 2, crashed: 1 } } },
+  })), ["2.50 (b5)", "2.55 (b11)", "2.55 (b10)"]);
+
+  const alertCrashCounts = [3, 8, 1, 6, 4, 7, 2, 5];
+  const manyAlerts = Object.fromEntries(alertCrashCounts.map((crashed, i) => [
+    `2.40 (b${i + 1})`, { devices: 10, crashed },
+  ]));
+  const activeBuilds = Array.from({ length: 6 }, (_, i) => ({ label: `2.55 (b${i + 10})`, count: 1 }));
+  assert.deepEqual(labelsIn(makeRender("dau")({
+    builds: activeBuilds,
+    buildsDau: activeBuilds,
+    buildCrashHealth: { dau: manyAlerts },
+  })), [
+    "2.40 (b2)", "2.40 (b6)",
+    "2.55 (b15)", "2.55 (b14)", "2.55 (b13)", "2.55 (b12)", "2.55 (b11)", "2.55 (b10)",
+  ]);
+});
+
 test("dashboard shows crash coverage gaps and playback error counts", () => {
   const html = readFileSync(new URL("./dashboard.html", import.meta.url), "utf8");
   const render = runInNewContext(
